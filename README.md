@@ -13,7 +13,6 @@ This package provides an optimized implementation of Moran's I spatial autocorre
   - Single-cell data with spatial coordinates
 - Multiple calculation modes:
   - Single-gene Moran's I (spatial autocorrelation for each gene)
-  - Bivariate Moran's I (spatial correlation between secreted protein genes and target genes)
   - Pairwise Moran's I (correlation between the first gene and all others)
   - All-vs-all pairwise Moran's I (correlation between all gene pairs)
 - Z-normalization of input gene expression data
@@ -78,14 +77,13 @@ Required Arguments:
 Options:
   -r <int>   Maximum grid radius for neighbor search. Default: 5.
   -p <int>   Platform type (0: Visium, 1: Older ST, 2: Single Cell). Default: 0.
-  -b <0|1|2> Calculation mode: 0 = Single-gene Moran's I, 1 = Pairwise Moran's I, 2 = Bivariate Moran's I. Default: 1.
+  -b <0|1> Calculation mode: 0 = Single-gene Moran's I, 1 = Pairwise Moran's I.
   -g <0|1>   Gene selection (only applies if -b 1): 0 = Compute Moran's I only between the *first* gene and all others,
              1 = Compute for *all* gene pairs. Default: 1.
   -s <0|1>   Include self-comparison (spot i vs spot i)? 0 = No, 1 = Yes. Default: 0.
   -t <int>   Set number of OpenMP threads. Default: Use OMP_NUM_THREADS environment variable.
   -m <int>   Set number of MKL threads. Default: Use MKL_NUM_THREADS environment variable.
   --sigma <float>  Custom sigma parameter for RBF kernel (default: inferred from data for single-cell, 100 for Visium).
-  --secreted-gene <int>  Index of secreted protein-coding gene for bivariate Moran's I calculation (required if -b 2).
 
 Single-cell specific options:
   -c <file>         Coordinates/metadata file with cell locations (TSV format). Required for single-cell data.
@@ -102,7 +100,6 @@ The format of the output file depends on the calculation mode:
 - **Single-gene mode (-b 0)**: TSV file with two columns: 'Gene', 'MoranI'
 - **Pairwise First Gene mode (-b 1, -g 0)**: TSV file with two columns: 'Gene', 'MoranI_vs_Gene0'
 - **Pairwise All mode (-b 1, -g 1)**: TSV file representing a symmetric matrix where rows and columns are gene names and cell (i, j) is Moran's I between gene_i and gene_j
-- **Bivariate Moran's I mode (-b 2)**: TSV file with two columns: 'Gene', 'MoranI_vs_SecretedGene'
 
 ## Examples
 
