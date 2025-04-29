@@ -121,11 +121,6 @@ The format of the output file depends on the calculation mode:
    ./morans_i_mkl -i sc_expr.tsv -o moransI_sc.tsv -p 2 -c sc_coords.tsv --id-col cell_id --x-col x_coord --y-col y_coord
    ```
 
-4. Calculate bivariate Moran's I between a secreted protein gene (index 5) and all other genes:
-   ```bash
-   ./morans_i_mkl -i visium_data.tsv -o bivariate_moransI.tsv -b 2 --secreted-gene 5
-   ```
-
 ## Implementation Details
 
 This implementation uses several optimizations:
