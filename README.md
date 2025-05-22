@@ -1,14 +1,16 @@
 # Moran's I Calculator for Spatial Transcriptomics
 
+**Version 1.1.0**
+
 ## Overview
 
 This package provides an optimized implementation of Moran's I spatial autocorrelation statistic specifically designed for spatial transcriptomics data. The implementation utilizes Intel's Math Kernel Library (MKL) for high-performance matrix operations and OpenMP for parallelization, making it suitable for large-scale spatial transcriptomics datasets.
 
 ## Features
 
-- Fast calculation of Moran's I using optimized matrix operations
+- Fast calculation of Moran's I using optimized matrix operations with MKL
 - Support for different spatial transcriptomics platforms:
-  - 10x Genomics Visium
+  - 10x Genomics Visium (hexagonal grid)
   - Older Spatial Transcriptomics (ST) platforms
   - Single-cell data with spatial coordinates
 - Multiple calculation modes:
@@ -18,8 +20,12 @@ This package provides an optimized implementation of Moran's I spatial autocorre
 - Z-normalization of input gene expression data
 - RBF kernel for spatial weights with platform-specific parameters
 - Configurable maximum neighbor search radius
+- Permutation testing to assess statistical significance 
 - Optimized sparse matrix operations
 - Multi-threaded implementation with OpenMP and MKL
+- Robust error handling and memory management
+- Unified configuration structure for parameter management
+- Support for high-resolution timing and performance analysis
 
 ## Requirements
 
@@ -29,17 +35,42 @@ This package provides an optimized implementation of Moran's I spatial autocorre
 
 ## Installation
 
-1. Make sure you have Intel oneAPI installed and properly set up.
+### Prerequisites
+
+1. Install Intel oneAPI Base Toolkit and MKL from [Intel's website](https://www.intel.com/content/www/us/en/developer/tools/oneapi/toolkits.html)
 2. Source the Intel oneAPI environment:
    ```bash
    source /opt/intel/oneapi/setvars.sh
    ```
-3. Clone the repository and build the program:
+
+### Building from Source
+
+1. Clone the repository:
    ```bash
    git clone [repository URL]
    cd morans_i_mkl
+   ```
+
+2. Build with the provided Makefile:
+   ```bash
    make
    ```
+
+3. Optionally install system-wide:
+   ```bash
+   make install PREFIX=/usr/local
+   ```
+
+### Makefile Options
+
+The provided Makefile supports several targets:
+
+- `make all` - Build the program (default)
+- `make clean` - Remove build artifacts
+- `make install` - Install to $(PREFIX)/bin (default: /usr/local/bin)
+- `make uninstall` - Remove from $(PREFIX)/bin
+- `make debug` - Build with debug flags and symbols
+- `make help` - Show Makefile help message
 
 ## Input Format
 
@@ -47,88 +78,121 @@ The program accepts tab-separated files (TSV) with the following structure:
 
 - **Header row**: Contains spot/cell identifiers. For Visium/ST data, these should be coordinates in the format `ROWxCOL` (e.g., `12x34`). For single-cell data, these should be cell IDs that match those in the coordinate file.
 - **Data rows**: Each row starts with a gene name followed by expression values for each spot/cell.
-- The header row can start with or without a tab before the first column name or have index name.
+- The first cell in the header row can be empty or contain a label for the gene column.
 
 Example:
 ```
-Gene  1x1 1x2 1x3 2x1 2x2 2x3
-Gene1 0.5 1.2 0.8 0.3 1.5 0.7
-Gene2 2.1 1.8 0.9 1.4 0.6 1.2
-...
+Gene  1x1   1x2   1x3   2x1   2x2   2x3
+Gene1 0.5   1.2   0.8   0.3   1.5   0.7
+Gene2 2.1   1.8   0.9   1.4   0.6   1.2
 ```
 
 For single-cell data, a coordinate file in TSV format is required with columns for cell IDs and their spatial coordinates.
+
+Example coordinate file:
+```
+cell_ID sdimx  sdimy
+cell_1  10.5   20.3
+cell_2  15.8   18.7
+```
 
 ## Usage
 
 ### Basic Usage
 
 ```bash
-./morans_i_mkl -i <input.tsv> -o <output.tsv> [OPTIONS]
+./morans_i_mkl -i <input.tsv> -o <output_prefix> [OPTIONS]
 ```
 
-### Command-line Options
+### Standard Run Options
 
 ```
 Required Arguments:
-  -i <file>  Input data matrix file (Genes x Spots/Cells).
-  -o <file>  Output file.
+  -i <file>        Input data matrix file (Genes x Spots/Cells).
+  -o <prefix>      Output file prefix for results.
 
-Options:
-  -r <int>   Maximum grid radius for neighbor search. Default: 5.
-  -p <int>   Platform type (0: Visium, 1: Older ST, 2: Single Cell). Default: 0.
-  -b <0|1> Calculation mode: 0 = Single-gene Moran's I, 1 = Pairwise Moran's I.
-  -g <0|1>   Gene selection (only applies if -b 1): 0 = Compute Moran's I only between the *first* gene and all others,
-             1 = Compute for *all* gene pairs. Default: 1.
-  -s <0|1>   Include self-comparison (spot i vs spot i)? 0 = No, 1 = Yes. Default: 0.
-  -t <int>   Set number of OpenMP threads. Default: Use OMP_NUM_THREADS environment variable.
-  -m <int>   Set number of MKL threads. Default: Use MKL_NUM_THREADS environment variable.
-  --sigma <float>  Custom sigma parameter for RBF kernel (default: inferred from data for single-cell, 100 for Visium).
+General Options:
+  -r <int>         Maximum grid radius for neighbor search. Default: 5.
+  -p <int>         Platform type (0: Visium, 1: Older ST, 2: Single Cell). Default: 0.
+  -b <0|1>         Calculation mode: 0 = Single-gene, 1 = Pairwise. Default: 1.
+  -g <0|1>         Gene selection (only applies if -b 1): 0 = Compute between first gene and all others,
+                   1 = Compute for all gene pairs. Default: 1.
+  -s <0|1>         Include self-comparison (spot i vs spot i)? 0 = No, 1 = Yes. Default: 0.
+  -t <int>         Set number of OpenMP threads. Default: 4 (or OMP_NUM_THREADS).
+  -m <int>         Set number of MKL threads. Default: Value of -t.
+  --sigma <float>  Custom sigma parameter for RBF kernel.
 
 Single-cell specific options:
-  -c <file>         Coordinates/metadata file with cell locations (TSV format). Required for single-cell data.
-  --id-col <name>   Column name for cell IDs in metadata file. Default: 'cell_ID'.
-  --x-col <name>    Column name for X coordinates in metadata file. Default: 'sdimx'.
-  --y-col <name>    Column name for Y coordinates in metadata file. Default: 'sdimy'.
-  --scale <float>   Scaling factor for coordinates to convert to integer grid. Default: 100.0.
+  -c <file>        Coordinates/metadata file with cell locations (TSV format).
+                   Required for single-cell data.
+  --id-col <name>  Column name for cell IDs in metadata file. Default: 'cell_ID'.
+  --x-col <name>   Column name for X coordinates in metadata file. Default: 'sdimx'.
+  --y-col <name>   Column name for Y coordinates in metadata file. Default: 'sdimy'.
+  --scale <float>  Scaling factor for coordinates to convert to integer grid. Default: 100.0.
 ```
 
-### Output Format
+### Permutation Test Options
 
-The format of the output file depends on the calculation mode:
+```
+  --run-perms             Enable permutation testing (with default settings).
+  --n-perms <int>         Number of permutations. Default: 1000. Implies --run-perms.
+  --perm-seed <int>       Seed for RNG in permutations. Default: Based on system time.
+  --perm-output-zscores   Output Z-scores from permutation test.
+  --perm-output-pvalues   Output p-values from permutation test.
+```
 
-- **Single-gene mode (-b 0)**: TSV file with two columns: 'Gene', 'MoranI'
-- **Pairwise First Gene mode (-b 1, -g 0)**: TSV file with two columns: 'Gene', 'MoranI_vs_Gene0'
-- **Pairwise All mode (-b 1, -g 1)**: TSV file representing a symmetric matrix where rows and columns are gene names and cell (i, j) is Moran's I between gene_i and gene_j
+### Toy Example Mode
+
+```
+  --run-toy-example       Runs a small, built-in 2D grid (5x5) example to test functionality.
+                          Requires -o <prefix>. Permutation options can be used.
+```
+
+### Output Files
+
+The format and file names depend on the calculation mode:
+
+- **Single-gene mode (-b 0)**:
+  - `<prefix>_single_gene_moran_i.tsv`: Two columns (Gene, MoranI)
+
+- **Pairwise First Gene mode (-b 1, -g 0)**:
+  - `<prefix>_first_vs_all_moran_i.tsv`: Two columns (Gene, MoranI_vs_FirstGene)
+
+- **Pairwise All mode (-b 1, -g 1)**:
+  - `<prefix>_all_pairs_moran_i_raw.tsv`: Raw lower triangular matrix of Moran's I values
+  
+- **Permutation Test outputs (if enabled for pairwise all / toy example)**:
+  - `<prefix>_zscores_lower_tri.tsv`: Z-scores (if --perm-output-zscores)
+  - `<prefix>_pvalues_lower_tri.tsv`: P-values (if --perm-output-pvalues)
 
 ## Examples
 
 1. Calculate single-gene Moran's I for Visium data:
    ```bash
-   ./morans_i_mkl -i visium_data.tsv -o moransI_results.tsv -b 0 -p 0 -r 4
+   ./morans_i_mkl -i visium_data.tsv -o results_single -b 0 -p 0 -r 4
    ```
 
 2. Calculate pairwise Moran's I between the first gene and all others:
    ```bash
-   ./morans_i_mkl -i visium_data.tsv -o moransI_pairwise.tsv -b 1 -g 0
+   ./morans_i_mkl -i visium_data.tsv -o results_firstvsall -b 1 -g 0
    ```
 
 3. Process single-cell data with spatial coordinates:
    ```bash
-   ./morans_i_mkl -i sc_expr.tsv -o moransI_sc.tsv -p 2 -c sc_coords.tsv --id-col cell_id --x-col x_coord --y-col y_coord
+   ./morans_i_mkl -i sc_expr.tsv -o results_sc -p 2 -c sc_coords.tsv --id-col cell_id --x-col x_coord --y-col y_coord
+   ```
+
+4. Run with permutation testing for statistical significance:
+   ```bash
+   ./morans_i_mkl -i visium_data.tsv -o results_perm -b 1 -g 1 --run-perms --n-perms 1000 --perm-output-zscores --perm-output-pvalues
+   ```
+
+5. Run the built-in toy example for testing:
+   ```bash
+   ./morans_i_mkl --run-toy-example -o toy_example --n-perms 100 --perm-seed 42
    ```
 
 ## Implementation Details
-
-This implementation uses several optimizations:
-
-- Sparse CSR matrix format for the spatial weights matrix
-- BLAS operations for dense matrix multiplications
-- Sparse BLAS for sparse-dense matrix operations
-- Vectorized division operations using Intel MKL VML
-- OpenMP parallelization for multi-threading
-- Efficient coordinate extraction and validation
-- Flexible handling of TSV files with or without leading tabs in the header row
 
 ### Mathematical Formulations
 
@@ -136,26 +200,25 @@ This implementation uses several optimizations:
 
 The univariate Moran's I is calculated using the matrix formula:
 ```
-I_univariate = (Z^T W Z) / (Z^T Z)
+I_univariate = (Z^T W Z) / S0
 ```
 where:
 - Z is the standardized (z-score) vector of gene expression values
 - W is the spatial weight matrix
+- S0 is the sum of all weights in W
 - ^T denotes the transpose operation
 
-#### Bivariate Moran's I (Secreted Protein Analysis)
+#### Bivariate Moran's I (Pairwise Analysis)
 
-The bivariate Moran's I between a secreted protein-coding gene and a target gene is calculated as:
+The bivariate Moran's I between two genes is calculated as:
 ```
-I_bivariate = (Z_s^T W Z_g) / (Z_s^T Z_s)
+I_bivariate = (Z_1^T W Z_2) / S0
 ```
 where:
-- Z_s ∈ ℝⁿ is the standardized expression vector of the secreted protein-coding gene across n spots
-- Z_g ∈ ℝⁿ is the standardized expression vector of the target gene across the same n spots
+- Z_1 ∈ ℝⁿ is the standardized expression vector of the first gene across n spots
+- Z_2 ∈ ℝⁿ is the standardized expression vector of the second gene across the same n spots
 - W is the spatial weight matrix
-- ^T denotes the transpose operation
-
-This formula enables analysis of spatial relationships between secreted protein gene expression and potential target genes.
+- S0 is the sum of all weights in W
 
 ### Spatial Weight Matrix
 
@@ -165,28 +228,63 @@ W_ij = exp(-(d_ij^2) / (2 * sigma^2))
 ```
 where:
 - d_ij is the Euclidean distance between spot i and j
-- sigma is the scale parameter, set to 100μm for Visium data (the distance between a spot and its 1st layer neighbor)
-- W_ii = 0 to mask coexpression effects in the same spot
-- W_ij = 0 when the distance exceeds `2*sigma` (e.g., 200μm for Visium, covering two layers of neighbor spots)
+- sigma is the scale parameter:
+  - 100μm for Visium data (distance between adjacent spots)
+  - 200μm for older ST platforms
+  - Automatically inferred from data for single-cell (or custom value with --sigma)
+- W_ij = 0 when the distance exceeds a maximum radius threshold
+- W_ii = 0 to exclude self-comparisons (if include_same_spot = 0)
 
-For single-cell data, the sigma parameter is automatically inferred from the data by calculating the average nearest neighbor distance, or can be manually specified with the `--sigma` parameter.
+### Permutation Testing
+
+Permutation testing is used to assess the statistical significance of observed Moran's I values. The process involves:
+
+1. Calculate observed Moran's I value(s)
+2. Randomly permute the gene expression values across spots (maintaining gene-wise Z-normalization)
+3. Recalculate Moran's I for each permutation
+4. Compute statistical measures:
+   - Z-scores: (observed_I - mean(permuted_I)) / std(permuted_I)
+   - P-values: proportion of permuted values with absolute value >= absolute observed value
 
 ### Efficient Implementation
 
-Our implementation employs Intel's Math Kernel Library (MKL) to optimize Moran's I calculation for spatial transcriptomics data. The core algorithm leverages sparse matrix-vector operations for efficient handling of spatial weights. We represent the weight matrix W in Compressed Sparse Row (CSR) format to minimize memory usage, particularly important for large datasets with thousands of spots. For bivariate Moran's I between secreted proteins and target genes, we first compute standardized vectors for both secreted protein gene expressions and target gene expressions (Z_s and Z_g), then calculate W·Z_g using mkl_sparse_d_mv() for optimized sparse matrix-vector multiplication. Z_s^T·(W·Z_g) calculation is done with cblas_ddot() function for the numerator and Z_s^T·Z_s for the denominator. The RBF kernel with distance cutoffs further enhances performance by limiting computations to relevant spot pairs. This approach enables processing of genome-wide bivariate Moran's I calculations while maintaining scalability for high-resolution spatial transcriptomics datasets.
+Our implementation uses Intel MKL to optimize Moran's I calculation:
+
+- Sparse CSR format for the spatial weight matrix to reduce memory usage
+- Optimized sparse matrix-vector operations with mkl_sparse_d_mm()
+- Dense matrix operations with cblas_dgemm()
+- OpenMP parallelization for multi-threading
+- Optimized vectorized math operations with Intel VML functions
+
+This approach enables efficient processing of large spatial transcriptomics datasets containing thousands of spots and genes.
 
 ## Performance Considerations
 
 - Increasing the maximum radius (`-r`) increases computational complexity
-- For large datasets, consider adjusting thread counts (`-t` and `-m`)
+- For large datasets, adjust thread counts (`-t` and `-m`) to match your hardware
 - All-vs-all pairwise mode (`-b 1 -g 1`) is significantly more memory-intensive than other modes
-- Self-comparisons can be excluded to focus on neighborhood relationships (`-s 0`)
-- For very large datasets, consider using single-gene mode (`-b 0`) or first-gene-vs-all mode (`-b 1 -g 0`)
+- Permutation testing (`--run-perms`) substantially increases computation time, especially with higher permutation counts
+- For very large datasets, consider:
+  - Using single-gene mode (`-b 0`) or first-gene-vs-all mode (`-b 1 -g 0`)
+  - Reducing permutation count for initial analyses
+  - Running on a high-memory system for all-vs-all analyses
+
+## Error Codes
+
+The program provides specific error codes for troubleshooting:
+
+- `MORANS_I_SUCCESS` (0): Operation completed successfully
+- `MORANS_I_ERROR_MEMORY` (-1): Memory allocation failure
+- `MORANS_I_ERROR_FILE` (-2): File access or parsing error
+- `MORANS_I_ERROR_PARAMETER` (-3): Invalid input parameter
+- `MORANS_I_ERROR_COMPUTATION` (-4): Computation error
 
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Citation
+
+If you use this software in your research, please cite:
 
 Beibei Ru, Lanqi Gong, Emily Yang, Seongyong Park, Kenneth Aldape, Lalage Wakefield, Peng Jiang. Inference of secreted protein activities in intercellular communication. [[Link](https://github.com/data2intelligence/SecAct)]
