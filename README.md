@@ -1,6 +1,6 @@
 # Moran's I Calculator for Spatial Transcriptomics
 
-**Version 1.1.0**
+**Version 1.2.0**
 
 ## Overview
 
@@ -13,12 +13,14 @@ This package provides an optimized implementation of Moran's I spatial autocorre
   - 10x Genomics Visium (hexagonal grid)
   - Older Spatial Transcriptomics (ST) platforms
   - Single-cell data with spatial coordinates
+  - **NEW: Custom weight matrices (any spatial relationship)**
 - Multiple calculation modes:
   - Single-gene Moran's I (spatial autocorrelation for each gene)
   - Pairwise Moran's I (correlation between the first gene and all others)
   - All-vs-all pairwise Moran's I (correlation between all gene pairs)
 - Z-normalization of input gene expression data
 - RBF kernel for spatial weights with platform-specific parameters
+- **NEW: Support for user-defined spatial weight matrices**
 - Configurable maximum neighbor search radius
 - Permutation testing to assess statistical significance 
 - Optimized sparse matrix operations
@@ -26,6 +28,25 @@ This package provides an optimized implementation of Moran's I spatial autocorre
 - Robust error handling and memory management
 - Unified configuration structure for parameter management
 - Support for high-resolution timing and performance analysis
+
+## What's New in Version 1.2.0
+
+### Custom Weight Matrix Support
+
+You can now provide your own spatial weight matrix instead of relying on built-in platform-specific weight calculations. This enables:
+
+- **Custom spatial relationships**: Define any spatial connectivity pattern
+- **Non-standard platforms**: Support for any spatial transcriptomics technology
+- **Alternative distance functions**: Use different distance metrics or kernel functions
+- **Experimental designs**: Incorporate prior knowledge about spatial relationships
+- **Flexible file formats**: Support for dense TSV, sparse COO, and sparse TSV formats
+
+### Supported Weight Matrix Formats
+
+1. **Dense TSV Format**: Full matrix with spot names as headers and row labels
+2. **Sparse COO Format**: Coordinate format with row coordinates, column coordinates, and weights
+3. **Sparse TSV Format**: Three-column format with spot1, spot2, and weight
+4. **Auto-detection**: Automatically detects format based on file content
 
 ## Requirements
 
@@ -112,8 +133,8 @@ Required Arguments:
   -o <prefix>      Output file prefix for results.
 
 General Options:
-  -r <int>         Maximum grid radius for neighbor search. Default: 5.
-  -p <int>         Platform type (0: Visium, 1: Older ST, 2: Single Cell). Default: 0.
+  -r <int>         Maximum grid radius for neighbor search. Default: 5. (Ignored if using custom weights)
+  -p <int>         Platform type (0: Visium, 1: Older ST, 2: Single Cell, 3: Custom Weights). Default: 0.
   -b <0|1>         Calculation mode: 0 = Single-gene, 1 = Pairwise. Default: 1.
   -g <0|1>         Gene selection (only applies if -b 1): 0 = Compute between first gene and all others,
                    1 = Compute for all gene pairs. Default: 1.
@@ -121,6 +142,11 @@ General Options:
   -t <int>         Set number of OpenMP threads. Default: 4 (or OMP_NUM_THREADS).
   -m <int>         Set number of MKL threads. Default: Value of -t.
   --sigma <float>  Custom sigma parameter for RBF kernel.
+
+Custom Weight Matrix Options:
+  -w <file>                Custom weight matrix file. Sets platform mode to CUSTOM_WEIGHTS (3).
+  --weight-format <format> Weight matrix format: auto (default), dense, sparse_coo, sparse_tsv.
+  --normalize-weights      Normalize custom weights by dividing by sum (S0). Default: No.
 
 Single-cell specific options:
   -c <file>        Coordinates/metadata file with cell locations (TSV format).
@@ -165,7 +191,41 @@ The format and file names depend on the calculation mode:
   - `<prefix>_zscores_lower_tri.tsv`: Z-scores (if --perm-output-zscores)
   - `<prefix>_pvalues_lower_tri.tsv`: P-values (if --perm-output-pvalues)
 
+## Custom Weight Matrix File Formats
+
+### Dense TSV Format
+Full matrix with spot names as headers and row labels:
+```
+spot_id 1x1 1x2 2x1 2x2
+1x1 0.0 0.8 0.6 0.3
+1x2 0.8 0.0 0.3 0.6
+2x1 0.6 0.3 0.0 0.8
+2x2 0.3 0.6 0.8 0.0
+```
+
+### Sparse COO Format
+Coordinate format with row coordinates, column coordinates, and weights:
+```
+row_spot  col_spot  weight
+1x1 1x2 0.8
+1x1 2x1 0.6
+1x2 2x2 0.6
+2x1 2x2 0.8
+```
+
+### Sparse TSV Format
+Three-column format with spot names and weights:
+```
+spot1 spot2 weight
+spot_A  spot_B  0.8
+spot_A  spot_C  0.6
+spot_B  spot_D  0.6
+spot_C  spot_D  0.8
+```
+
 ## Examples
+
+### Traditional Platform-Based Analysis
 
 1. Calculate single-gene Moran's I for Visium data:
    ```bash
@@ -182,15 +242,104 @@ The format and file names depend on the calculation mode:
    ./morans_i_mkl -i sc_expr.tsv -o results_sc -p 2 -c sc_coords.tsv --id-col cell_id --x-col x_coord --y-col y_coord
    ```
 
-4. Run with permutation testing for statistical significance:
+### Custom Weight Matrix Analysis
+
+4. Use a pre-computed dense weight matrix:
+   ```bash
+   ./morans_i_mkl -i expression_data.tsv -o results_custom -w weights_dense.tsv --weight-format dense
+   ```
+
+5. Use a sparse weight matrix with auto-detection:
+   ```bash
+   ./morans_i_mkl -i expression_data.tsv -o results_custom -w weights_sparse.tsv
+   ```
+
+6. Use custom weights with normalization:
+   ```bash
+   ./morans_i_mkl -i expression_data.tsv -o results_custom -w weights.tsv --normalize-weights
+   ```
+
+7. Custom weights with permutation testing:
+   ```bash
+   ./morans_i_mkl -i expression_data.tsv -o results_custom -w weights.tsv --run-perms --n-perms 1000
+   ```
+
+### Advanced Examples
+
+8. Run with permutation testing for statistical significance:
    ```bash
    ./morans_i_mkl -i visium_data.tsv -o results_perm -b 1 -g 1 --run-perms --n-perms 1000 --perm-output-zscores --perm-output-pvalues
    ```
 
-5. Run the built-in toy example for testing:
+9. Run the built-in toy example for testing:
    ```bash
    ./morans_i_mkl --run-toy-example -o toy_example --n-perms 100 --perm-seed 42
    ```
+
+## Creating Custom Weight Matrices
+
+### Using Python (Recommended)
+
+You can create custom weight matrices using the provided Python script or your own code. Here's an example:
+
+```python
+import numpy as np
+import pandas as pd
+from scipy.spatial.distance import cdist
+
+# Load spot coordinates
+spots = pd.read_csv('spot_coordinates.tsv', sep='\t')  # columns: spot_id, x, y
+coordinates = spots[['x', 'y']].values
+
+# Generate RBF weights
+distances = cdist(coordinates, coordinates, metric='euclidean')
+sigma = 100.0  # Adjust based on your data scale
+weights = np.exp(-(distances**2) / (2 * sigma**2))
+
+# Remove self-connections
+np.fill_diagonal(weights, 0.0)
+
+# Remove very small weights
+weights[weights < 1e-12] = 0.0
+
+# Save as dense matrix
+df = pd.DataFrame(weights, index=spots['spot_id'], columns=spots['spot_id'])
+df.index.name = 'spot_id'
+df.to_csv('custom_weights_dense.tsv', sep='\t')
+
+# Or save as sparse matrix
+from scipy.sparse import coo_matrix
+sparse_weights = coo_matrix(weights)
+
+with open('custom_weights_sparse.tsv', 'w') as f:
+    f.write("spot1\tspot2\tweight\n")
+    for i, j, w in zip(sparse_weights.row, sparse_weights.col, sparse_weights.data):
+        f.write(f"{spots.iloc[i]['spot_id']}\t{spots.iloc[j]['spot_id']}\t{w:.8f}\n")
+```
+
+### Alternative Distance Functions
+
+You can implement various spatial relationships:
+
+```python
+# Inverse distance weights
+weights = 1.0 / (1.0 + distances)
+
+# K-nearest neighbors (binary weights)
+k = 6  # number of neighbors
+weights = np.zeros_like(distances)
+for i in range(len(distances)):
+    nearest_k = np.argsort(distances[i])[1:k+1]  # exclude self
+    weights[i, nearest_k] = 1.0
+
+# Distance threshold (binary)
+threshold = 150.0  # distance threshold
+weights = (distances <= threshold).astype(float)
+
+# Power law decay
+alpha = 2.0
+weights = 1.0 / (1.0 + distances**alpha)
+```
 
 ## Implementation Details
 
@@ -222,6 +371,8 @@ where:
 
 ### Spatial Weight Matrix
 
+#### Built-in Platform Support
+
 The spatial weight matrix is constructed using a Radial Basis Function (RBF) kernel:
 ```
 W_ij = exp(-(d_ij^2) / (2 * sigma^2))
@@ -234,6 +385,16 @@ where:
   - Automatically inferred from data for single-cell (or custom value with --sigma)
 - W_ij = 0 when the distance exceeds a maximum radius threshold
 - W_ii = 0 to exclude self-comparisons (if include_same_spot = 0)
+
+#### Custom Weight Matrices
+
+When using custom weight matrices (-w option):
+- The program reads your pre-computed weight matrix from file
+- No distance calculations or RBF kernels are applied
+- The matrix must be symmetric for meaningful spatial autocorrelation analysis
+- Weights are typically non-negative, but negative weights are allowed
+- Self-weights (diagonal elements) are typically zero but can be non-zero
+- The sum of weights (S0) is calculated from your provided matrix
 
 ### Permutation Testing
 
@@ -260,14 +421,16 @@ This approach enables efficient processing of large spatial transcriptomics data
 
 ## Performance Considerations
 
-- Increasing the maximum radius (`-r`) increases computational complexity
+- Increasing the maximum radius (`-r`) increases computational complexity (not applicable for custom weights)
 - For large datasets, adjust thread counts (`-t` and `-m`) to match your hardware
 - All-vs-all pairwise mode (`-b 1 -g 1`) is significantly more memory-intensive than other modes
 - Permutation testing (`--run-perms`) substantially increases computation time, especially with higher permutation counts
+- Custom weight matrices with high density (many non-zero elements) will be slower than sparse matrices
 - For very large datasets, consider:
   - Using single-gene mode (`-b 0`) or first-gene-vs-all mode (`-b 1 -g 0`)
   - Reducing permutation count for initial analyses
   - Running on a high-memory system for all-vs-all analyses
+  - Pre-filtering spots or genes to reduce matrix dimensions
 
 ## Error Codes
 

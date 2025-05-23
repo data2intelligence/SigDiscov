@@ -1,0 +1,30 @@
+# Ignore raw and processed data directories
+/data/
+/datasets/
+/raw_data/
+/processed_data/
+
+# Ignore common data file types
+*.csv
+*.tsv
+*.h5ad
+*.h5
+*.rds
+*.rda
+*.npz
+*.npy
+*.feather
+*.loom
+*.mat
+
+# If you have large images
+*.tif
+*.tiff
+*.png
+*.jpg
+*.jpeg
+
+# Logs and temp files
+*.log
+*.tmp
+

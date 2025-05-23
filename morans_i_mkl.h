@@ -3,7 +3,7 @@
  * This library provides efficient calculation of Moran's I spatial autocorrelation
  * statistics for gene expression data, optimized using Intel MKL.
  *
- * Version: 1.1.0
+ * Version: 1.2.0 - Added custom weight matrix support
  */
 
 #ifndef MORANS_I_MKL_H
@@ -21,12 +21,13 @@
 #include "mkl_vml.h"  /* For vdDiv and other VML functions */
 
 /* Library version */
-#define MORANS_I_MKL_VERSION "1.1.0"
+#define MORANS_I_MKL_VERSION "1.2.0"
 
 /* Constants */
 #define VISIUM 0                      /* Visium platform with hexagonal grid */
 #define OLD 1                         /* Legacy platform mode */
 #define SINGLE_CELL 2                 /* Single-cell data with irregular positions */
+#define CUSTOM_WEIGHTS 3              /* Custom weight matrix provided */
 #define ZERO_STD_THRESHOLD 1e-8       /* Threshold for considering standard deviation zero */
 #define WEIGHT_THRESHOLD 1e-12        /* Threshold for considering spatial weight zero */
 #define BUFFER_SIZE 1024              /* Buffer size for reading files */
@@ -39,8 +40,12 @@
 #define DEFAULT_NUM_THREADS 4         /* Default number of OpenMP threads if not set by OMP_NUM_THREADS or -t */
 #define DEFAULT_MKL_NUM_THREADS 0     /* Default MKL threads (0: use OpenMP setting from config.n_threads or MKL internal default) */
 #define DEFAULT_NUM_PERMUTATIONS 1000 /* Default number of permutations if enabled */
-/* DEFAULT_PERM_SEED is handled in initialize_default_config(), e.g., a fixed value or time-based */
 
+/* Weight matrix file format types */
+#define WEIGHT_FORMAT_AUTO 0          /* Auto-detect format */
+#define WEIGHT_FORMAT_DENSE 1         /* Dense TSV format with spot names */
+#define WEIGHT_FORMAT_SPARSE_COO 2    /* Sparse COO format (row, col, value) */
+#define WEIGHT_FORMAT_SPARSE_TSV 3    /* Sparse TSV format (spot1, spot2, weight) */
 
 /* Error codes */
 #define MORANS_I_SUCCESS 0
@@ -114,7 +119,7 @@ typedef struct {
  * Populated from command-line arguments or defaults.
  */
 typedef struct {
-    int platform_mode;      /* Platform mode (VISIUM, OLD, SINGLE_CELL) */
+    int platform_mode;      /* Platform mode (VISIUM, OLD, SINGLE_CELL, CUSTOM_WEIGHTS) */
     int max_radius;         /* Maximum radius for neighboring spots (grid units) */
     int calc_pairwise;      /* Boolean: 1 if pairwise Moran's I, 0 if single-gene */
     int calc_all_vs_all;    /* Boolean (if pairwise): 1 if all genes vs all, 0 if first gene vs all */
@@ -122,6 +127,11 @@ typedef struct {
     double coord_scale;     /* Coordinate scaling factor for single-cell to integer grid */
     int n_threads;          /* Number of OpenMP threads to use */
     int mkl_n_threads;      /* Number of MKL threads (0: let MKL decide based on n_threads or its own default) */
+    
+    // Custom weight matrix configuration
+    char* custom_weights_file;    /* Path to custom weight matrix file */
+    int weight_format;            /* Format of weight matrix file */
+    int normalize_weights;        /* Boolean: normalize custom weights (divide by sum) */
     
     // Permutation-specific configuration
     int run_permutations;      /* Boolean: 1 to run permutation tests, 0 otherwise */
@@ -145,6 +155,14 @@ int load_positive_value(const char* value_str, const char* param, unsigned int m
 double load_double_value(const char* value_str, const char* param);
 void print_mkl_status(sparse_status_t status, const char* function_name);
 double get_time(void); // Prototype for get_time
+
+/* Custom Weight Matrix Functions */
+SparseMatrix* read_custom_weight_matrix(const char* filename, int format, char** spot_names, MKL_INT n_spots);
+int detect_weight_matrix_format(const char* filename);
+SparseMatrix* read_dense_weight_matrix(const char* filename, char** spot_names, MKL_INT n_spots);
+SparseMatrix* read_sparse_weight_matrix_coo(const char* filename, char** spot_names, MKL_INT n_spots);
+SparseMatrix* read_sparse_weight_matrix_tsv(const char* filename, char** spot_names, MKL_INT n_spots);
+int validate_weight_matrix(const SparseMatrix* W, char** spot_names, MKL_INT n_spots);
 
 /* Spatial Data Processing */
 double decay(double d, double sigma);
