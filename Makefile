@@ -1,5 +1,5 @@
 # Makefile for Moran's I calculation with Intel oneAPI and MKL
-# Version: 1.2.0
+# Version: 1.2.1
 # Compiler: Use icx (Intel LLVM-based compiler)
 CC = icx
 # Standard Flags: Optimization, OpenMP, Warnings, C standards, Debug symbols
@@ -28,7 +28,7 @@ MKL_LIBS = -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core -liomp5 -lpthread -lm 
 # Final linking flags
 LIBS = $(LDFLAGS) $(MKL_LIBS)
 # Version information - Updated to match header file
-VERSION = 1.2.0
+VERSION = 1.2.1
 VERSION_FLAG = -DMORANS_I_MKL_VERSION=\"$(VERSION)\"
 # Source files
 SOURCES = main.c morans_i_mkl.c

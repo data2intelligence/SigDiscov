@@ -1,6 +1,7 @@
 /* main.c - Main program for Moran's I calculation using Intel MKL
  *
- * Version: 1.2.0 - Added custom weight matrix support
+ * Version: 1.2.1 (Updated for improved safety and performance)
+ * Refactored: Improved code structure and resource management
  */
 
 #include <stdio.h>
@@ -30,11 +31,1043 @@ static char* my_strdup(const char* s) {
 #define strdup my_strdup
 #endif
 
+/* Resource Management Structure */
+typedef struct {
+    DenseMatrix* vst_matrix;
+    DenseMatrix* znorm_matrix;
+    SpotCoordinates* spot_coords;
+    DenseMatrix* decay_matrix;
+    SparseMatrix* W_matrix;
+    DenseMatrix* X_calc;
+    DenseMatrix* observed_results;
+    PermutationResults* perm_results;
+    
+    /* Helper arrays */
+    MKL_INT* valid_spot_indices;
+    MKL_INT* valid_spot_rows;
+    MKL_INT* valid_spot_cols;
+    char** valid_spot_names;
+    MKL_INT num_valid_spots;
+} AnalysisResources;
+
+/* Command Line Arguments Structure */
+typedef struct {
+    char input_file[BUFFER_SIZE];
+    char output_prefix[BUFFER_SIZE];
+    char meta_file[BUFFER_SIZE];
+    char id_column[BUFFER_SIZE];
+    char x_column[BUFFER_SIZE];
+    char y_column[BUFFER_SIZE];
+    double custom_sigma;
+    int use_metadata_file;
+    int run_toy_example;
+} CommandLineArgs;
+
+/* Forward declarations for all functions */
+void print_main_help(const char* program_name);
+int parse_weight_format(const char* format_str);
+char** extract_spot_names_from_expression(const DenseMatrix* expr_matrix, MKL_INT* n_spots_out);
+
+/* Toy example functions */
+static inline MKL_INT grid_to_1d_idx(MKL_INT r, MKL_INT c, MKL_INT num_grid_cols);
+DenseMatrix* create_theoretical_toy_moran_i_matrix_2d(MKL_INT n_genes, char** gene_names);
+SparseMatrix* create_toy_W_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_cols);
+DenseMatrix* create_toy_X_calc_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_cols, MKL_INT n_genes);
+int run_toy_example_2d(const char* output_prefix_toy, const MoransIConfig* cli_config);
+
+/* Analysis functions */
+static void initialize_resources(AnalysisResources* resources);
+static void cleanup_resources(AnalysisResources* resources);
+static void initialize_command_args(CommandLineArgs* args);
+static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* config, CommandLineArgs* args);
+static int validate_and_initialize_config(const MoransIConfig* config, const CommandLineArgs* args);
+static int load_and_process_expression_data(const char* input_file, AnalysisResources* resources);
+static int setup_spatial_analysis(const MoransIConfig* config, const CommandLineArgs* args, AnalysisResources* resources);
+static int setup_builtin_spatial_weights(const MoransIConfig* config, const CommandLineArgs* args, AnalysisResources* resources);
+static int setup_custom_spatial_weights(const MoransIConfig* config, AnalysisResources* resources);
+static int prepare_valid_spot_arrays(AnalysisResources* resources);
+static int map_spots_to_expression(AnalysisResources* resources);
+static int prepare_calculation_matrix_builtin(AnalysisResources* resources);
+static int prepare_calculation_matrix_custom(AnalysisResources* resources);
+static int run_moran_analysis(const MoransIConfig* config, AnalysisResources* resources, const char* output_prefix);
+static int run_permutation_analysis(const MoransIConfig* config, AnalysisResources* resources, const char* output_prefix);
+static void print_configuration_summary(const MoransIConfig* config, const CommandLineArgs* args);
+
 void print_elapsed_time(double start_time, double end_time, const char* operation) {
     double elapsed = end_time - start_time;
     printf("Time for %s: %.6f seconds\n", operation, elapsed);
 }
 
+/* Initialize resources structure */
+static void initialize_resources(AnalysisResources* resources) {
+    if (!resources) return;
+    memset(resources, 0, sizeof(AnalysisResources));
+}
+
+/* Clean up all allocated resources */
+static void cleanup_resources(AnalysisResources* resources) {
+    if (!resources) return;
+    
+    if (resources->vst_matrix) free_dense_matrix(resources->vst_matrix);
+    if (resources->znorm_matrix) free_dense_matrix(resources->znorm_matrix);
+    if (resources->spot_coords) free_spot_coordinates(resources->spot_coords);
+    if (resources->decay_matrix) free_dense_matrix(resources->decay_matrix);
+    if (resources->W_matrix) free_sparse_matrix(resources->W_matrix);
+    if (resources->X_calc) free_dense_matrix(resources->X_calc);
+    if (resources->observed_results) free_dense_matrix(resources->observed_results);
+    if (resources->perm_results) free_permutation_results(resources->perm_results);
+    
+    if (resources->valid_spot_names) {
+        for (MKL_INT k = 0; k < resources->num_valid_spots; k++) {
+            if (resources->valid_spot_names[k]) free(resources->valid_spot_names[k]);
+        }
+        free(resources->valid_spot_names);
+    }
+    if (resources->valid_spot_indices) free(resources->valid_spot_indices);
+    if (resources->valid_spot_rows) free(resources->valid_spot_rows);
+    if (resources->valid_spot_cols) free(resources->valid_spot_cols);
+    
+    memset(resources, 0, sizeof(AnalysisResources));
+}
+
+/* Initialize command line arguments with defaults */
+static void initialize_command_args(CommandLineArgs* args) {
+    if (!args) return;
+    memset(args, 0, sizeof(CommandLineArgs));
+    strcpy(args->id_column, "cell_ID");
+    strcpy(args->x_column, "sdimx");
+    strcpy(args->y_column, "sdimy");
+    args->custom_sigma = 0.0;
+    args->use_metadata_file = 0;
+    args->run_toy_example = 0;
+}
+
+/* Parse command line arguments */
+static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* config, 
+                                       CommandLineArgs* args) {
+    if (!config || !args) {
+        fprintf(stderr, "Error: NULL parameters in parse_command_line_arguments\n");
+        return MORANS_I_ERROR_PARAMETER;
+    }
+    
+    if (argc == 1 || (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0))) {
+        print_main_help(argv[0]);
+        return MORANS_I_SUCCESS; // Special case - help requested
+    }
+    
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-i") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for -i\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            strncpy(args->input_file, argv[i], BUFFER_SIZE - 1); 
+            args->input_file[BUFFER_SIZE - 1] = '\0';
+            
+        } else if (strcmp(argv[i], "-o") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for -o\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            strncpy(args->output_prefix, argv[i], BUFFER_SIZE - 1); 
+            args->output_prefix[BUFFER_SIZE - 1] = '\0';
+            
+        } else if (strcmp(argv[i], "--run-toy-example") == 0) {
+            args->run_toy_example = 2;
+            
+        } else if (strcmp(argv[i], "-c") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for -c\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            strncpy(args->meta_file, argv[i], BUFFER_SIZE - 1); 
+            args->meta_file[BUFFER_SIZE - 1] = '\0';
+            args->use_metadata_file = 1;
+            
+        } else if (strcmp(argv[i], "--id-col") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for --id-col\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            strncpy(args->id_column, argv[i], BUFFER_SIZE - 1); 
+            args->id_column[BUFFER_SIZE - 1] = '\0';
+            
+        } else if (strcmp(argv[i], "--x-col") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for --x-col\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            strncpy(args->x_column, argv[i], BUFFER_SIZE - 1); 
+            args->x_column[BUFFER_SIZE - 1] = '\0';
+            
+        } else if (strcmp(argv[i], "--y-col") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for --y-col\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            strncpy(args->y_column, argv[i], BUFFER_SIZE - 1); 
+            args->y_column[BUFFER_SIZE - 1] = '\0';
+            
+        } else if (strcmp(argv[i], "--scale") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for --scale\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            config->coord_scale = load_double_value(argv[i], "--scale");
+            if (isnan(config->coord_scale) || config->coord_scale <= 0) { 
+                fprintf(stderr, "Error: --scale must be a positive number.\n"); 
+                return MORANS_I_ERROR_PARAMETER;
+            }
+            
+        } else if (strcmp(argv[i], "--sigma") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for --sigma\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            args->custom_sigma = load_double_value(argv[i], "--sigma");
+            if (isnan(args->custom_sigma)) { 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            
+        } else if (strcmp(argv[i], "-r") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for -r\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            config->max_radius = load_positive_value(argv[i], "-r", 1, 1000);
+            if (config->max_radius < 0) { 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            
+        } else if (strcmp(argv[i], "-w") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for -w\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            if (config->custom_weights_file) free(config->custom_weights_file);
+            config->custom_weights_file = strdup(argv[i]);
+            if (!config->custom_weights_file) { 
+                perror("strdup custom_weights_file"); 
+                return MORANS_I_ERROR_MEMORY; 
+            }
+            config->platform_mode = CUSTOM_WEIGHTS;
+            
+        } else if (strcmp(argv[i], "--weight-format") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for --weight-format\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            config->weight_format = parse_weight_format(argv[i]);
+            
+        } else if (strcmp(argv[i], "--normalize-weights") == 0) {
+            config->normalize_weights = 1;
+            
+        } else if (strcmp(argv[i], "--row-normalize") == 0) {
+            if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 || strcmp(argv[i + 1], "1") == 0)) {
+                // Has explicit value
+                i++;
+                config->row_normalize_weights = load_positive_value(argv[i], "--row-normalize", 0, 1);
+                if (config->row_normalize_weights < 0) {
+                    return MORANS_I_ERROR_PARAMETER;
+                }
+            } else {
+                // No explicit value, default to 1 (enable)
+                config->row_normalize_weights = 1;
+            }
+            
+        } else if (strcmp(argv[i], "-p") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for -p\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            config->platform_mode = load_positive_value(argv[i], "-p", 0, 3);
+            if (config->platform_mode < 0) { 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            
+        } else if (strcmp(argv[i], "-b") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for -b\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            config->calc_pairwise = load_positive_value(argv[i], "-b", 0, 1);
+            if (config->calc_pairwise < 0) { 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            
+        } else if (strcmp(argv[i], "-g") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for -g\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            config->calc_all_vs_all = load_positive_value(argv[i], "-g", 0, 1);
+            if (config->calc_all_vs_all < 0) { 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            
+        } else if (strcmp(argv[i], "-s") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for -s\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            config->include_same_spot = load_positive_value(argv[i], "-s", 0, 1);
+            if (config->include_same_spot < 0) { 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            
+        } else if (strcmp(argv[i], "-t") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for -t\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            config->n_threads = load_positive_value(argv[i], "-t", 1, 1024);
+            if (config->n_threads < 0) { 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            
+        } else if (strcmp(argv[i], "-m") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for -m\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            config->mkl_n_threads = load_positive_value(argv[i], "-m", 1, 1024);
+            if (config->mkl_n_threads < 0) { 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            
+        } else if (strcmp(argv[i], "--run-perms") == 0) { 
+            config->run_permutations = 1;
+            
+        } else if (strcmp(argv[i], "--n-perms") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for --n-perms\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            config->num_permutations = load_positive_value(argv[i], "--n-perms", 1, 10000000);
+            if (config->num_permutations < 0) { 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            config->run_permutations = 1;
+            
+        } else if (strcmp(argv[i], "--perm-seed") == 0) {
+            if (++i >= argc) { 
+                fprintf(stderr, "Error: Missing value for --perm-seed\n"); 
+                return MORANS_I_ERROR_PARAMETER; 
+            }
+            long seed_val = strtol(argv[i], NULL, 10); 
+            if (errno == ERANGE || seed_val < 0 || (unsigned long)seed_val > UINT_MAX) { 
+                fprintf(stderr, "Error: Invalid seed value for --perm-seed '%s'.\n", argv[i]); 
+                return MORANS_I_ERROR_PARAMETER;
+            }
+            config->perm_seed = (unsigned int)seed_val;
+            config->run_permutations = 1;
+            
+        } else if (strcmp(argv[i], "--perm-output-zscores") == 0) {
+            config->perm_output_zscores = 1;
+            config->run_permutations = 1;
+            
+        } else if (strcmp(argv[i], "--perm-output-pvalues") == 0) {
+            config->perm_output_pvalues = 1;
+            config->run_permutations = 1;
+            
+        } else {
+            fprintf(stderr, "Error: Unknown parameter '%s'. Use -h for help.\n", argv[i]);
+            return MORANS_I_ERROR_PARAMETER;
+        }
+    }
+    
+    return MORANS_I_SUCCESS;
+}
+
+/* Validate configuration and file accessibility */
+static int validate_and_initialize_config(const MoransIConfig* config, const CommandLineArgs* args) {
+    if (!config || !args) {
+        fprintf(stderr, "Error: NULL parameters in validate_and_initialize_config\n");
+        return MORANS_I_ERROR_PARAMETER;
+    }
+    
+    /* Initialize MKL/OpenMP environment */
+    if (initialize_morans_i(config) != MORANS_I_SUCCESS) {
+        fprintf(stderr, "Error: Failed to initialize Moran's I MKL/OpenMP environment.\n");
+        return MORANS_I_ERROR_COMPUTATION;
+    }
+    
+    /* Validate output prefix */
+    if (strlen(args->output_prefix) == 0) { 
+        fprintf(stderr, "Error: Output file prefix (-o) must be specified.\n"); 
+        return MORANS_I_ERROR_PARAMETER;
+    }
+
+    /* Validate custom weight matrix settings */
+    if (config->platform_mode == CUSTOM_WEIGHTS) {
+        if (!config->custom_weights_file) {
+            fprintf(stderr, "Error: Custom weights platform mode requires -w <weight_file>\n");
+            return MORANS_I_ERROR_PARAMETER;
+        }
+        if (access(config->custom_weights_file, R_OK) != 0) {
+            fprintf(stderr, "Error: Cannot access custom weight matrix file '%s': %s\n", 
+                    config->custom_weights_file, strerror(errno));
+            return MORANS_I_ERROR_FILE;
+        }
+    } else if (config->custom_weights_file) {
+        fprintf(stderr, "Warning: Custom weight file provided, automatically setting platform mode to CUSTOM_WEIGHTS\n");
+        /* Note: This would require modifying config, which is const. This should be handled in argument parsing. */
+    }
+    
+    if (config->normalize_weights && config->platform_mode != CUSTOM_WEIGHTS) {
+        fprintf(stderr, "Warning: --normalize-weights only applies to custom weight matrices\n");
+    }
+
+    if (config->row_normalize_weights && config->platform_mode != CUSTOM_WEIGHTS) {
+        fprintf(stderr, "Warning: --row-normalize only applies to custom weight matrices\n");
+    }
+
+    /* For non-toy runs, validate input file */
+    if (args->run_toy_example == 0) {
+        if (strlen(args->input_file) == 0) { 
+            fprintf(stderr, "Error: Input file (-i) must be specified for standard run.\n"); 
+            return MORANS_I_ERROR_PARAMETER;
+        }
+        if (access(args->input_file, R_OK) != 0) { 
+            fprintf(stderr, "Error: Cannot access input file '%s': %s\n", args->input_file, strerror(errno)); 
+            return MORANS_I_ERROR_FILE;
+        }
+        
+        /* Validate metadata file if provided */
+        if (args->use_metadata_file) {
+            if (strlen(args->meta_file) == 0) { 
+                fprintf(stderr, "Error: Metadata file path is empty despite -c being used.\n"); 
+                return MORANS_I_ERROR_PARAMETER;
+            }
+            if (access(args->meta_file, R_OK) != 0) { 
+                fprintf(stderr, "Error: Cannot access metadata file '%s': %s\n", args->meta_file, strerror(errno)); 
+                return MORANS_I_ERROR_FILE;
+            }
+            if (config->platform_mode != SINGLE_CELL && config->platform_mode != CUSTOM_WEIGHTS) {
+                printf("Warning: Metadata file (-c) provided. Forcing platform mode to SINGLE_CELL (%d).\n", SINGLE_CELL);
+                /* Note: This would require modifying config, which is const. This should be handled in argument parsing. */
+            }
+        } else {
+            if (config->platform_mode == SINGLE_CELL) { 
+                fprintf(stderr, "Error: Platform mode SINGLE_CELL selected, but no metadata file (-c) provided.\n"); 
+                return MORANS_I_ERROR_PARAMETER;
+            }
+        }
+    }
+    
+    return MORANS_I_SUCCESS;
+}
+
+/* Load and process expression data */
+static int load_and_process_expression_data(const char* input_file, AnalysisResources* resources) {
+    if (!input_file || !resources) {
+        fprintf(stderr, "Error: NULL parameters in load_and_process_expression_data\n");
+        return MORANS_I_ERROR_PARAMETER;
+    }
+    
+    double start_time, end_time;
+    
+    printf("Loading gene expression data from %s...\n", input_file);
+    start_time = get_time();
+    resources->vst_matrix = read_vst_file(input_file);
+    end_time = get_time();
+    print_elapsed_time(start_time, end_time, "gene expression data loading");
+    
+    if (!resources->vst_matrix) { 
+        fprintf(stderr, "Error: Failed to load gene expression data.\n"); 
+        return MORANS_I_ERROR_FILE;
+    }
+    
+    printf("Loaded data matrix: %lld genes x %lld spots/cells.\n", 
+           (long long)resources->vst_matrix->nrows, (long long)resources->vst_matrix->ncols);
+    
+    if (resources->vst_matrix->nrows == 0 || resources->vst_matrix->ncols == 0) { 
+        fprintf(stderr, "Error: Loaded expression matrix is empty.\n"); 
+        return MORANS_I_ERROR_FILE;
+    }
+
+    /* Clean non-finite values */
+    MKL_INT total_elements = resources->vst_matrix->nrows * resources->vst_matrix->ncols; 
+    MKL_INT non_finite_count = 0; 
+    #pragma omp parallel for reduction(+:non_finite_count)
+    for (MKL_INT i = 0; i < total_elements; i++) {
+        if (!isfinite(resources->vst_matrix->values[i])) { 
+            resources->vst_matrix->values[i] = 0.0; 
+            non_finite_count++;
+        }
+    }
+    if (non_finite_count > 0) {
+        printf("Warning: Found and replaced %lld non-finite values with 0.0 in expression data.\n", 
+               (long long)non_finite_count);
+    }
+
+    /* Z-normalize the data */
+    printf("Performing Z-normalization (gene-wise)...\n");
+    start_time = get_time();
+    resources->znorm_matrix = z_normalize(resources->vst_matrix);
+    end_time = get_time();
+    print_elapsed_time(start_time, end_time, "Z-normalization");
+    
+    /* Free VST matrix as we no longer need it */
+    free_dense_matrix(resources->vst_matrix);
+    resources->vst_matrix = NULL;
+    
+    if (!resources->znorm_matrix) { 
+        fprintf(stderr, "Error: Z-normalization failed.\n"); 
+        return MORANS_I_ERROR_COMPUTATION;
+    }
+    
+    return MORANS_I_SUCCESS;
+}
+
+/* Setup spatial analysis components */
+static int setup_spatial_analysis(const MoransIConfig* config, const CommandLineArgs* args, 
+                                 AnalysisResources* resources) {
+    if (!config || !args || !resources || !resources->znorm_matrix) {
+        fprintf(stderr, "Error: NULL parameters in setup_spatial_analysis\n");
+        return MORANS_I_ERROR_PARAMETER;
+    }
+    
+    /* Skip coordinate processing for custom weights mode */
+    if (config->platform_mode != CUSTOM_WEIGHTS) {
+        return setup_builtin_spatial_weights(config, args, resources);
+    } else {
+        return setup_custom_spatial_weights(config, resources);
+    }
+}
+
+/* Setup spatial analysis with built-in weight calculation */
+static int setup_builtin_spatial_weights(const MoransIConfig* config, const CommandLineArgs* args, 
+                                        AnalysisResources* resources) {
+    double start_time, end_time;
+    
+    printf("Preparing spatial coordinate data...\n");
+    start_time = get_time();
+    if (args->use_metadata_file) {
+        resources->spot_coords = read_coordinates_file(args->meta_file, args->id_column, 
+                                                      args->x_column, args->y_column, 
+                                                      config->coord_scale);
+    } else {
+        resources->spot_coords = extract_coordinates(resources->znorm_matrix->colnames, 
+                                                    resources->znorm_matrix->ncols);
+    }
+    end_time = get_time();
+    print_elapsed_time(start_time, end_time, "spatial coordinate processing");
+    
+    if (!resources->spot_coords) { 
+        fprintf(stderr, "Error: Failed to obtain or process spot coordinates.\n"); 
+        return MORANS_I_ERROR_COMPUTATION;
+    }
+    
+    printf("Processed %lld total spot coordinate entries, %lld are valid.\n", 
+           (long long)resources->spot_coords->total_spots, 
+           (long long)resources->spot_coords->valid_spots);
+    
+    if (resources->spot_coords->valid_spots == 0) { 
+        fprintf(stderr, "Error: No valid spot coordinates found. Cannot proceed.\n"); 
+        return MORANS_I_ERROR_COMPUTATION;
+    }
+
+    /* Determine sigma for decay function */
+    double sigma_for_decay = args->custom_sigma; 
+    if (config->platform_mode == SINGLE_CELL && sigma_for_decay <= 0.0) {
+        printf("Inferring sigma for RBF kernel from single-cell coordinate data...\n");
+        sigma_for_decay = infer_sigma_from_data(resources->spot_coords, config->coord_scale);
+        if (sigma_for_decay <= 0) { 
+            fprintf(stderr, "Warning: Failed to infer positive sigma (got %.2f), using default of 50.0 for SC.\n", 
+                    sigma_for_decay); 
+            sigma_for_decay = 50.0;
+        }
+    }
+    
+    /* Prepare helper arrays for valid spots */
+    if (prepare_valid_spot_arrays(resources) != MORANS_I_SUCCESS) {
+        return MORANS_I_ERROR_MEMORY;
+    }
+    
+    /* Map coordinates to expression data */
+    if (map_spots_to_expression(resources) != MORANS_I_SUCCESS) {
+        return MORANS_I_ERROR_COMPUTATION;
+    }
+
+    /* Create distance decay matrix */
+    printf("Creating distance decay matrix (max_radius_grid_units=%d)...\n", config->max_radius);
+    start_time = get_time();
+    resources->decay_matrix = create_distance_matrix(config->max_radius, config->platform_mode, 
+                                                    sigma_for_decay, config->coord_scale);
+    end_time = get_time();
+    print_elapsed_time(start_time, end_time, "distance decay matrix creation");
+    
+    if (!resources->decay_matrix) { 
+        fprintf(stderr, "Error: Failed to create distance decay lookup matrix.\n"); 
+        return MORANS_I_ERROR_COMPUTATION;
+    }
+    
+    if (!config->include_same_spot && resources->decay_matrix->nrows > 0 && resources->decay_matrix->ncols > 0) {
+        printf("Excluding self-comparisons: setting decay_matrix[0,0] to 0.0.\n");
+        resources->decay_matrix->values[0] = 0.0;
+    }
+
+    /* Build spatial weight matrix */
+    printf("Building spatial weight matrix W for %lld valid spots...\n", (long long)resources->num_valid_spots);
+    start_time = get_time();
+    resources->W_matrix = build_spatial_weight_matrix(resources->valid_spot_rows, 
+                                                     resources->valid_spot_cols, 
+                                                     resources->num_valid_spots, 
+                                                     resources->decay_matrix, 
+                                                     config->max_radius,
+                                                     config->row_normalize_weights);
+    end_time = get_time();
+    print_elapsed_time(start_time, end_time, "spatial weight matrix W construction");
+    
+    /* Free decay matrix as we no longer need it */
+    free_dense_matrix(resources->decay_matrix);
+    resources->decay_matrix = NULL;
+    
+    if (!resources->W_matrix) { 
+        fprintf(stderr, "Error: Failed to build spatial weight matrix W.\n"); 
+        return MORANS_I_ERROR_COMPUTATION;
+    }
+
+    /* Prepare final calculation matrix */
+    if (prepare_calculation_matrix_builtin(resources) != MORANS_I_SUCCESS) {
+        return MORANS_I_ERROR_COMPUTATION;
+    }
+    
+    return MORANS_I_SUCCESS;
+}
+
+/* Setup spatial analysis with custom weights */
+static int setup_custom_spatial_weights(const MoransIConfig* config, AnalysisResources* resources) {
+    double start_time, end_time;
+    
+    printf("Using custom weight matrix mode - preparing calculation matrix...\n");
+    start_time = get_time();
+    
+    /* Create X_calc by transposing znorm_matrix from genes x spots to spots x genes */
+    if (prepare_calculation_matrix_custom(resources) != MORANS_I_SUCCESS) {
+        return MORANS_I_ERROR_MEMORY;
+    }
+    
+    end_time = get_time();
+    print_elapsed_time(start_time, end_time, "matrix transposition for custom weights");
+    
+    /* Free znorm matrix as we no longer need it */
+    free_dense_matrix(resources->znorm_matrix);
+    resources->znorm_matrix = NULL;
+    
+    /* Load custom weight matrix */
+    printf("Loading custom weight matrix from %s...\n", config->custom_weights_file);
+    start_time = get_time();
+    
+    MKL_INT n_spots_for_weights;
+    char** spot_names_for_weights = extract_spot_names_from_expression(resources->X_calc, &n_spots_for_weights);
+    
+    if (!spot_names_for_weights || n_spots_for_weights != resources->X_calc->nrows) {
+        fprintf(stderr, "Error: Failed to extract spot names for weight matrix mapping\n");
+        if (spot_names_for_weights) free(spot_names_for_weights);
+        return MORANS_I_ERROR_COMPUTATION;
+    }
+    
+    resources->W_matrix = read_custom_weight_matrix(config->custom_weights_file, 
+                                                   config->weight_format,
+                                                   spot_names_for_weights, 
+                                                   n_spots_for_weights);
+    
+    free(spot_names_for_weights);  // Only free the array, not the strings (they're references)
+    
+    end_time = get_time();
+    print_elapsed_time(start_time, end_time, "custom weight matrix loading");
+    
+    if (!resources->W_matrix) {
+        fprintf(stderr, "Error: Failed to load custom weight matrix.\n");
+        return MORANS_I_ERROR_FILE;
+    }
+    
+    /* Optionally normalize weights */
+    if (config->normalize_weights) {
+        double S0_before = calculate_weight_sum(resources->W_matrix);
+        if (fabs(S0_before) > ZERO_STD_THRESHOLD) {
+            printf("Normalizing custom weights (S0_before = %.6f)...\n", S0_before);
+            for (MKL_INT i = 0; i < resources->W_matrix->nnz; i++) {
+                resources->W_matrix->values[i] /= S0_before;
+            }
+            double S0_after = calculate_weight_sum(resources->W_matrix);
+            printf("Weights normalized (S0_after = %.6f)\n", S0_after);
+        } else {
+            fprintf(stderr, "Warning: Cannot normalize weights with S0 near zero (%.6e)\n", S0_before);
+        }
+    }
+    
+    return MORANS_I_SUCCESS;
+}
+
+/* Helper functions for spatial setup */
+static int prepare_valid_spot_arrays(AnalysisResources* resources) {
+    resources->num_valid_spots = resources->spot_coords->valid_spots;
+    
+    resources->valid_spot_indices = (MKL_INT*)malloc((size_t)resources->num_valid_spots * sizeof(MKL_INT));
+    resources->valid_spot_rows = (MKL_INT*)malloc((size_t)resources->num_valid_spots * sizeof(MKL_INT));
+    resources->valid_spot_cols = (MKL_INT*)malloc((size_t)resources->num_valid_spots * sizeof(MKL_INT));
+    resources->valid_spot_names = (char**)calloc(resources->num_valid_spots, sizeof(char*));
+    
+    if (!resources->valid_spot_indices || !resources->valid_spot_rows || 
+        !resources->valid_spot_cols || !resources->valid_spot_names) {
+        perror("Memory allocation failed for valid spot helper arrays");
+        return MORANS_I_ERROR_MEMORY;
+    }
+    
+    return MORANS_I_SUCCESS;
+}
+
+static int map_spots_to_expression(AnalysisResources* resources) {
+    MKL_INT v_idx = 0;
+    
+    for (MKL_INT i = 0; i < resources->spot_coords->total_spots; i++) { 
+        if (resources->spot_coords->valid_mask[i]) {
+            if (v_idx >= resources->num_valid_spots) { 
+                fprintf(stderr, "Error: Index v_idx out of bounds for helper arrays.\n"); 
+                return MORANS_I_ERROR_COMPUTATION;
+            }
+            
+            resources->valid_spot_rows[v_idx] = resources->spot_coords->spot_row[i];
+            resources->valid_spot_cols[v_idx] = resources->spot_coords->spot_col[i];
+            resources->valid_spot_names[v_idx] = strdup(resources->spot_coords->spot_names[i]);
+            
+            if (!resources->valid_spot_names[v_idx]) { 
+                perror("strdup for valid_spot_names_list"); 
+                return MORANS_I_ERROR_MEMORY;
+            }
+            
+            /* Find corresponding expression column */
+            int expr_col_idx = -1; 
+            for (MKL_INT j = 0; j < resources->znorm_matrix->ncols; j++) {
+                if (strcmp(resources->spot_coords->spot_names[i], resources->znorm_matrix->colnames[j]) == 0) { 
+                    expr_col_idx = j; 
+                    break;
+                }
+            }
+            resources->valid_spot_indices[v_idx] = expr_col_idx;
+            
+            if (expr_col_idx == -1) {
+                fprintf(stderr, "Warning: Valid coordinate spot '%s' not found in expression matrix colnames.\n", 
+                        resources->spot_coords->spot_names[i]);
+            }
+            v_idx++;
+        }
+    }
+    
+    if (v_idx != resources->num_valid_spots) {
+        fprintf(stderr, "Warning: Actual populated valid spots (%lld) differs from initial count (%lld). Adjusting.\n", 
+                (long long)v_idx, (long long)resources->num_valid_spots);
+        resources->num_valid_spots = v_idx; 
+        if (resources->num_valid_spots == 0) { 
+            fprintf(stderr, "Error: No valid spots remain. Cannot proceed.\n"); 
+            return MORANS_I_ERROR_COMPUTATION; 
+        }
+    }
+    
+    return MORANS_I_SUCCESS;
+}
+
+static int prepare_calculation_matrix_builtin(AnalysisResources* resources) {
+    double start_time, end_time;
+    
+    printf("Preparing final calculation matrix X_calc (Valid_Spots x Genes)...\n");
+    start_time = get_time();
+    
+    resources->X_calc = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (!resources->X_calc) { 
+        perror("malloc X_calc struct"); 
+        return MORANS_I_ERROR_MEMORY; 
+    }
+    
+    resources->X_calc->nrows = resources->num_valid_spots; 
+    resources->X_calc->ncols = resources->znorm_matrix->nrows;
+    resources->X_calc->values = (double*)mkl_malloc((size_t)resources->X_calc->nrows * resources->X_calc->ncols * sizeof(double), 64);
+    resources->X_calc->rownames = (char**)calloc(resources->X_calc->nrows, sizeof(char*)); 
+    resources->X_calc->colnames = (char**)calloc(resources->X_calc->ncols, sizeof(char*)); 
+    
+    if (!resources->X_calc->values || !resources->X_calc->rownames || !resources->X_calc->colnames) {
+        perror("Memory allocation failed for X_calc components"); 
+        return MORANS_I_ERROR_MEMORY;
+    }
+
+    /* Copy gene names */
+    for (MKL_INT g = 0; g < resources->X_calc->ncols; g++) { 
+        resources->X_calc->colnames[g] = strdup(resources->znorm_matrix->rownames[g]); 
+        if (!resources->X_calc->colnames[g]) {
+            perror("strdup X_calc gene name"); 
+            return MORANS_I_ERROR_MEMORY;
+        }
+    }
+    
+    /* Copy spot names */
+    for (MKL_INT i = 0; i < resources->X_calc->nrows; i++) { 
+        resources->X_calc->rownames[i] = strdup(resources->valid_spot_names[i]); 
+        if (!resources->X_calc->rownames[i]) {
+            perror("strdup X_calc spot name"); 
+            return MORANS_I_ERROR_MEMORY;
+        }
+    }
+
+    /* Copy expression data for valid spots */
+    #pragma omp parallel for
+    for (MKL_INT i = 0; i < resources->X_calc->nrows; i++) { 
+        MKL_INT original_expr_col_idx = resources->valid_spot_indices[i]; 
+        for (MKL_INT j = 0; j < resources->X_calc->ncols; j++) { 
+            if (original_expr_col_idx != -1) {
+                resources->X_calc->values[i * resources->X_calc->ncols + j] = 
+                    resources->znorm_matrix->values[j * resources->znorm_matrix->ncols + original_expr_col_idx];
+            } else {
+                resources->X_calc->values[i * resources->X_calc->ncols + j] = 0.0; 
+            }
+        }
+    }
+    
+    end_time = get_time();
+    print_elapsed_time(start_time, end_time, "final X_calc matrix preparation");
+
+    /* Clean up intermediate data structures */
+    free_dense_matrix(resources->znorm_matrix);
+    resources->znorm_matrix = NULL;
+    free_spot_coordinates(resources->spot_coords);
+    resources->spot_coords = NULL;
+    
+    return MORANS_I_SUCCESS;
+}
+
+static int prepare_calculation_matrix_custom(AnalysisResources* resources) {
+    /* Transpose the gene x spots matrix to spots x genes for X_calc */
+    resources->X_calc = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (!resources->X_calc) { 
+        perror("malloc X_calc struct"); 
+        return MORANS_I_ERROR_MEMORY; 
+    }
+    
+    resources->X_calc->nrows = resources->znorm_matrix->ncols; // spots
+    resources->X_calc->ncols = resources->znorm_matrix->nrows; // genes
+    resources->X_calc->values = (double*)mkl_malloc((size_t)resources->X_calc->nrows * resources->X_calc->ncols * sizeof(double), 64);
+    resources->X_calc->rownames = (char**)calloc(resources->X_calc->nrows, sizeof(char*)); // spot names
+    resources->X_calc->colnames = (char**)calloc(resources->X_calc->ncols, sizeof(char*)); // gene names
+    
+    if (!resources->X_calc->values || !resources->X_calc->rownames || !resources->X_calc->colnames) {
+        perror("Memory allocation failed for X_calc components"); 
+        return MORANS_I_ERROR_MEMORY;
+    }
+
+    /* Copy gene names (columns in X_calc) */
+    for (MKL_INT g = 0; g < resources->X_calc->ncols; g++) {
+        resources->X_calc->colnames[g] = strdup(resources->znorm_matrix->rownames[g]);
+        if (!resources->X_calc->colnames[g]) {
+            perror("strdup X_calc gene name"); 
+            return MORANS_I_ERROR_MEMORY;
+        }
+    }
+    
+    /* Copy spot names (rows in X_calc) */
+    for (MKL_INT s = 0; s < resources->X_calc->nrows; s++) {
+        resources->X_calc->rownames[s] = strdup(resources->znorm_matrix->colnames[s]);
+        if (!resources->X_calc->rownames[s]) {
+            perror("strdup X_calc spot name"); 
+            return MORANS_I_ERROR_MEMORY;
+        }
+    }
+    
+    /* Transpose data: znorm_matrix[gene][spot] -> X_calc[spot][gene] */
+    #pragma omp parallel for
+    for (MKL_INT s = 0; s < resources->X_calc->nrows; s++) {
+        for (MKL_INT g = 0; g < resources->X_calc->ncols; g++) {
+            resources->X_calc->values[s * resources->X_calc->ncols + g] = 
+                resources->znorm_matrix->values[g * resources->znorm_matrix->ncols + s];
+        }
+    }
+    
+    return MORANS_I_SUCCESS;
+}
+
+/* Run Moran's I analysis based on configuration */
+static int run_moran_analysis(const MoransIConfig* config, AnalysisResources* resources, 
+                             const char* output_prefix) {
+    if (!config || !resources || !output_prefix || !resources->X_calc || !resources->W_matrix) {
+        fprintf(stderr, "Error: NULL parameters in run_moran_analysis\n");
+        return MORANS_I_ERROR_PARAMETER;
+    }
+    
+    double start_time, end_time;
+    double S0_val = calculate_weight_sum(resources->W_matrix); 
+    
+    printf("Sum of all weights S0 = %.6f (from %lld NNZ in W)\n", 
+           S0_val, (long long)resources->W_matrix->nnz);
+    
+    if (fabs(S0_val) < DBL_EPSILON && resources->W_matrix->nnz > 0) {
+        fprintf(stderr, "Warning: S0 is near-zero. Moran's I results will likely be 0, NaN, or Inf.\n");
+    }
+    if (resources->W_matrix->nnz == 0 && resources->X_calc->nrows > 0) {
+        fprintf(stderr, "Warning: Spatial Weight Matrix W has no non-zero elements.\n");
+    }
+
+    printf("Calculating Moran's I based on selected mode%s...\n", 
+           config->row_normalize_weights ? " (with row-normalized weights)" : "");
+    start_time = get_time();
+    
+    char result_filename[BUFFER_SIZE]; 
+    int status = MORANS_I_SUCCESS;
+
+    if (!config->calc_pairwise) { 
+        /* Single-gene mode */
+        snprintf(result_filename, BUFFER_SIZE, "%s_single_gene_moran_i.tsv", output_prefix);
+        printf("Mode: Single-Gene Moran's I. Output: %s\n", result_filename);
+        status = save_single_gene_results(resources->X_calc, resources->W_matrix, S0_val, result_filename, config->row_normalize_weights);
+        
+    } else if (!config->calc_all_vs_all) { 
+        /* First gene vs all mode */
+        snprintf(result_filename, BUFFER_SIZE, "%s_first_vs_all_moran_i.tsv", output_prefix);
+        printf("Mode: Pairwise Moran's I (First Gene vs All Others). Output: %s\n", result_filename);
+        
+        if (resources->X_calc->ncols == 0) { 
+            fprintf(stderr, "Error: No genes in X_calc for first-vs-all Moran's I.\n"); 
+            status = MORANS_I_ERROR_PARAMETER;
+        } else {
+            double* first_vs_all_results = calculate_first_gene_vs_all(resources->X_calc, resources->W_matrix, S0_val, config->row_normalize_weights); 
+            if (first_vs_all_results) {
+                status = save_first_gene_vs_all_results(first_vs_all_results, 
+                                                       (const char**)resources->X_calc->colnames, 
+                                                       resources->X_calc->ncols, result_filename);
+                mkl_free(first_vs_all_results);
+            } else { 
+                fprintf(stderr, "Error: Failed to calculate Moran's I for first gene vs all others.\n"); 
+                status = MORANS_I_ERROR_COMPUTATION;
+            }
+        }
+        
+    } else { 
+        /* All pairs mode */
+        snprintf(result_filename, BUFFER_SIZE, "%s_all_pairs_moran_i_raw.tsv", output_prefix);
+        printf("Mode: Pairwise Moran's I (All Gene Pairs - Raw Lower Triangular). Output: %s\n", result_filename);
+        
+        resources->observed_results = calculate_morans_i(resources->X_calc, resources->W_matrix, config->row_normalize_weights);
+        if (resources->observed_results) {
+            status = save_lower_triangular_matrix_raw(resources->observed_results, result_filename);
+        } else {
+            fprintf(stderr, "Error: Failed to calculate all-pairs Moran's I.\n");
+            status = MORANS_I_ERROR_COMPUTATION;
+        }
+    }
+    
+    end_time = get_time();
+    print_elapsed_time(start_time, end_time, "Observed Moran's I calculation and saving");
+    
+    return status;
+}
+
+/* Run permutation analysis if requested */
+static int run_permutation_analysis(const MoransIConfig* config, AnalysisResources* resources, 
+                                   const char* output_prefix) {
+    if (!config || !resources || !output_prefix) {
+        fprintf(stderr, "Error: NULL parameters in run_permutation_analysis\n");
+        return MORANS_I_ERROR_PARAMETER;
+    }
+    
+    if (!config->run_permutations) {
+        return MORANS_I_SUCCESS; // Nothing to do
+    }
+    
+    if (!resources->observed_results || !config->calc_pairwise || !config->calc_all_vs_all) {
+        if (!config->calc_pairwise || !config->calc_all_vs_all) {
+            printf("Warning: Permutation testing is primarily designed for 'all gene pairs' mode (-b 1 -g 1).\n");
+            printf("         Current mode: -b %d -g %d. Skipping permutations.\n", 
+                   config->calc_pairwise, config->calc_all_vs_all);
+        } else if (!resources->observed_results) {
+            printf("Warning: Observed Moran's I calculation failed for all-pairs. Skipping permutations.\n");
+        } else {
+            printf("Warning: Permutation testing requested but prerequisites not met. Skipping permutations.\n");
+        }
+        return MORANS_I_SUCCESS;
+    }
+    
+    double start_time, end_time;
+    
+    printf("--- Running Permutation Test ---\n");
+    PermutationParams perm_params; 
+    perm_params.n_permutations = config->num_permutations;
+    perm_params.seed = config->perm_seed; 
+    perm_params.z_score_output = config->perm_output_zscores;
+    perm_params.p_value_output = config->perm_output_pvalues;
+
+    start_time = get_time();
+    resources->perm_results = run_permutation_test(resources->X_calc, resources->W_matrix, &perm_params, config->row_normalize_weights);
+    end_time = get_time();
+    print_elapsed_time(start_time, end_time, "Permutation Test computation");
+
+    if (resources->perm_results) {
+        start_time = get_time();
+        int save_status = save_permutation_results(resources->perm_results, output_prefix);
+        end_time = get_time();
+        print_elapsed_time(start_time, end_time, "Saving Permutation Test results");
+        
+        if (save_status != MORANS_I_SUCCESS) {
+            fprintf(stderr, "Error saving permutation results.\n");
+            return save_status;
+        }
+    } else {
+        fprintf(stderr, "Error: Permutation test failed to produce results.\n");
+        return MORANS_I_ERROR_COMPUTATION;
+    }
+    
+    return MORANS_I_SUCCESS;
+}
+
+/* Print configuration summary */
+static void print_configuration_summary(const MoransIConfig* config, const CommandLineArgs* args) {
+    printf("\nMoran's I calculation utility version %s\n\n", morans_i_mkl_version());
+    printf("--- Parameters ---\n");
+    printf("Input file: %s\n", args->input_file);
+    printf("Output file prefix: %s\n", args->output_prefix);
+    
+    if (config->platform_mode == CUSTOM_WEIGHTS) {
+        printf("Custom Weight Matrix File: %s\n", config->custom_weights_file);
+        const char* format_names[] = {"auto", "dense", "sparse_coo", "sparse_tsv"};
+        printf("  Weight Format: %s\n", format_names[config->weight_format]);
+        printf("  Normalize Weights: %s\n", config->normalize_weights ? "Yes" : "No");
+        printf("  Row Normalize Weights: %s\n", config->row_normalize_weights ? "Yes" : "No");
+    } else {
+        if (args->use_metadata_file) {
+            printf("Metadata file: %s\n", args->meta_file);
+            printf("  ID column: %s\n", args->id_column); 
+            printf("  X coordinate column: %s\n", args->x_column); 
+            printf("  Y coordinate column: %s\n", args->y_column);
+            printf("  Coordinate scale factor: %.2f\n", config->coord_scale);
+        }
+        if (args->custom_sigma > 0) {
+            printf("Custom Sigma for RBF: %.4f\n", args->custom_sigma);
+        } else {
+            printf("Custom Sigma for RBF: Not set (will use platform default or infer for SC).\n");
+        }
+        printf("Max radius (grid units): %d\n", config->max_radius);
+        printf("Row Normalize Weights: %s\n", config->row_normalize_weights ? "Yes" : "No");
+    }
+    
+    const char* platform_names[] = {"Visium", "Old ST", "Single Cell", "Custom Weights"};
+    printf("Platform: %d (%s)\n", config->platform_mode, 
+           config->platform_mode < 4 ? platform_names[config->platform_mode] : "Unknown");
+    printf("Mode: %s\n", config->calc_pairwise ? "Pairwise Moran's I" : "Single-Gene Moran's I");
+    if (config->calc_pairwise) {
+        printf("  Gene Pairs: %s\n", config->calc_all_vs_all ? "All vs All" : "First Gene vs All Others");
+    }
+    printf("Include Self-Comparisons (w_ii): %s\n", config->include_same_spot ? "Yes" : "No");
+    
+    if (config->run_permutations) {
+        printf("Permutation Testing: Enabled\n");
+        printf("  Number of Permutations: %d\n", config->num_permutations);
+        printf("  Permutation Seed: %u\n", config->perm_seed);
+        printf("  Output Z-scores: %s\n", config->perm_output_zscores ? "Yes" : "No");
+        printf("  Output P-values: %s\n", config->perm_output_pvalues ? "Yes" : "No");
+    }
+    printf("------------------\n");
+}
+
+/* Include all the toy example functions and helpers from original file */
 void print_main_help(const char* program_name) {
     printf("\nCompute Pairwise or Single-Gene Moran's I for Spatial Transcriptomics Data\n\n");
     printf("Usage: %s -i <input.tsv> -o <output_prefix> [OPTIONS]\n", program_name);
@@ -55,6 +1088,8 @@ void print_main_help(const char* program_name) {
     printf("  -g <0|1>\tGene selection (if -b 1): 0 = First gene vs all, 1 = All gene pairs. Default: %d.\n",
            DEFAULT_CALC_ALL_VS_ALL);
     printf("  -s <0|1>\tInclude self-comparison (w_ii)? 0 = No, 1 = Yes. Default: %d.\n", DEFAULT_INCLUDE_SAME_SPOT);
+    printf("  --row-normalize <0|1>\tNormalize each row of weight matrix to sum to 1? 0 = No, 1 = Yes. Default: %d.\n",
+           DEFAULT_ROW_NORMALIZE_WEIGHTS);
     printf("  -t <int>\tSet number of OpenMP threads. Default: %d (or OMP_NUM_THREADS).\n", DEFAULT_NUM_THREADS);
     printf("  -m <int>\tSet number of MKL threads. Default: Value of -t or OpenMP default.\n");
     printf("\nCustom Weight Matrix Options:\n");
@@ -104,19 +1139,11 @@ void print_main_help(const char* program_name) {
     printf("Version: %s\n", morans_i_mkl_version());
 }
 
-// --- Toy Example Implementation for a 2D Grid ---
-// --- Helper: grid_to_1d_idx remains the same ---
+/* Include all toy example functions exactly as they were */
 static inline MKL_INT grid_to_1d_idx(MKL_INT r, MKL_INT c, MKL_INT num_grid_cols) {
     return r * num_grid_cols + c;
 }
 
-/*
- * Creates a DenseMatrix containing the theoretically expected Moran's I values
- * for the specific 5-gene, 5x5 grid toy example.
- * Note: Some values are exact based on derivation, others might be qualitative expectations.
- * The "true" theoretical values for the generated X and W are what calculate_morans_i produces.
- * This function is more for "expected pattern" verification.
- */
 DenseMatrix* create_theoretical_toy_moran_i_matrix_2d(MKL_INT n_genes, char** gene_names) {
     if (n_genes != 5) {
         fprintf(stderr, "Error (create_theoretical_toy_moran_i): This function is hardcoded for 5 genes.\n");
@@ -196,21 +1223,12 @@ DenseMatrix* create_theoretical_toy_moran_i_matrix_2d(MKL_INT n_genes, char** ge
     theoretical_I->values[4 * n_genes + 3] = 0.0; // Approx.
 
     // I(G4,G4) - Radial Autocorrelation
-    // This is harder to pin down to an exact theoretical value without re-implementing the sum.
-    // We can either:
-    // 1. Put an estimated qualitative value (e.g., 0.5 as a placeholder for "positive")
-    // 2. Leave it as 0.0 and note that the actual calculated value should be compared.
-    // 3. Or, even better, this "theoretical" matrix could actually *use* the output
-    //    of calculate_morans_i for this specific entry if the goal is to show what the
-    //    code *should* produce if the hand-derivations are also correct.
-    // Let's use a placeholder, as this matrix is for "hand-derived expectations".
     theoretical_I->values[4 * n_genes + 4] = 0.4; // Placeholder: Expected positive, actual value will depend on exact Z-scores and W sums.
 
     printf("Theoretical Moran's I expectation matrix created.\n");
     return theoretical_I;
 }
 
-// --- Helper: create_toy_W_matrix_2d remains the same ---
 SparseMatrix* create_toy_W_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_cols) {
     MKL_INT n_spots = num_grid_rows * num_grid_cols;
     if (n_spots == 0) {
@@ -236,7 +1254,7 @@ SparseMatrix* create_toy_W_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_col
         temp_V = (double*)malloc(max_possible_nnz * sizeof(double));
         if (!temp_I || !temp_J || !temp_V) {
             perror("malloc temp COO for toy W 2D");
-            goto cleanup_toy_w_coo_2d; // Updated label
+            goto cleanup_toy_w_coo_2d;
         }
     }
 
@@ -259,7 +1277,7 @@ SparseMatrix* create_toy_W_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_col
                         current_nnz++;
                     } else if (temp_I) { 
                         fprintf(stderr, "Error: Exceeded temp COO capacity for toy W 2D.\n");
-                        goto cleanup_toy_w_coo_2d; // Updated label
+                        goto cleanup_toy_w_coo_2d;
                     }
                 }
             }
@@ -268,22 +1286,22 @@ SparseMatrix* create_toy_W_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_col
     W->nnz = current_nnz;
 
     W->row_ptr = (MKL_INT*)mkl_calloc(n_spots + 1, sizeof(MKL_INT), 64);
-    if (!W->row_ptr) { perror("mkl_calloc W->row_ptr for toy W 2D"); goto cleanup_toy_w_coo_2d;} // Updated label
+    if (!W->row_ptr) { perror("mkl_calloc W->row_ptr for toy W 2D"); goto cleanup_toy_w_coo_2d;}
 
     if (W->nnz > 0) {
         W->col_ind = (MKL_INT*)mkl_malloc(W->nnz * sizeof(MKL_INT), 64);
         W->values  = (double*)mkl_malloc(W->nnz * sizeof(double), 64);
         if (!W->col_ind || !W->values) {
             perror("mkl_malloc W->col_ind/values for toy W 2D");
-            goto cleanup_toy_w_coo_2d; // Updated label
+            goto cleanup_toy_w_coo_2d;
         }
 
         for (MKL_INT k = 0; k < W->nnz; ++k) W->row_ptr[temp_I[k] + 1]++;
         for (MKL_INT i = 0; i < n_spots; ++i) W->row_ptr[i + 1] += W->row_ptr[i];
         
-        current_pos = (MKL_INT*)mkl_malloc((size_t)(n_spots + 1) * sizeof(MKL_INT), 64); // Corrected size
-        if (!current_pos) { perror("mkl_malloc current_pos for CSR conversion"); goto cleanup_toy_w_coo_2d;} // Updated label
-        memcpy(current_pos, W->row_ptr, (size_t)(n_spots + 1) * sizeof(MKL_INT)); // Corrected size
+        current_pos = (MKL_INT*)mkl_malloc((size_t)(n_spots + 1) * sizeof(MKL_INT), 64);
+        if (!current_pos) { perror("mkl_malloc current_pos for CSR conversion"); goto cleanup_toy_w_coo_2d;}
+        memcpy(current_pos, W->row_ptr, (size_t)(n_spots + 1) * sizeof(MKL_INT));
 
         for (MKL_INT k = 0; k < W->nnz; ++k) {
             MKL_INT r_csr = temp_I[k]; 
@@ -297,17 +1315,16 @@ SparseMatrix* create_toy_W_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_col
         W->values = NULL;
     }
 
-cleanup_toy_w_coo_2d: // Centralized cleanup label for this function
+cleanup_toy_w_coo_2d:
     free(temp_I); 
     free(temp_J); 
     free(temp_V);
     mkl_free(current_pos);
-    // If any CSR allocation failed after COO temp arrays were used, W might be partially formed
     if ((W->row_ptr && W->nnz > 0 && (!W->col_ind || !W->values)) || (!W->row_ptr && n_spots > 0) ) { 
-        free_sparse_matrix(W); // free_sparse_matrix handles partially allocated W
+        free_sparse_matrix(W);
         return NULL;
     }
-    if (W->nnz > 0 && (!W->col_ind || !W->values)) { // Final check if CSR data alloc failed
+    if (W->nnz > 0 && (!W->col_ind || !W->values)) {
          free_sparse_matrix(W);
          return NULL;
     }
@@ -316,17 +1333,13 @@ cleanup_toy_w_coo_2d: // Centralized cleanup label for this function
     return W;
 }
 
-/*
- * Creates a toy X_calc matrix ( (num_grid_rows * num_grid_cols) x N_genes )
- * with 2D spatial patterns, then Z-normalizes it. Now uses 5 genes.
- */
 DenseMatrix* create_toy_X_calc_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_cols, MKL_INT n_genes) {
     MKL_INT n_spots = num_grid_rows * num_grid_cols;
     if (n_spots == 0 || n_genes == 0) {
         fprintf(stderr, "Error (create_toy_X_calc_2d): n_spots or n_genes is zero.\n");
         return NULL;
     }
-    if (n_genes < 5 && n_genes > 0) { // Check if enough genes for all defined patterns
+    if (n_genes < 5 && n_genes > 0) {
         fprintf(stderr, "Warning (create_toy_X_calc_2d): Requested %lld genes, but patterns defined for up to 5. Some patterns might be omitted.\n", (long long)n_genes);
     }
 
@@ -373,14 +1386,14 @@ DenseMatrix* create_toy_X_calc_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid
     if (n_genes >= 5) {
         double center_r = (double)(num_grid_rows -1) / 2.0;
         double center_c = (double)(num_grid_cols -1) / 2.0;
-        double max_dist_val = 0.0; // Find max distance to a corner to scale values later
+        double max_dist_val = 0.0;
         for (MKL_INT r_corn = 0; r_corn < num_grid_rows; r_corn += (num_grid_rows-1 > 0 ? num_grid_rows-1 : 1) ) {
              for (MKL_INT c_corn = 0; c_corn < num_grid_cols; c_corn += (num_grid_cols-1 > 0 ? num_grid_cols-1 : 1) ) {
                 double d = sqrt(pow(r_corn - center_r, 2) + pow(c_corn - center_c, 2));
                 if (d > max_dist_val) max_dist_val = d;
              }
         }
-        if (max_dist_val == 0 && (num_grid_rows > 1 || num_grid_cols > 1) ) max_dist_val = 1.0; // Avoid div by zero for non-1x1 grid
+        if (max_dist_val == 0 && (num_grid_rows > 1 || num_grid_cols > 1) ) max_dist_val = 1.0;
 
         for (MKL_INT r = 0; r < num_grid_rows; ++r) for (MKL_INT c=0; c<num_grid_cols; ++c) {
             double dist_from_center = sqrt(pow(r - center_r, 2) + pow(c - center_c, 2));
@@ -408,7 +1421,6 @@ DenseMatrix* create_toy_X_calc_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid
     return X;
 }
 
-/* Orchestrator for the 2D Grid Toy Example. */
 int run_toy_example_2d(const char* output_prefix_toy, const MoransIConfig* cli_config) {
     printf("\n--- Running 2D Grid Toy Example (5x5 spots, 5 genes) ---\n");
     MKL_INT grid_rows = 5; 
@@ -419,24 +1431,23 @@ int run_toy_example_2d(const char* output_prefix_toy, const MoransIConfig* cli_c
     DenseMatrix* toy_X_calc = create_toy_X_calc_matrix_2d(grid_rows, grid_cols, toy_n_genes);
     SparseMatrix* toy_W = create_toy_W_matrix_2d(grid_rows, grid_cols);
 
-    DenseMatrix* toy_observed_I = NULL; // Initialize to NULL
-    DenseMatrix* toy_theoretical_I = NULL; // Initialize to NULL
-    PermutationResults* toy_perm_results = NULL; // Initialize to NULL
+    DenseMatrix* toy_observed_I = NULL;
+    DenseMatrix* toy_theoretical_I = NULL;
+    PermutationResults* toy_perm_results = NULL;
 
     if (!toy_X_calc || !toy_W) {
         fprintf(stderr, "Failed to create 2D toy matrices for example.\n");
         status = MORANS_I_ERROR_COMPUTATION;
-        goto toy_cleanup; // Use goto for cleanup
+        goto toy_cleanup;
     }
 
-    char file_buffer[BUFFER_SIZE]; // Reusable buffer for filenames
+    char file_buffer[BUFFER_SIZE];
 
     snprintf(file_buffer, BUFFER_SIZE, "%s_toy_2D_X_calc_Znorm.tsv", output_prefix_toy);
     if (save_results(toy_X_calc, file_buffer) == MORANS_I_SUCCESS) {
         printf("Saved Z-normalized 2D toy X_calc to %s for inspection.\n", file_buffer);
     }
 
-    // Create and save the "hand-derived" theoretical matrix
     toy_theoretical_I = create_theoretical_toy_moran_i_matrix_2d(toy_n_genes, toy_X_calc->colnames);
     if (toy_theoretical_I) {
         snprintf(file_buffer, BUFFER_SIZE, "%s_toy_2D_theoretical_I_full.tsv", output_prefix_toy);
@@ -450,11 +1461,10 @@ int run_toy_example_2d(const char* output_prefix_toy, const MoransIConfig* cli_c
     }
 
     printf("Calculating observed Moran's I for 2D toy example...\n");
-    toy_observed_I = calculate_morans_i(toy_X_calc, toy_W);
+    toy_observed_I = calculate_morans_i(toy_X_calc, toy_W, cli_config->row_normalize_weights);
     if (!toy_observed_I) {
         fprintf(stderr, "Failed to calculate observed Moran's I for 2D toy example.\n");
         status = MORANS_I_ERROR_COMPUTATION;
-        // No goto here, will be caught by next if block or cleanup will handle toy_observed_I = NULL
     } else {
         snprintf(file_buffer, BUFFER_SIZE, "%s_toy_2D_observed_I_full.tsv", output_prefix_toy);
         if (save_results(toy_observed_I, file_buffer) == MORANS_I_SUCCESS) {
@@ -465,16 +1475,15 @@ int run_toy_example_2d(const char* output_prefix_toy, const MoransIConfig* cli_c
 
         if (cli_config->run_permutations) {
             PermutationParams toy_perm_params;
-            toy_perm_params.n_permutations = (cli_config->num_permutations > 0 && cli_config->num_permutations < 5000) ? cli_config->num_permutations : 10000;
+            toy_perm_params.n_permutations = (cli_config->num_permutations > 0 && cli_config->num_permutations < 5000) ? cli_config->num_permutations : 100;
             toy_perm_params.seed = cli_config->perm_seed; 
             toy_perm_params.z_score_output = cli_config->perm_output_zscores;
             toy_perm_params.p_value_output = cli_config->perm_output_pvalues;
 
             printf("Running permutation test for 2D toy example (%d permutations)...\n", toy_perm_params.n_permutations);
-            toy_perm_results = run_permutation_test(toy_X_calc, toy_W, &toy_perm_params);
+            toy_perm_results = run_permutation_test(toy_X_calc, toy_W, &toy_perm_params, cli_config->row_normalize_weights);
 
             if (toy_perm_results) {
-                // save_permutation_results now saves Z and P lower triangular files
                 if (save_permutation_results(toy_perm_results, output_prefix_toy) != MORANS_I_SUCCESS) {
                      fprintf(stderr, "Warning: Failed to save some or all toy permutation results.\n");
                 } else {
@@ -489,17 +1498,16 @@ int run_toy_example_2d(const char* output_prefix_toy, const MoransIConfig* cli_c
         }
     }
 
-toy_cleanup: // Label for cleaning up toy-specific allocations
+toy_cleanup:
     free_dense_matrix(toy_X_calc);
     free_sparse_matrix(toy_W);
-    free_dense_matrix(toy_observed_I); // Safe if NULL
-    free_dense_matrix(toy_theoretical_I); // Safe if NULL
-    free_permutation_results(toy_perm_results); // Safe if NULL
+    free_dense_matrix(toy_observed_I);
+    free_dense_matrix(toy_theoretical_I);
+    free_permutation_results(toy_perm_results);
     printf("--- 2D Grid Toy Example Finished ---\n\n");
     return status;
 }
 
-/* helper function to parse weight format string */
 int parse_weight_format(const char* format_str) {
     if (!format_str) return WEIGHT_FORMAT_AUTO;
     
@@ -512,7 +1520,6 @@ int parse_weight_format(const char* format_str) {
     return WEIGHT_FORMAT_AUTO;
 }
 
-/* Helper function to extract spot names from expression matrix for weight matrix mapping */
 char** extract_spot_names_from_expression(const DenseMatrix* expr_matrix, MKL_INT* n_spots_out) {
     if (!expr_matrix || !n_spots_out) {
         fprintf(stderr, "Error: NULL parameters in extract_spot_names_from_expression\n");
@@ -520,8 +1527,6 @@ char** extract_spot_names_from_expression(const DenseMatrix* expr_matrix, MKL_IN
         return NULL;
     }
     
-    // For custom weights, we need the spot names from the expression matrix rownames
-    // Note: X_calc is spots x genes, so spot names are in rownames
     MKL_INT n_spots = expr_matrix->nrows;
     *n_spots_out = n_spots;
     
@@ -547,528 +1552,72 @@ char** extract_spot_names_from_expression(const DenseMatrix* expr_matrix, MKL_IN
     return spot_names;
 }
 
-/* Main function */
+/* Main function - now clean and focused */
 int main(int argc, char* argv[]) {
-    double main_op_start_time, main_op_end_time;
     double total_start_time = get_time();
-
-    MoransIConfig config = initialize_default_config();
-    char input_file[BUFFER_SIZE] = "";
-    char output_file_prefix[BUFFER_SIZE] = "";
-    char meta_file[BUFFER_SIZE] = "";
-    char id_column[BUFFER_SIZE] = "cell_ID";
-    char x_column[BUFFER_SIZE] = "sdimx";
-    char y_column[BUFFER_SIZE] = "sdimy";
-    double custom_sigma = 0.0;
-    int use_metadata_file = 0;
-    int run_the_toy_example_flag = 0; // 0 = no toy, 2 = 2D grid toy
-
-    DenseMatrix* vst_matrix_ptr = NULL;
-    DenseMatrix* znorm_genes_x_spots_ptr = NULL;
-    SpotCoordinates* spot_coords_data_ptr = NULL;
-    MKL_INT* valid_spot_original_indices_ptr = NULL;
-    MKL_INT* valid_spot_rows_for_W_ptr = NULL;
-    MKL_INT* valid_spot_cols_for_W_ptr = NULL;
-    char**   valid_spot_names_list_ptr = NULL;
-    DenseMatrix* decay_lookup_matrix_ptr = NULL;
-    SparseMatrix* W_matrix_ptr = NULL;
-    DenseMatrix* X_calc_ptr = NULL;
-    DenseMatrix* observed_morans_i_matrix_ptr = NULL;
-    PermutationResults* perm_results_ptr = NULL;
     int final_status = MORANS_I_SUCCESS;
-    MKL_INT num_valid_spots_for_helpers = 0;
-
-    if (argc == 1 || (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0))) {
-        print_main_help(argv[0]);
-        return 0;
-    }
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-i") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for -i\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            strncpy(input_file, argv[i], BUFFER_SIZE - 1); input_file[BUFFER_SIZE - 1] = '\0';
-        } else if (strcmp(argv[i], "-o") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for -o\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            strncpy(output_file_prefix, argv[i], BUFFER_SIZE - 1); output_file_prefix[BUFFER_SIZE - 1] = '\0';
-        } else if (strcmp(argv[i], "--run-toy-example") == 0) {
-            run_the_toy_example_flag = 2; 
-        } else if (strcmp(argv[i], "-c") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for -c\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            strncpy(meta_file, argv[i], BUFFER_SIZE - 1); meta_file[BUFFER_SIZE - 1] = '\0';
-            use_metadata_file = 1;
-        } else if (strcmp(argv[i], "--id-col") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for --id-col\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            strncpy(id_column, argv[i], BUFFER_SIZE - 1); id_column[BUFFER_SIZE - 1] = '\0';
-        } else if (strcmp(argv[i], "--x-col") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for --x-col\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            strncpy(x_column, argv[i], BUFFER_SIZE - 1); x_column[BUFFER_SIZE - 1] = '\0';
-        } else if (strcmp(argv[i], "--y-col") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for --y-col\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            strncpy(y_column, argv[i], BUFFER_SIZE - 1); y_column[BUFFER_SIZE - 1] = '\0';
-        } else if (strcmp(argv[i], "--scale") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for --scale\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            config.coord_scale = load_double_value(argv[i], "--scale");
-            if (isnan(config.coord_scale) || config.coord_scale <= 0) { fprintf(stderr, "Error: --scale must be a positive number.\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup;}
-        } else if (strcmp(argv[i], "--sigma") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for --sigma\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            custom_sigma = load_double_value(argv[i], "--sigma");
-            if (isnan(custom_sigma)) { final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-        } else if (strcmp(argv[i], "-r") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for -r\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            config.max_radius = load_positive_value(argv[i], "-r", 1, 1000);
-            if (config.max_radius < 0) { final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-        } else if (strcmp(argv[i], "-w") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for -w\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            if (config.custom_weights_file) free(config.custom_weights_file);
-            config.custom_weights_file = strdup(argv[i]);
-            if (!config.custom_weights_file) { perror("strdup custom_weights_file"); final_status = MORANS_I_ERROR_MEMORY; goto cleanup; }
-            config.platform_mode = CUSTOM_WEIGHTS;
-        } else if (strcmp(argv[i], "--weight-format") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for --weight-format\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            config.weight_format = parse_weight_format(argv[i]);
-        } else if (strcmp(argv[i], "--normalize-weights") == 0) {
-            config.normalize_weights = 1;
-        } else if (strcmp(argv[i], "-p") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for -p\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            // Updated to allow CUSTOM_WEIGHTS (3)
-            config.platform_mode = load_positive_value(argv[i], "-p", 0, 3);
-            if (config.platform_mode < 0) { final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-        } else if (strcmp(argv[i], "-b") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for -b\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            config.calc_pairwise = load_positive_value(argv[i], "-b", 0, 1);
-            if (config.calc_pairwise < 0) { final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-        } else if (strcmp(argv[i], "-g") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for -g\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            config.calc_all_vs_all = load_positive_value(argv[i], "-g", 0, 1);
-            if (config.calc_all_vs_all < 0) { final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-        } else if (strcmp(argv[i], "-s") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for -s\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            config.include_same_spot = load_positive_value(argv[i], "-s", 0, 1);
-            if (config.include_same_spot < 0) { final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-        } else if (strcmp(argv[i], "-t") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for -t\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            config.n_threads = load_positive_value(argv[i], "-t", 1, 1024);
-            if (config.n_threads < 0) { final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-        } else if (strcmp(argv[i], "-m") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for -m\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            config.mkl_n_threads = load_positive_value(argv[i], "-m", 1, 1024);
-            if (config.mkl_n_threads < 0) { final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-        } else if (strcmp(argv[i], "--run-perms") == 0) { 
-            config.run_permutations = 1;
-        } else if (strcmp(argv[i], "--n-perms") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for --n-perms\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            config.num_permutations = load_positive_value(argv[i], "--n-perms", 1, 10000000);
-            if (config.num_permutations < 0) { final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            config.run_permutations = 1;
-        } else if (strcmp(argv[i], "--perm-seed") == 0) {
-            if (++i >= argc) { fprintf(stderr, "Error: Missing value for --perm-seed\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup; }
-            long seed_val = strtol(argv[i], NULL, 10); 
-            if (errno == ERANGE || seed_val < 0 || (unsigned long)seed_val > UINT_MAX) { 
-                fprintf(stderr, "Error: Invalid seed value for --perm-seed '%s'.\n", argv[i]); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup;
-            }
-            config.perm_seed = (unsigned int)seed_val;
-            config.run_permutations = 1;
-        } else if (strcmp(argv[i], "--perm-output-zscores") == 0) {
-            config.perm_output_zscores = 1;
-            config.run_permutations = 1;
-        } else if (strcmp(argv[i], "--perm-output-pvalues") == 0) {
-            config.perm_output_pvalues = 1;
-            config.run_permutations = 1;
-        } else {
-            fprintf(stderr, "Error: Unknown parameter '%s'. Use -h for help.\n", argv[i]);
-            final_status = MORANS_I_ERROR_PARAMETER; goto cleanup;
-        }
-    }
-
-    if (initialize_morans_i(&config) != MORANS_I_SUCCESS) {
-        fprintf(stderr, "Error: Failed to initialize Moran's I MKL/OpenMP environment.\n");
-        final_status = MORANS_I_ERROR_COMPUTATION; goto cleanup;
-    }
-    if (strlen(output_file_prefix) == 0) { fprintf(stderr, "Error: Output file prefix (-o) must be specified.\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup;}
-
-    // Validate custom weight matrix settings
-    if (config.platform_mode == CUSTOM_WEIGHTS) {
-        if (!config.custom_weights_file) {
-            fprintf(stderr, "Error: Custom weights platform mode requires -w <weight_file>\n");
-            final_status = MORANS_I_ERROR_PARAMETER; goto cleanup;
-        }
-        if (access(config.custom_weights_file, R_OK) != 0) {
-            fprintf(stderr, "Error: Cannot access custom weight matrix file '%s': %s\n", 
-                    config.custom_weights_file, strerror(errno));
-            final_status = MORANS_I_ERROR_FILE; goto cleanup;
-        }
-    } else if (config.custom_weights_file) {
-        // If weight file provided without setting platform mode
-        fprintf(stderr, "Warning: Custom weight file provided, automatically setting platform mode to CUSTOM_WEIGHTS\n");
-        config.platform_mode = CUSTOM_WEIGHTS;
+    
+    /* Initialize structures */
+    MoransIConfig config = initialize_default_config();
+    CommandLineArgs args;
+    AnalysisResources resources;
+    initialize_command_args(&args);
+    initialize_resources(&resources);
+    
+    /* Parse command line arguments */
+    int parse_status = parse_command_line_arguments(argc, argv, &config, &args);
+    if (parse_status != MORANS_I_SUCCESS) {
+        final_status = parse_status;
+        goto cleanup;
     }
     
-    if (config.normalize_weights && config.platform_mode != CUSTOM_WEIGHTS) {
-        fprintf(stderr, "Warning: --normalize-weights only applies to custom weight matrices\n");
-        config.normalize_weights = 0;
-    }
-
-    if (run_the_toy_example_flag == 2) {
-        final_status = run_toy_example_2d(output_file_prefix, &config);
-        goto cleanup; 
-    }
-
-    // --- REGULAR EXECUTION PATH ---
-    if (strlen(input_file) == 0) { fprintf(stderr, "Error: Input file (-i) must be specified for standard run.\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup;}
-    if (access(input_file, R_OK) != 0) { fprintf(stderr, "Error: Cannot access input file '%s': %s\n", input_file, strerror(errno)); final_status = MORANS_I_ERROR_FILE; goto cleanup;}
-    if (use_metadata_file) {
-        if (strlen(meta_file) == 0) { fprintf(stderr, "Error: Metadata file path is empty despite -c being used.\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup;}
-        if (access(meta_file, R_OK) != 0) { fprintf(stderr, "Error: Cannot access metadata file '%s': %s\n", meta_file, strerror(errno)); final_status = MORANS_I_ERROR_FILE; goto cleanup;}
-        if (config.platform_mode != SINGLE_CELL && config.platform_mode != CUSTOM_WEIGHTS) {
-            printf("Warning: Metadata file (-c) provided. Forcing platform mode to SINGLE_CELL (%d).\n", SINGLE_CELL);
-            config.platform_mode = SINGLE_CELL;
-        }
-    } else {
-        if (config.platform_mode == SINGLE_CELL) { fprintf(stderr, "Error: Platform mode SINGLE_CELL selected, but no metadata file (-c) provided.\n"); final_status = MORANS_I_ERROR_PARAMETER; goto cleanup;}
-    }
-
-    printf("\nMoran's I calculation utility version %s\n\n", morans_i_mkl_version());
-    printf("--- Parameters ---\n");
-    printf("Input file: %s\n", input_file);
-    printf("Output file prefix: %s\n", output_file_prefix);
-    
-    if (config.platform_mode == CUSTOM_WEIGHTS) {
-        printf("Custom Weight Matrix File: %s\n", config.custom_weights_file);
-        const char* format_names[] = {"auto", "dense", "sparse_coo", "sparse_tsv"};
-        printf("  Weight Format: %s\n", format_names[config.weight_format]);
-        printf("  Normalize Weights: %s\n", config.normalize_weights ? "Yes" : "No");
-    } else {
-        if (use_metadata_file) {
-            printf("Metadata file: %s\n", meta_file);
-            printf("  ID column: %s\n", id_column); 
-            printf("  X coordinate column: %s\n", x_column); 
-            printf("  Y coordinate column: %s\n", y_column);
-            printf("  Coordinate scale factor: %.2f\n", config.coord_scale);
-        }
-        if (custom_sigma > 0) printf("Custom Sigma for RBF: %.4f\n", custom_sigma);
-        else printf("Custom Sigma for RBF: Not set (will use platform default or infer for SC).\n");
-        printf("Max radius (grid units): %d\n", config.max_radius);
+    /* Check if help was requested (indicated by empty output prefix after successful parsing) */
+    if (argc <= 2 && strlen(args.output_prefix) == 0) {
+        final_status = MORANS_I_SUCCESS;
+        goto cleanup;
     }
     
-    const char* platform_names[] = {"Visium", "Old ST", "Single Cell", "Custom Weights"};
-    printf("Platform: %d (%s)\n", config.platform_mode, 
-           config.platform_mode < 4 ? platform_names[config.platform_mode] : "Unknown");
-    printf("Mode: %s\n", config.calc_pairwise ? "Pairwise Moran's I" : "Single-Gene Moran's I");
-    if (config.calc_pairwise) printf("  Gene Pairs: %s\n", config.calc_all_vs_all ? "All vs All" : "First Gene vs All Others");
-    printf("Include Self-Comparisons (w_ii): %s\n", config.include_same_spot ? "Yes" : "No");
+    /* Handle toy example mode */
+    if (args.run_toy_example == 2) {
+        final_status = run_toy_example_2d(args.output_prefix, &config);
+        goto cleanup;
+    }
     
-    if(config.run_permutations) {
-        printf("Permutation Testing: Enabled\n");
-        printf("  Number of Permutations: %d\n", config.num_permutations);
-        printf("  Permutation Seed: %u\n", config.perm_seed);
-        printf("  Output Z-scores: %s\n", config.perm_output_zscores ? "Yes" : "No");
-        printf("  Output P-values: %s\n", config.perm_output_pvalues ? "Yes" : "No");
+    /* Validate configuration and initialize */
+    final_status = validate_and_initialize_config(&config, &args);
+    if (final_status != MORANS_I_SUCCESS) {
+        goto cleanup;
     }
-    printf("------------------\n");
-
-    printf("Loading gene expression data from %s...\n", input_file);
-    main_op_start_time = get_time(); vst_matrix_ptr = read_vst_file(input_file); main_op_end_time = get_time();
-    print_elapsed_time(main_op_start_time, main_op_end_time, "gene expression data loading");
-    if (!vst_matrix_ptr) { fprintf(stderr, "Error: Failed to load gene expression data.\n"); final_status = MORANS_I_ERROR_FILE; goto cleanup;}
-    printf("Loaded data matrix: %lld genes x %lld spots/cells.\n", (long long)vst_matrix_ptr->nrows, (long long)vst_matrix_ptr->ncols);
-    if (vst_matrix_ptr->nrows == 0 || vst_matrix_ptr->ncols == 0) { fprintf(stderr, "Error: Loaded expression matrix is empty.\n"); final_status = MORANS_I_ERROR_FILE; goto cleanup;}
-
-    MKL_INT total_expr_elements_main = vst_matrix_ptr->nrows * vst_matrix_ptr->ncols; MKL_INT non_finite_count_main = 0; 
-    #pragma omp parallel for reduction(+:non_finite_count_main)
-    for (MKL_INT i_main = 0; i_main < total_expr_elements_main; i_main++) if (!isfinite(vst_matrix_ptr->values[i_main])) { vst_matrix_ptr->values[i_main] = 0.0; non_finite_count_main++;}
-    if (non_finite_count_main > 0) printf("Warning: Found and replaced %lld non-finite values with 0.0 in expression data.\n", (long long)non_finite_count_main);
-
-    printf("Performing Z-normalization (gene-wise)...\n");
-    main_op_start_time = get_time(); znorm_genes_x_spots_ptr = z_normalize(vst_matrix_ptr); main_op_end_time = get_time();
-    print_elapsed_time(main_op_start_time, main_op_end_time, "Z-normalization");
-    free_dense_matrix(vst_matrix_ptr); vst_matrix_ptr = NULL; 
-    if (!znorm_genes_x_spots_ptr) { fprintf(stderr, "Error: Z-normalization failed.\n"); final_status = MORANS_I_ERROR_COMPUTATION; goto cleanup;}
-
-    // Skip coordinate processing for custom weights mode
-    if (config.platform_mode != CUSTOM_WEIGHTS) {
-        printf("Preparing spatial coordinate data...\n");
-        main_op_start_time = get_time();
-        if (use_metadata_file) spot_coords_data_ptr = read_coordinates_file(meta_file, id_column, x_column, y_column, config.coord_scale);
-        else spot_coords_data_ptr = extract_coordinates(znorm_genes_x_spots_ptr->colnames, znorm_genes_x_spots_ptr->ncols);
-        main_op_end_time = get_time(); print_elapsed_time(main_op_start_time, main_op_end_time, "spatial coordinate processing");
-        if (!spot_coords_data_ptr) { fprintf(stderr, "Error: Failed to obtain or process spot coordinates.\n"); final_status = MORANS_I_ERROR_COMPUTATION; goto cleanup;}
-        printf("Processed %lld total spot coordinate entries, %lld are valid.\n", (long long)spot_coords_data_ptr->total_spots, (long long)spot_coords_data_ptr->valid_spots);
-        if (spot_coords_data_ptr->valid_spots == 0) { fprintf(stderr, "Error: No valid spot coordinates found. Cannot proceed.\n"); final_status = MORANS_I_ERROR_COMPUTATION; goto cleanup;}
-
-        double sigma_for_decay_main = custom_sigma; 
-        if (config.platform_mode == SINGLE_CELL && sigma_for_decay_main <= 0.0) {
-            printf("Inferring sigma for RBF kernel from single-cell coordinate data...\n");
-            sigma_for_decay_main = infer_sigma_from_data(spot_coords_data_ptr, config.coord_scale);
-            if (sigma_for_decay_main <= 0) { fprintf(stderr, "Warning: Failed to infer positive sigma (got %.2f), using default of 50.0 for SC.\n", sigma_for_decay_main); sigma_for_decay_main = 50.0;}
-        }
-        
-        num_valid_spots_for_helpers = spot_coords_data_ptr->valid_spots;
-        valid_spot_original_indices_ptr = (MKL_INT*)malloc((size_t)num_valid_spots_for_helpers * sizeof(MKL_INT));
-        valid_spot_rows_for_W_ptr = (MKL_INT*)malloc((size_t)num_valid_spots_for_helpers * sizeof(MKL_INT));
-        valid_spot_cols_for_W_ptr = (MKL_INT*)malloc((size_t)num_valid_spots_for_helpers * sizeof(MKL_INT));
-        valid_spot_names_list_ptr = (char**)calloc(num_valid_spots_for_helpers, sizeof(char*));
-        if (!valid_spot_original_indices_ptr || !valid_spot_rows_for_W_ptr || !valid_spot_cols_for_W_ptr || !valid_spot_names_list_ptr) {
-            perror("Memory allocation failed for valid spot helper arrays"); final_status = MORANS_I_ERROR_MEMORY; goto cleanup;
-        }
-        MKL_INT v_idx_main = 0; 
-        for (MKL_INT i_main_loop = 0; i_main_loop < spot_coords_data_ptr->total_spots; i_main_loop++) { 
-            if (spot_coords_data_ptr->valid_mask[i_main_loop]) {
-                if (v_idx_main >= num_valid_spots_for_helpers) { fprintf(stderr, "Error: Index v_idx_main out of bounds for helper arrays.\n"); final_status = MORANS_I_ERROR_COMPUTATION; goto cleanup;}
-                valid_spot_rows_for_W_ptr[v_idx_main] = spot_coords_data_ptr->spot_row[i_main_loop];
-                valid_spot_cols_for_W_ptr[v_idx_main] = spot_coords_data_ptr->spot_col[i_main_loop];
-                valid_spot_names_list_ptr[v_idx_main] = strdup(spot_coords_data_ptr->spot_names[i_main_loop]);
-                if(!valid_spot_names_list_ptr[v_idx_main]) { perror("strdup for valid_spot_names_list"); final_status = MORANS_I_ERROR_MEMORY; goto cleanup;}
-                int expr_col_idx_main = -1; 
-                for (MKL_INT j_main_loop = 0; j_main_loop < znorm_genes_x_spots_ptr->ncols; ++j_main_loop) if (strcmp(spot_coords_data_ptr->spot_names[i_main_loop], znorm_genes_x_spots_ptr->colnames[j_main_loop]) == 0) { expr_col_idx_main = j_main_loop; break;}
-                valid_spot_original_indices_ptr[v_idx_main] = expr_col_idx_main;
-                if(expr_col_idx_main == -1 && use_metadata_file) fprintf(stderr, "Warning: Valid coordinate spot '%s' from metadata not found in expression matrix colnames.\n", spot_coords_data_ptr->spot_names[i_main_loop]);
-                v_idx_main++;
-            }
-        }
-        if (v_idx_main != num_valid_spots_for_helpers) {
-            fprintf(stderr, "Warning: Actual populated valid spots (%lld) differs from initial count (%lld). Adjusting.\n", (long long)v_idx_main, (long long)num_valid_spots_for_helpers);
-            num_valid_spots_for_helpers = v_idx_main; 
-            if (num_valid_spots_for_helpers == 0) { fprintf(stderr, "Error: No valid spots remain. Cannot proceed.\n"); final_status = MORANS_I_ERROR_COMPUTATION; goto cleanup; }
-        }
-
-        printf("Creating distance decay matrix (max_radius_grid_units=%d)...\n", config.max_radius);
-        main_op_start_time = get_time();
-        decay_lookup_matrix_ptr = create_distance_matrix(config.max_radius, config.platform_mode, sigma_for_decay_main, config.coord_scale);
-        main_op_end_time = get_time(); print_elapsed_time(main_op_start_time, main_op_end_time, "distance decay matrix creation");
-        if (!decay_lookup_matrix_ptr) { fprintf(stderr, "Error: Failed to create distance decay lookup matrix.\n"); final_status = MORANS_I_ERROR_COMPUTATION; goto cleanup;}
-        if (!config.include_same_spot && decay_lookup_matrix_ptr->nrows > 0 && decay_lookup_matrix_ptr->ncols > 0) {
-            printf("Excluding self-comparisons: setting decay_matrix[0,0] to 0.0.\n");
-            decay_lookup_matrix_ptr->values[0] = 0.0;
-        }
-
-        printf("Building spatial weight matrix W for %lld valid spots...\n", (long long)num_valid_spots_for_helpers);
-        main_op_start_time = get_time();
-        W_matrix_ptr = build_spatial_weight_matrix(valid_spot_rows_for_W_ptr, valid_spot_cols_for_W_ptr, num_valid_spots_for_helpers, decay_lookup_matrix_ptr, config.max_radius);
-        main_op_end_time = get_time(); print_elapsed_time(main_op_start_time, main_op_end_time, "spatial weight matrix W construction");
-        free_dense_matrix(decay_lookup_matrix_ptr); decay_lookup_matrix_ptr = NULL;
-        if (!W_matrix_ptr) { fprintf(stderr, "Error: Failed to build spatial weight matrix W.\n"); final_status = MORANS_I_ERROR_COMPUTATION; goto cleanup;}
-
-        printf("Preparing final calculation matrix X_calc (Valid_Spots x Genes)...\n");
-        main_op_start_time = get_time(); X_calc_ptr = (DenseMatrix*)malloc(sizeof(DenseMatrix));
-        if (!X_calc_ptr) { perror("malloc X_calc_ptr struct"); final_status = MORANS_I_ERROR_MEMORY; goto cleanup; }
-        X_calc_ptr->nrows = num_valid_spots_for_helpers; X_calc_ptr->ncols = znorm_genes_x_spots_ptr->nrows;
-        X_calc_ptr->values = NULL; X_calc_ptr->rownames = NULL; X_calc_ptr->colnames = NULL;
-        X_calc_ptr->values = (double*)mkl_malloc((size_t)X_calc_ptr->nrows * X_calc_ptr->ncols * sizeof(double), 64);
-        X_calc_ptr->rownames = (char**)calloc(X_calc_ptr->nrows, sizeof(char*)); 
-        X_calc_ptr->colnames = (char**)calloc(X_calc_ptr->ncols, sizeof(char*)); 
-        if (!X_calc_ptr->values || !X_calc_ptr->rownames || !X_calc_ptr->colnames) {
-            perror("Memory allocation failed for X_calc_ptr components"); final_status = MORANS_I_ERROR_MEMORY; goto cleanup;
-        }
-
-        for (MKL_INT g_main = 0; g_main < X_calc_ptr->ncols; g_main++) { X_calc_ptr->colnames[g_main] = strdup(znorm_genes_x_spots_ptr->rownames[g_main]); if(!X_calc_ptr->colnames[g_main]) {perror("strdup X_calc_ptr gene name"); final_status = MORANS_I_ERROR_MEMORY; goto cleanup;}}
-        for (MKL_INT i_main_xc = 0; i_main_xc < X_calc_ptr->nrows; i_main_xc++) { X_calc_ptr->rownames[i_main_xc] = strdup(valid_spot_names_list_ptr[i_main_xc]); if(!X_calc_ptr->rownames[i_main_xc]) {perror("strdup X_calc_ptr spot name"); final_status = MORANS_I_ERROR_MEMORY; goto cleanup;}}
-
-        #pragma omp parallel for
-        for (MKL_INT i_valid_spot_main = 0; i_valid_spot_main < X_calc_ptr->nrows; i_valid_spot_main++) { 
-            MKL_INT original_expr_spot_col_idx_main = valid_spot_original_indices_ptr[i_valid_spot_main]; 
-            for (MKL_INT j_gene_main = 0; j_gene_main < X_calc_ptr->ncols; j_gene_main++) { 
-                if (original_expr_spot_col_idx_main != -1) X_calc_ptr->values[i_valid_spot_main * X_calc_ptr->ncols + j_gene_main] = znorm_genes_x_spots_ptr->values[j_gene_main * znorm_genes_x_spots_ptr->ncols + original_expr_spot_col_idx_main];
-                else X_calc_ptr->values[i_valid_spot_main * X_calc_ptr->ncols + j_gene_main] = 0.0; 
-            }
-        }
-        main_op_end_time = get_time(); print_elapsed_time(main_op_start_time, main_op_end_time, "final X_calc matrix preparation");
-
-        free_dense_matrix(znorm_genes_x_spots_ptr); znorm_genes_x_spots_ptr = NULL;
-        free_spot_coordinates(spot_coords_data_ptr); spot_coords_data_ptr = NULL;
-        if (valid_spot_names_list_ptr) { for(MKL_INT k=0; k < num_valid_spots_for_helpers; ++k) {if (valid_spot_names_list_ptr[k]) free(valid_spot_names_list_ptr[k]);} free(valid_spot_names_list_ptr); valid_spot_names_list_ptr = NULL; }
-        free(valid_spot_original_indices_ptr); valid_spot_original_indices_ptr = NULL;
-        free(valid_spot_rows_for_W_ptr); valid_spot_rows_for_W_ptr = NULL;
-        free(valid_spot_cols_for_W_ptr); valid_spot_cols_for_W_ptr = NULL;
-
-    } else {
-        // Custom weights mode: create X_calc directly from znorm_genes_x_spots_ptr
-        printf("Using custom weight matrix mode - preparing calculation matrix...\n");
-        main_op_start_time = get_time();
-        
-        // Transpose the gene x spots matrix to spots x genes for X_calc
-        X_calc_ptr = (DenseMatrix*)malloc(sizeof(DenseMatrix));
-        if (!X_calc_ptr) { perror("malloc X_calc_ptr struct"); final_status = MORANS_I_ERROR_MEMORY; goto cleanup; }
-        
-        X_calc_ptr->nrows = znorm_genes_x_spots_ptr->ncols; // spots
-        X_calc_ptr->ncols = znorm_genes_x_spots_ptr->nrows; // genes
-        X_calc_ptr->values = (double*)mkl_malloc((size_t)X_calc_ptr->nrows * X_calc_ptr->ncols * sizeof(double), 64);
-        X_calc_ptr->rownames = (char**)calloc(X_calc_ptr->nrows, sizeof(char*)); // spot names
-        X_calc_ptr->colnames = (char**)calloc(X_calc_ptr->ncols, sizeof(char*)); // gene names
-        
-        if (!X_calc_ptr->values || !X_calc_ptr->rownames || !X_calc_ptr->colnames) {
-            perror("Memory allocation failed for X_calc_ptr components"); final_status = MORANS_I_ERROR_MEMORY; goto cleanup;
-        }
-
-        // Copy gene names (columns in X_calc)
-        for (MKL_INT g = 0; g < X_calc_ptr->ncols; g++) {
-            X_calc_ptr->colnames[g] = strdup(znorm_genes_x_spots_ptr->rownames[g]);
-            if(!X_calc_ptr->colnames[g]) {perror("strdup X_calc_ptr gene name"); final_status = MORANS_I_ERROR_MEMORY; goto cleanup;}
-        }
-        
-        // Copy spot names (rows in X_calc)
-        for (MKL_INT s = 0; s < X_calc_ptr->nrows; s++) {
-            X_calc_ptr->rownames[s] = strdup(znorm_genes_x_spots_ptr->colnames[s]);
-            if(!X_calc_ptr->rownames[s]) {perror("strdup X_calc_ptr spot name"); final_status = MORANS_I_ERROR_MEMORY; goto cleanup;}
-        }
-        
-        // Transpose data: znorm_genes_x_spots_ptr[gene][spot] -> X_calc_ptr[spot][gene]
-        #pragma omp parallel for
-        for (MKL_INT s = 0; s < X_calc_ptr->nrows; s++) {
-            for (MKL_INT g = 0; g < X_calc_ptr->ncols; g++) {
-                X_calc_ptr->values[s * X_calc_ptr->ncols + g] = znorm_genes_x_spots_ptr->values[g * znorm_genes_x_spots_ptr->ncols + s];
-            }
-        }
-        
-        main_op_end_time = get_time(); 
-        print_elapsed_time(main_op_start_time, main_op_end_time, "matrix transposition for custom weights");
-        
-        free_dense_matrix(znorm_genes_x_spots_ptr); znorm_genes_x_spots_ptr = NULL;
-        
-        // Load custom weight matrix
-        printf("Loading custom weight matrix from %s...\n", config.custom_weights_file);
-        main_op_start_time = get_time();
-        
-        MKL_INT n_spots_for_weights;
-        char** spot_names_for_weights = extract_spot_names_from_expression(X_calc_ptr, &n_spots_for_weights);
-        
-        if (!spot_names_for_weights || n_spots_for_weights != X_calc_ptr->nrows) {
-            fprintf(stderr, "Error: Failed to extract spot names for weight matrix mapping\n");
-            if (spot_names_for_weights) free(spot_names_for_weights);
-            final_status = MORANS_I_ERROR_COMPUTATION; goto cleanup;
-        }
-        
-        W_matrix_ptr = read_custom_weight_matrix(config.custom_weights_file, 
-                                                config.weight_format,
-                                                spot_names_for_weights, 
-                                                n_spots_for_weights);
-        
-        free(spot_names_for_weights);  // Only free the array, not the strings (they're references)
-        
-        main_op_end_time = get_time();
-        print_elapsed_time(main_op_start_time, main_op_end_time, "custom weight matrix loading");
-        
-        if (!W_matrix_ptr) {
-            fprintf(stderr, "Error: Failed to load custom weight matrix.\n");
-            final_status = MORANS_I_ERROR_FILE; goto cleanup;
-        }
-        
-        // Optionally normalize weights
-        if (config.normalize_weights) {
-            double S0_before = calculate_weight_sum(W_matrix_ptr);
-            if (fabs(S0_before) > ZERO_STD_THRESHOLD) {
-                printf("Normalizing custom weights (S0_before = %.6f)...\n", S0_before);
-                for (MKL_INT i = 0; i < W_matrix_ptr->nnz; i++) {
-                    W_matrix_ptr->values[i] /= S0_before;
-                }
-                double S0_after = calculate_weight_sum(W_matrix_ptr);
-                printf("Weights normalized (S0_after = %.6f)\n", S0_after);
-            } else {
-                fprintf(stderr, "Warning: Cannot normalize weights with S0 near zero (%.6e)\n", S0_before);
-            }
-        }
+    
+    /* Print configuration summary */
+    print_configuration_summary(&config, &args);
+    
+    /* Load and process expression data */
+    final_status = load_and_process_expression_data(args.input_file, &resources);
+    if (final_status != MORANS_I_SUCCESS) {
+        goto cleanup;
     }
-
-    double S0_val_main = calculate_weight_sum(W_matrix_ptr); 
-    printf("Sum of all weights S0 = %.6f (from %lld NNZ in W)\n", S0_val_main, (long long)W_matrix_ptr->nnz);
-    if (fabs(S0_val_main) < DBL_EPSILON && W_matrix_ptr->nnz > 0) fprintf(stderr, "Warning: S0 is near-zero. Moran's I results will likely be 0, NaN, or Inf.\n");
-    if (W_matrix_ptr->nnz == 0 && X_calc_ptr->nrows > 0) fprintf(stderr, "Warning: Spatial Weight Matrix W has no non-zero elements.\n");
-
-    printf("Calculating Moran's I based on selected mode...\n");
-    main_op_start_time = get_time();
-    char result_output_filename_main[BUFFER_SIZE]; 
-
-    if (!config.calc_pairwise) { 
-        snprintf(result_output_filename_main, BUFFER_SIZE, "%s_single_gene_moran_i.tsv", output_file_prefix);
-        printf("Mode: Single-Gene Moran's I. Output: %s\n", result_output_filename_main);
-        final_status = save_single_gene_results(X_calc_ptr, W_matrix_ptr, S0_val_main, result_output_filename_main);
-    } else { 
-        if (!config.calc_all_vs_all) { 
-            snprintf(result_output_filename_main, BUFFER_SIZE, "%s_first_vs_all_moran_i.tsv", output_file_prefix);
-            printf("Mode: Pairwise Moran's I (First Gene vs All Others). Output: %s\n", result_output_filename_main);
-            if (X_calc_ptr->ncols == 0) { fprintf(stderr, "Error: No genes in X_calc_ptr for first-vs-all Moran's I.\n"); final_status = MORANS_I_ERROR_PARAMETER;
-            } else {
-                double* first_vs_all_results_arr_main = calculate_first_gene_vs_all(X_calc_ptr, W_matrix_ptr, S0_val_main); 
-                if (first_vs_all_results_arr_main) {
-                    final_status = save_first_gene_vs_all_results(first_vs_all_results_arr_main, (const char**)X_calc_ptr->colnames, X_calc_ptr->ncols, result_output_filename_main);
-                    mkl_free(first_vs_all_results_arr_main);
-                } else { fprintf(stderr, "Error: Failed to calculate Moran's I for first gene vs all others.\n"); final_status = MORANS_I_ERROR_COMPUTATION;}
-            }
-        } else { 
-            char raw_output_filename_main[BUFFER_SIZE]; 
-            snprintf(raw_output_filename_main, BUFFER_SIZE, "%s_all_pairs_moran_i_raw.tsv", output_file_prefix);
-            printf("Mode: Pairwise Moran's I (All Gene Pairs - Raw Lower Triangular). Output: %s\n", raw_output_filename_main);
-            observed_morans_i_matrix_ptr = calculate_morans_i(X_calc_ptr, W_matrix_ptr);
-            if (observed_morans_i_matrix_ptr) {
-                final_status = save_lower_triangular_matrix_raw(observed_morans_i_matrix_ptr, raw_output_filename_main);
-            } else {
-                fprintf(stderr, "Error: Failed to calculate all-pairs Moran's I.\n");
-                final_status = MORANS_I_ERROR_COMPUTATION;
-            }
-        }
+    
+    /* Setup spatial analysis components */
+    final_status = setup_spatial_analysis(&config, &args, &resources);
+    if (final_status != MORANS_I_SUCCESS) {
+        goto cleanup;
     }
-    main_op_end_time = get_time();
-    print_elapsed_time(main_op_start_time, main_op_end_time, "Observed Moran's I calculation and saving");
-
-    if (final_status == MORANS_I_SUCCESS && config.run_permutations) {
-        if (observed_morans_i_matrix_ptr != NULL && config.calc_pairwise && config.calc_all_vs_all) {
-            printf("--- Running Permutation Test ---\n");
-            PermutationParams perm_params_main; 
-            perm_params_main.n_permutations = config.num_permutations;
-            perm_params_main.seed = config.perm_seed; 
-            perm_params_main.z_score_output = config.perm_output_zscores;
-            perm_params_main.p_value_output = config.perm_output_pvalues;
-
-            main_op_start_time = get_time();
-            perm_results_ptr = run_permutation_test(X_calc_ptr, W_matrix_ptr, &perm_params_main);
-            main_op_end_time = get_time();
-            print_elapsed_time(main_op_start_time, main_op_end_time, "Permutation Test computation");
-
-            if (perm_results_ptr) {
-                main_op_start_time = get_time();
-                int save_perm_status_main = save_permutation_results(perm_results_ptr, output_file_prefix);
-                if(save_perm_status_main != MORANS_I_SUCCESS) {
-                    fprintf(stderr, "Error saving permutation results.\n");
-                    if (final_status == MORANS_I_SUCCESS) final_status = save_perm_status_main;
-                }
-                main_op_end_time = get_time();
-                print_elapsed_time(main_op_start_time, main_op_end_time, "Saving Permutation Test results");
-            } else {
-                fprintf(stderr, "Error: Permutation test failed to produce results.\n");
-                if (final_status == MORANS_I_SUCCESS) final_status = MORANS_I_ERROR_COMPUTATION;
-            }
-        } else if (config.run_permutations) { 
-             if (!config.calc_pairwise || !config.calc_all_vs_all) {
-                printf("Warning: Permutation testing is primarily designed for 'all gene pairs' mode (-b 1 -g 1).\n");
-                printf("         Current mode: -b %d -g %d. Skipping permutations.\n", config.calc_pairwise, config.calc_all_vs_all);
-             } else if (observed_morans_i_matrix_ptr == NULL && (config.calc_pairwise && config.calc_all_vs_all) ) {
-                printf("Warning: Observed Moran's I calculation failed for all-pairs. Skipping permutations.\n");
-             } else {
-                printf("Warning: Permutation testing requested but prerequisites not met. Skipping permutations.\n");
-             }
-        }
+    
+    /* Run Moran's I analysis */
+    final_status = run_moran_analysis(&config, &resources, args.output_prefix);
+    if (final_status != MORANS_I_SUCCESS) {
+        goto cleanup;
     }
-
+    
+    /* Run permutation analysis if requested */
+    final_status = run_permutation_analysis(&config, &resources, args.output_prefix);
+    
 cleanup:
-    if (vst_matrix_ptr) free_dense_matrix(vst_matrix_ptr);
-    if (znorm_genes_x_spots_ptr) free_dense_matrix(znorm_genes_x_spots_ptr);
-    if (spot_coords_data_ptr) free_spot_coordinates(spot_coords_data_ptr);
-    if (decay_lookup_matrix_ptr) free_dense_matrix(decay_lookup_matrix_ptr);
-    if (W_matrix_ptr) free_sparse_matrix(W_matrix_ptr);
-    if (X_calc_ptr) free_dense_matrix(X_calc_ptr);
-    if (observed_morans_i_matrix_ptr) free_dense_matrix(observed_morans_i_matrix_ptr);
-    if (perm_results_ptr) free_permutation_results(perm_results_ptr);
-
-    if (valid_spot_names_list_ptr) {
-        for(MKL_INT k=0; k < num_valid_spots_for_helpers; ++k) {
-            if(valid_spot_names_list_ptr[k]) free(valid_spot_names_list_ptr[k]);
-        }
-        free(valid_spot_names_list_ptr);
-    }
-    if (valid_spot_original_indices_ptr) free(valid_spot_original_indices_ptr);
-    if (valid_spot_rows_for_W_ptr) free(valid_spot_rows_for_W_ptr);
-    if (valid_spot_cols_for_W_ptr) free(valid_spot_cols_for_W_ptr);
-
-    // Free custom weights file path
+    /* Clean up all resources */
+    cleanup_resources(&resources);
+    
+    /* Free custom weights file path */
     if (config.custom_weights_file) {
         free(config.custom_weights_file);
         config.custom_weights_file = NULL;

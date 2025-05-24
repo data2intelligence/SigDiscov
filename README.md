@@ -1,6 +1,6 @@
 # Moran's I Calculator for Spatial Transcriptomics
 
-**Version 1.2.0**
+**Version 1.2.1**
 
 ## Overview
 
@@ -21,6 +21,7 @@ This package provides an optimized implementation of Moran's I spatial autocorre
 - Z-normalization of input gene expression data
 - RBF kernel for spatial weights with platform-specific parameters
 - **NEW: Support for user-defined spatial weight matrices**
+- **NEW: Python weight matrix generator tool**
 - Configurable maximum neighbor search radius
 - Permutation testing to assess statistical significance 
 - Optimized sparse matrix operations
@@ -41,6 +42,15 @@ You can now provide your own spatial weight matrix instead of relying on built-i
 - **Experimental designs**: Incorporate prior knowledge about spatial relationships
 - **Flexible file formats**: Support for dense TSV, sparse COO, and sparse TSV formats
 
+### Weight Matrix Generator Tool
+
+A Python script that generates custom weight matrices using the exact same algorithm as the internal Moran's I calculation:
+
+- **Identical parameters**: Uses same command-line options as main program (-r, -s, -p, etc.)
+- **Direct VST integration**: Reads coordinates directly from VST file headers
+- **Validation workflow**: Ensures custom matrices produce identical results
+- **Multiple formats**: Outputs both dense and sparse matrix formats
+
 ### Supported Weight Matrix Formats
 
 1. **Dense TSV Format**: Full matrix with spot names as headers and row labels
@@ -53,6 +63,7 @@ You can now provide your own spatial weight matrix instead of relying on built-i
 - Intel oneAPI Base Toolkit (for the Intel LLVM-based compiler)
 - Intel oneAPI Math Kernel Library (MKL)
 - C99-compatible compiler with OpenMP support
+- Python 3.6+ with numpy, pandas, scipy (for weight matrix generator)
 
 ## Installation
 
@@ -81,6 +92,13 @@ You can now provide your own spatial weight matrix instead of relying on built-i
    ```bash
    make install PREFIX=/usr/local
    ```
+
+### Python Dependencies
+
+For the weight matrix generator tool:
+```bash
+pip install numpy pandas scipy
+```
 
 ### Makefile Options
 
@@ -174,6 +192,64 @@ Single-cell specific options:
                           Requires -o <prefix>. Permutation options can be used.
 ```
 
+## Weight Matrix Generator Tool
+
+### Usage
+
+The included Python script generates custom weight matrices using the exact same algorithm as the internal Moran's I calculation:
+
+```bash
+python3 make_custom_w.py -i <input.tsv> -o <output_prefix> [OPTIONS]
+```
+
+### Weight Generator Options
+
+```
+Required Arguments:
+  -i, --input <file>       Input VST file
+  -o, --output <prefix>    Output file prefix
+
+Options:
+  -r, --max-radius <int>   Maximum radius for neighbors (default: 5)
+  -s, --include-same-spot <0|1>  Include self-connections: 0=No, 1=Yes (default: 0)
+  -p, --platform <0|1|2>   Platform: 0=Visium, 1=Old ST, 2=Single Cell (default: 0)
+  --sigma <float>          RBF kernel sigma (default: 100.0)
+```
+
+### Weight Generator Examples
+
+```bash
+# Generate weight matrix with same parameters as Moran's I run
+python3 make_custom_w.py -i expression.tsv -o custom_weights -r 3 -s 0 -p 0
+
+# Test custom weights vs built-in calculation
+./morans_i_mkl -i expression.tsv -o builtin -r 3 -s 0 -p 0 -b 1 -g 1
+./morans_i_mkl -i expression.tsv -o custom -w custom_weights_dense.tsv --weight-format dense -b 1 -g 1
+
+# Verify identical results
+diff builtin_all_pairs_moran_i_raw.tsv custom_all_pairs_moran_i_raw.tsv
+```
+
+### Validation Workflow
+
+To ensure custom weight matrices produce identical results:
+
+1. **Generate custom weights** with exact same parameters:
+   ```bash
+   python3 make_custom_w.py -i data.tsv -o weights -r 5 -s 0 -p 0
+   ```
+
+2. **Run both methods** with matching parameters:
+   ```bash
+   ./morans_i_mkl -i data.tsv -o test_builtin -r 5 -s 0 -p 0 -b 1 -g 1
+   ./morans_i_mkl -i data.tsv -o test_custom -w weights_dense.tsv --weight-format dense -b 1 -g 1
+   ```
+
+3. **Compare results** (should be identical):
+   ```bash
+   diff test_builtin_all_pairs_moran_i_raw.tsv test_custom_all_pairs_moran_i_raw.tsv
+   ```
+
 ### Output Files
 
 The format and file names depend on the calculation mode:
@@ -244,43 +320,57 @@ spot_C  spot_D  0.8
 
 ### Custom Weight Matrix Analysis
 
-4. Use a pre-computed dense weight matrix:
+4. Generate and use custom weight matrices:
    ```bash
-   ./morans_i_mkl -i expression_data.tsv -o results_custom -w weights_dense.tsv --weight-format dense
+   # Generate custom weights
+   python3 make_custom_w.py -i expression_data.tsv -o custom_weights -r 5 -s 0 -p 0
+   
+   # Use dense format
+   ./morans_i_mkl -i expression_data.tsv -o results_custom -w custom_weights_dense.tsv --weight-format dense
+   
+   # Use sparse format
+   ./morans_i_mkl -i expression_data.tsv -o results_custom -w custom_weights_sparse.tsv --weight-format sparse_tsv
    ```
 
-5. Use a sparse weight matrix with auto-detection:
-   ```bash
-   ./morans_i_mkl -i expression_data.tsv -o results_custom -w weights_sparse.tsv
-   ```
-
-6. Use custom weights with normalization:
+5. Use custom weights with normalization:
    ```bash
    ./morans_i_mkl -i expression_data.tsv -o results_custom -w weights.tsv --normalize-weights
    ```
 
-7. Custom weights with permutation testing:
+6. Custom weights with permutation testing:
    ```bash
    ./morans_i_mkl -i expression_data.tsv -o results_custom -w weights.tsv --run-perms --n-perms 1000
    ```
 
 ### Advanced Examples
 
-8. Run with permutation testing for statistical significance:
+7. Run with permutation testing for statistical significance:
    ```bash
    ./morans_i_mkl -i visium_data.tsv -o results_perm -b 1 -g 1 --run-perms --n-perms 1000 --perm-output-zscores --perm-output-pvalues
    ```
 
-9. Run the built-in toy example for testing:
+8. Run the built-in toy example for testing:
    ```bash
    ./morans_i_mkl --run-toy-example -o toy_example --n-perms 100 --perm-seed 42
    ```
 
 ## Creating Custom Weight Matrices
 
-### Using Python (Recommended)
+### Using the Weight Matrix Generator (Recommended)
 
-You can create custom weight matrices using the provided Python script or your own code. Here's an example:
+The provided Python script generates weight matrices using the exact same algorithm as the Moran's I program:
+
+```bash
+# Generate custom weights with specific parameters
+python3 make_custom_w.py -i your_data.tsv -o my_weights -r 3 -s 0 -p 0 --sigma 150
+
+# Use the generated weights
+./morans_i_mkl -i your_data.tsv -o results -w my_weights_dense.tsv --weight-format dense
+```
+
+### Manual Python Implementation
+
+You can also create custom weight matrices manually:
 
 ```python
 import numpy as np

@@ -3,7 +3,7 @@
  * This library provides efficient calculation of Moran's I spatial autocorrelation
  * statistics for gene expression data, optimized using Intel MKL.
  *
- * Version: 1.2.0 - Added custom weight matrix support
+ * Version: 1.2.1 - Added row normalization support
  */
 
 #ifndef MORANS_I_MKL_H
@@ -21,7 +21,7 @@
 #include "mkl_vml.h"  /* For vdDiv and other VML functions */
 
 /* Library version */
-#define MORANS_I_MKL_VERSION "1.2.0"
+#define MORANS_I_MKL_VERSION "1.2.1"
 
 /* Constants */
 #define VISIUM 0                      /* Visium platform with hexagonal grid */
@@ -40,6 +40,7 @@
 #define DEFAULT_NUM_THREADS 4         /* Default number of OpenMP threads if not set by OMP_NUM_THREADS or -t */
 #define DEFAULT_MKL_NUM_THREADS 0     /* Default MKL threads (0: use OpenMP setting from config.n_threads or MKL internal default) */
 #define DEFAULT_NUM_PERMUTATIONS 1000 /* Default number of permutations if enabled */
+#define DEFAULT_ROW_NORMALIZE_WEIGHTS 0 /* Default: do not normalize rows to sum to 1 */
 
 /* Weight matrix file format types */
 #define WEIGHT_FORMAT_AUTO 0          /* Auto-detect format */
@@ -132,6 +133,7 @@ typedef struct {
     char* custom_weights_file;    /* Path to custom weight matrix file */
     int weight_format;            /* Format of weight matrix file */
     int normalize_weights;        /* Boolean: normalize custom weights (divide by sum) */
+    int row_normalize_weights;    /* Boolean: normalize each row to sum to 1 */
     
     // Permutation-specific configuration
     int run_permutations;      /* Boolean: 1 to run permutation tests, 0 otherwise */
@@ -139,7 +141,7 @@ typedef struct {
     unsigned int perm_seed;    /* Seed for RNG in permutations */
     int perm_output_zscores;   /* Boolean: 1 to output Z-scores from permutations */
     int perm_output_pvalues;   /* Boolean: 1 to output p-values from permutations */
-    char* output_prefix;    /* Prefix for output files */    
+    char* output_prefix;       /* Prefix for output files */    
 } MoransIConfig;
 
 /* --- Function Prototypes --- */
@@ -182,22 +184,22 @@ DenseMatrix* z_normalize(const DenseMatrix* data_matrix);
 /* Moran's I Core Calculation */
 SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const MKL_INT* spot_col_valid,
                                           MKL_INT n_spots_valid, const DenseMatrix* distance_matrix,
-                                          MKL_INT max_radius);
+                                          MKL_INT max_radius, int row_normalize);
 double calculate_weight_sum(const SparseMatrix* W);
-DenseMatrix* calculate_morans_i(const DenseMatrix* X_spots_x_genes, const SparseMatrix* W_spots_x_spots);
-double calculate_single_gene_moran_i(const double* gene_data_vector, const SparseMatrix* W_spots_x_spots, MKL_INT n_spots);
-double* calculate_first_gene_vs_all(const DenseMatrix* X_spots_x_genes, const SparseMatrix* W_spots_x_spots, double S0);
+DenseMatrix* calculate_morans_i(const DenseMatrix* X_spots_x_genes, const SparseMatrix* W_spots_x_spots, int row_normalized);
+double calculate_single_gene_moran_i(const double* gene_data_vector, const SparseMatrix* W_spots_x_spots, MKL_INT n_spots, int row_normalized);
+double* calculate_first_gene_vs_all(const DenseMatrix* X_spots_x_genes, const SparseMatrix* W_spots_x_spots, double S0, int row_normalized);
 double* calculate_morans_i_batch(const double* X_data_spots_x_genes, long long n_genes, long long n_spots,
                                  const double* W_values, const long long* W_row_ptr, const long long* W_col_ind,
                                  long long W_nnz, int paired_genes);
 
 /* Permutation Testing */
 PermutationResults* run_permutation_test(const DenseMatrix* X_spots_x_genes, const SparseMatrix* W_spots_x_spots,
-                                         const PermutationParams* params);
+                                         const PermutationParams* params, int row_normalized);
 
 /* Results Saving */
 int save_results(const DenseMatrix* result_matrix, const char* output_file); 
-int save_single_gene_results(const DenseMatrix* X_calc_spots_x_genes, const SparseMatrix* W_spots_x_spots, double S0_unused, const char* output_file); 
+int save_single_gene_results(const DenseMatrix* X_calc_spots_x_genes, const SparseMatrix* W_spots_x_spots, double S0_unused, const char* output_file, int row_normalized); 
 int save_first_gene_vs_all_results(const double* morans_values_array, const char** gene_names_array, MKL_INT n_genes, const char* output_file);
 int save_lower_triangular_matrix_raw(const DenseMatrix* square_matrix, const char* output_file);
 int save_permutation_results(const PermutationResults* perm_test_results,
