@@ -1709,22 +1709,36 @@ SparseMatrix* read_sparse_weight_matrix_tsv(const char* filename, SpotNameHashTa
         
         char* spot1_trimmed = trim_whitespace_inplace(spot1_str);
         char* spot2_trimmed = trim_whitespace_inplace(spot2_str);
+        char* weight_trimmed = trim_whitespace_inplace(weight_str);  // CRITICAL FIX: Trim weight string
         
         MKL_INT row_idx = spot_name_ht_find(spot_map, spot1_trimmed);
         MKL_INT col_idx = spot_name_ht_find(spot_map, spot2_trimmed);
         
         if (row_idx >= 0 && col_idx >= 0) {
             char* endptr;
-            double weight = strtod(weight_str, &endptr);
-            if (endptr != weight_str && *endptr == '\0' && isfinite(weight) && fabs(weight) > WEIGHT_THRESHOLD) {
-                triplets[nnz_count].row = row_idx;
-                triplets[nnz_count].col = col_idx;
-                triplets[nnz_count].value = weight;
-                nnz_count++;
+            errno = 0;  // Clear errno before parsing
+            double weight = strtod(weight_trimmed, &endptr);
+            
+            // ENHANCED VALIDATION: More lenient about trailing whitespace
+            if (errno == 0 && endptr != weight_trimmed && isfinite(weight) && fabs(weight) > WEIGHT_THRESHOLD) {
+                // Additional check: ensure no significant trailing characters
+                while (*endptr && isspace((unsigned char)*endptr)) endptr++;
+                
+                if (*endptr == '\0') {  // Now check if we've consumed all significant characters
+                    triplets[nnz_count].row = row_idx;
+                    triplets[nnz_count].col = col_idx;
+                    triplets[nnz_count].value = weight;
+                    nnz_count++;
+                } else {
+                    if (line_num <= 10 || line_num % 100000 == 0) {
+                        fprintf(stderr, "Warning: Line %d in '%s': Invalid weight '%s' (trailing chars). Skipping.\n", 
+                                line_num, filename, weight_trimmed);
+                    }
+                }
             } else {
                 if (line_num <= 10 || line_num % 100000 == 0) { // Limit warning frequency
-                    fprintf(stderr, "Warning: Line %d in '%s': Invalid weight '%s' or value too small. Skipping.\n", 
-                            line_num, filename, weight_str);
+                    fprintf(stderr, "Warning: Line %d in '%s': Invalid weight '%s' or value too small (%.2e <= %.2e). Skipping.\n", 
+                            line_num, filename, weight_trimmed, fabs(weight), WEIGHT_THRESHOLD);
                 }
             }
         } else {
