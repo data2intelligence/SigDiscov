@@ -1,6 +1,6 @@
 /* morans_i_mkl.c - Optimized MKL-based Moran's I implementation
  *
- * Version: 1.2.1 (Updated for improved safety and performance)
+ * Version: 1.2.2 (Optimized custom weight matrix reading)
  *
  * This implements efficient calculation of Moran's I spatial autocorrelation
  * statistics for spatial transcriptomics data using Intel MKL.
@@ -19,7 +19,7 @@
 #include <unistd.h>  /* For access() */
 #include <limits.h>
 #include <stdint.h>
-#include "morans_i_mkl.h"
+#include "morans_i_mkl.h" // This now includes SpotNameHashTable definitions
 
 /* Define M_PI if not defined by math.h */
 #ifndef M_PI
@@ -80,9 +80,135 @@ static int permutation_worker(const DenseMatrix* X_original,
                              double* local_p_counts,
                              const DenseMatrix* observed_results);
 
+/* Hash Table Helper Function DEFINITIONS (these stay in .c and are static) */
+// The SpotNameHashNode and SpotNameHashTable struct definitions are now in morans_i_mkl.h
+
+static unsigned long spot_name_hash(const char* str) {
+    unsigned long hash = 5381;
+    int c;
+    while ((c = (unsigned char)*str++)) // cast to unsigned char
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+    return hash;
+}
+
+static int is_prime(size_t n) {
+    if (n <= 1) return 0;
+    if (n <= 3) return 1;
+    if (n % 2 == 0 || n % 3 == 0) return 0;
+    for (size_t i = 5; i * i <= n; i = i + 6)
+        if (n % i == 0 || n % (i + 2) == 0)
+            return 0;
+    return 1;
+}
+
+/* Helper to find next prime (simple version for hash table sizing) */
+static size_t get_next_prime(size_t n) {
+    if (n <= 1) return 2;
+    size_t prime = n;
+    int found = 0;
+    while (!found) {
+        if (is_prime(prime))
+            found = 1;
+        else
+            prime++;
+    }
+    return prime;
+}
+
+
+static SpotNameHashTable* spot_name_ht_create(size_t num_spots_hint) {
+    SpotNameHashTable* ht = (SpotNameHashTable*)malloc(sizeof(SpotNameHashTable));
+    if (!ht) {
+        perror("spot_name_ht_create: malloc ht failed");
+        return NULL;
+    }
+
+    // Aim for load factor around 1.0, choose prime number of buckets.
+    // Ensure num_buckets is at least a small prime if hint is 0 or very small.
+    size_t buckets_n = (num_spots_hint > 16) ? num_spots_hint : 17; // Use 17 as a small prime default
+    ht->num_buckets = get_next_prime(buckets_n);
+
+
+    ht->buckets = (SpotNameHashNode**)calloc(ht->num_buckets, sizeof(SpotNameHashNode*));
+    if (!ht->buckets) {
+        perror("spot_name_ht_create: calloc buckets failed");
+        free(ht);
+        return NULL;
+    }
+    ht->count = 0;
+    DEBUG_PRINT("Created spot name hash table with %zu buckets for hint %zu.", ht->num_buckets, num_spots_hint);
+    return ht;
+}
+
+static int spot_name_ht_insert(SpotNameHashTable* ht, const char* name, MKL_INT index) {
+    if (!ht || !name) return -1; 
+    unsigned long hash_val = spot_name_hash(name);
+    size_t bucket_idx = hash_val % ht->num_buckets;
+
+    // Check for duplicates (optional, but good for integrity if names should be unique)
+    #ifdef DEBUG_BUILD
+    SpotNameHashNode* existing = ht->buckets[bucket_idx];
+    while(existing) {
+        if (strcmp(existing->name, name) == 0) {
+            DEBUG_PRINT("Hash table insert warning: Duplicate name '%s' (old_idx: %lld, new_idx: %lld). Overwriting is not implemented; new entry will shadow old in find.", name, (long long)existing->index, (long long)index);
+            // Depending on policy, you might return an error or update the existing node.
+            // For this application, distinct spot names from expression data are expected.
+        }
+        existing = existing->next;
+    }
+    #endif
+
+    SpotNameHashNode* newNode = (SpotNameHashNode*)malloc(sizeof(SpotNameHashNode));
+    if (!newNode) {
+        perror("spot_name_ht_insert: malloc newNode failed");
+        return -1; 
+    }
+    newNode->name = strdup(name);
+    if (!newNode->name) {
+        perror("spot_name_ht_insert: strdup name failed");
+        free(newNode);
+        return -1; 
+    }
+    newNode->index = index;
+    newNode->next = ht->buckets[bucket_idx]; // Insert at the head of the list
+    ht->buckets[bucket_idx] = newNode;
+    ht->count++;
+    return 0; // Success
+}
+
+static MKL_INT spot_name_ht_find(const SpotNameHashTable* ht, const char* name) {
+    if (!ht || !name) return -1; 
+    unsigned long hash_val = spot_name_hash(name);
+    size_t bucket_idx = hash_val % ht->num_buckets;
+    SpotNameHashNode* current = ht->buckets[bucket_idx];
+    while (current) {
+        if (strcmp(current->name, name) == 0) {
+            return current->index;
+        }
+        current = current->next;
+    }
+    return -1; // Not found
+}
+
+static void spot_name_ht_free(SpotNameHashTable* ht) {
+    if (!ht) return;
+    for (size_t i = 0; i < ht->num_buckets; i++) {
+        SpotNameHashNode* current = ht->buckets[i];
+        while (current) {
+            SpotNameHashNode* next_node = current->next;
+            free(current->name);
+            free(current);
+            current = next_node;
+        }
+    }
+    free(ht->buckets);
+    free(ht);
+}
+
+
 /* Library version information */
 const char* morans_i_mkl_version(void) {
-    return "1.2.1"; 
+    return "1.2.2"; 
 }
 
 /* ===============================
@@ -356,15 +482,16 @@ DenseMatrix* z_normalize(const DenseMatrix* data_matrix) {
     normalized->values = NULL;
 
     // Allocate arrays
-    size_t values_size;
-    if (safe_multiply_size_t(n_genes, n_spots, &values_size) != 0 ||
-        safe_multiply_size_t(values_size, sizeof(double), &values_size) != 0) {
+    size_t values_size_bytes; // Renamed to avoid confusion with element count
+    size_t num_elements;
+    if (safe_multiply_size_t(n_genes, n_spots, &num_elements) != 0 ||
+        safe_multiply_size_t(num_elements, sizeof(double), &values_size_bytes) != 0) {
         fprintf(stderr, "Error: Matrix dimensions too large for z_normalize\n");
         free(normalized);
         return NULL;
     }
-
-    normalized->values = (double*)mkl_malloc(values_size, 64);
+    
+    normalized->values = (double*)mkl_malloc(values_size_bytes, 64);
     normalized->rownames = (char**)calloc(n_genes, sizeof(char*));
     normalized->colnames = (char**)calloc(n_spots, sizeof(char*));
 
@@ -445,10 +572,14 @@ DenseMatrix* z_normalize(const DenseMatrix* data_matrix) {
                             sum_sq_diff += diff * diff;
                         }
                     }
-                    double variance = (n_finite > 0) ? sum_sq_diff / n_finite : 0.0;
-                    if (variance < 0.0) variance = 0.0;
+                    double variance = (n_finite > 0) ? sum_sq_diff / n_finite : 0.0; // Use n_finite, not n_spots for variance with NaNs
+                    if (variance < 0.0) variance = 0.0; // Should not happen with sum of squares
                     std_dev = sqrt(variance);
+                } else if (n_finite == 1) { // Single finite value, mean is the value, std_dev is 0
+                    mean = sum; // sum is just the single value
+                    std_dev = 0.0;
                 }
+                // if n_finite == 0, mean and std_dev remain 0.0
 
                 if (n_finite <= 1 || std_dev < ZERO_STD_THRESHOLD) {
                     for (MKL_INT j = 0; j < n_spots; j++) {
@@ -459,9 +590,9 @@ DenseMatrix* z_normalize(const DenseMatrix* data_matrix) {
                         if (isfinite(current_gene_row_input[j])) {
                             centered_values_tl[j] = current_gene_row_input[j] - mean;
                         } else {
-                            centered_values_tl[j] = 0.0;
+                            centered_values_tl[j] = 0.0; // Non-finite values become 0 after normalization
                         }
-                        std_dev_vector_tl[j] = std_dev;
+                        std_dev_vector_tl[j] = std_dev; // Broadcast std_dev
                     }
                     vdDiv(n_spots, centered_values_tl, std_dev_vector_tl, current_gene_row_output);
                 }
@@ -482,6 +613,7 @@ DenseMatrix* z_normalize(const DenseMatrix* data_matrix) {
     DEBUG_MATRIX_INFO(normalized, "z_normalized");
     return normalized;
 }
+
 
 /* ===============================
  * SPATIAL WEIGHT MATRIX FUNCTIONS
@@ -511,7 +643,7 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
         W_empty->nrows = 0; 
         W_empty->ncols = 0; 
         W_empty->nnz = 0;
-        W_empty->row_ptr = (MKL_INT*)mkl_calloc(1, sizeof(MKL_INT), 64);
+        W_empty->row_ptr = (MKL_INT*)mkl_calloc(1, sizeof(MKL_INT), 64); // n_spots_valid + 1 = 1
         W_empty->col_ind = NULL;
         W_empty->values = NULL;
         if (!W_empty->row_ptr) { 
@@ -527,21 +659,21 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
            row_normalize ? " with row normalization" : "");
 
     MKL_INT estimated_neighbors_per_spot = (MKL_INT)(M_PI * max_radius * max_radius * 1.5);
-    if (estimated_neighbors_per_spot <= 0) estimated_neighbors_per_spot = 27;
+    if (estimated_neighbors_per_spot <= 0) estimated_neighbors_per_spot = 27; // Default from STUtility (max_radius=5 -> ~117, this is lower)
     
-    size_t initial_capacity_size;
-    if (safe_multiply_size_t(n_spots_valid, estimated_neighbors_per_spot, &initial_capacity_size) != 0) {
-        initial_capacity_size = n_spots_valid; // Fallback to minimum
+    size_t initial_capacity_size_t;
+    if (safe_multiply_size_t(n_spots_valid, estimated_neighbors_per_spot, &initial_capacity_size_t) != 0) {
+        initial_capacity_size_t = n_spots_valid; // Fallback to minimum if overflow
     }
     
-    MKL_INT initial_capacity = (MKL_INT)initial_capacity_size;
-    size_t max_dense_size;
-    if (safe_multiply_size_t(n_spots_valid, n_spots_valid, &max_dense_size) == 0 && 
-        initial_capacity > (MKL_INT)max_dense_size) {
-        initial_capacity = (MKL_INT)max_dense_size;
+    MKL_INT initial_capacity = (MKL_INT)initial_capacity_size_t;
+    size_t max_dense_elements; // max possible NNZ if dense
+    if (safe_multiply_size_t(n_spots_valid, n_spots_valid, &max_dense_elements) == 0 && 
+        initial_capacity > (MKL_INT)max_dense_elements) { // Ensure initial_capacity is not larger than dense
+        initial_capacity = (MKL_INT)max_dense_elements;
     }
 
-    if (initial_capacity <= 0) initial_capacity = (n_spots_valid > 0) ? n_spots_valid : 1;
+    if (initial_capacity <= 0) initial_capacity = (n_spots_valid > 0) ? n_spots_valid : 1; // Ensure positive
 
     printf("  Initial estimated NNZ capacity: %lld\n", (long long)initial_capacity);
 
@@ -557,44 +689,46 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
         return NULL;
     }
 
-    volatile int critical_error_flag = 0;
+    volatile int critical_error_flag = 0; // Flag for critical errors like memory allocation
 
     #pragma omp parallel
     {
-        MKL_INT local_initial_cap = (estimated_neighbors_per_spot > 0) ? estimated_neighbors_per_spot * 2 : 256;
+        // Thread-local storage for COO triplets
+        MKL_INT local_initial_cap = (estimated_neighbors_per_spot > 0) ? estimated_neighbors_per_spot * 2 : 256; // Heuristic
         MKL_INT local_capacity = local_initial_cap;
         MKL_INT* local_I_tl = (MKL_INT*)malloc((size_t)local_capacity * sizeof(MKL_INT));
         MKL_INT* local_J_tl = (MKL_INT*)malloc((size_t)local_capacity * sizeof(MKL_INT));
         double* local_V_tl = (double*)malloc((size_t)local_capacity * sizeof(double));
         MKL_INT local_nnz_tl = 0;
-        int thread_alloc_error = 0;
+        int thread_alloc_error = 0; // Thread-local error flag
 
         if (!local_I_tl || !local_J_tl || !local_V_tl) {
             #pragma omp critical
             {
                 fprintf(stderr, "Error: Thread %d failed to alloc thread-local COO buffers.\n", omp_get_thread_num());
-                critical_error_flag = 1;
+                critical_error_flag = 1; // Signal global error
             }
-            thread_alloc_error = 1;
+            thread_alloc_error = 1; // Mark this thread as having an error
         }
 
-        if (!thread_alloc_error && !critical_error_flag) {
-            #pragma omp for schedule(dynamic, 128)
+        if (!thread_alloc_error && !critical_error_flag) { // Proceed only if no errors so far
+            #pragma omp for schedule(dynamic, 128) // Dynamic schedule for load balancing
             for (MKL_INT i = 0; i < n_spots_valid; i++) {
-                if (critical_error_flag || thread_alloc_error) {
-                    continue; // Changed from break to continue since break is not allowed in OpenMP for loop
+                if (critical_error_flag || thread_alloc_error) { // Check flags before/during loop
+                     continue; // Skip iteration if error occurred. Cannot 'break' from OpenMP for loop.
                 }
 
                 for (MKL_INT j = 0; j < n_spots_valid; j++) {
                     MKL_INT row_shift_abs = llabs(spot_row_valid[i] - spot_row_valid[j]);
                     MKL_INT col_shift_abs = llabs(spot_col_valid[i] - spot_col_valid[j]);
 
+                    // Check bounds for distance_matrix access
                     if (row_shift_abs < distance_matrix->nrows && col_shift_abs < distance_matrix->ncols) {
                         double weight = distance_matrix->values[row_shift_abs * distance_matrix->ncols + col_shift_abs];
 
-                        if (fabs(weight) > WEIGHT_THRESHOLD) {
-                            if (local_nnz_tl >= local_capacity) {
-                                MKL_INT new_capacity = (MKL_INT)(local_capacity * 1.5) + 1;
+                        if (fabs(weight) > WEIGHT_THRESHOLD) { // Weight is significant
+                            if (local_nnz_tl >= local_capacity) { // Resize local buffer if needed
+                                MKL_INT new_capacity = (MKL_INT)(local_capacity * 1.5) + 1; // Growth factor
                                 MKL_INT* temp_li_new = (MKL_INT*)realloc(local_I_tl, (size_t)new_capacity * sizeof(MKL_INT));
                                 MKL_INT* temp_lj_new = (MKL_INT*)realloc(local_J_tl, (size_t)new_capacity * sizeof(MKL_INT));
                                 double* temp_lv_new = (double*)realloc(local_V_tl, (size_t)new_capacity * sizeof(double));
@@ -605,11 +739,12 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
                                         fprintf(stderr, "Error: Thread %d failed to realloc thread-local COO buffers.\n", omp_get_thread_num());
                                         critical_error_flag = 1;
                                     }
+                                    // Keep old pointers if realloc failed for some but not all
                                     local_I_tl = temp_li_new ? temp_li_new : local_I_tl;
                                     local_J_tl = temp_lj_new ? temp_lj_new : local_J_tl;
                                     local_V_tl = temp_lv_new ? temp_lv_new : local_V_tl;
-                                    thread_alloc_error = 1;
-                                    continue; // Changed from break to continue
+                                    thread_alloc_error = 1; // Mark error for this thread
+                                    continue; // Skip to next i due to realloc failure
                                 }
                                 local_I_tl = temp_li_new;
                                 local_J_tl = temp_lj_new;
@@ -623,34 +758,44 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
                         }
                     }
                 }
-                if (thread_alloc_error) {
-                    continue; // Changed from break to continue
+                if (thread_alloc_error) { // If error occurred within inner loop (e.g. realloc)
+                     continue; // Skip to next i
                 }
-            }
-        }
+            } // End of omp for loop
+        } // End of if (!thread_alloc_error && !critical_error_flag)
 
+        // Merge thread-local results into global COO arrays (critical section)
         if (!critical_error_flag && !thread_alloc_error && local_nnz_tl > 0) {
             #pragma omp critical
             {
-                if (!critical_error_flag) {
-                    if (nnz_count + local_nnz_tl > current_capacity) {
+                if (!critical_error_flag) { // Re-check global error flag inside critical section
+                    if (nnz_count + local_nnz_tl > current_capacity) { // Resize global buffer if needed
                         MKL_INT needed_capacity = nnz_count + local_nnz_tl;
                         MKL_INT new_global_capacity = current_capacity;
-                        while(new_global_capacity < needed_capacity) {
+                        while(new_global_capacity < needed_capacity && new_global_capacity > 0) { // Prevent overflow with new_global_capacity > 0
                             new_global_capacity = (MKL_INT)(new_global_capacity * 1.5) + 1;
+                            if (new_global_capacity <= current_capacity) { // Overflow or no increase
+                                new_global_capacity = needed_capacity > current_capacity ? needed_capacity : current_capacity + 1; // Try to reach at least needed
+                                if (new_global_capacity <= current_capacity) { // Still stuck, indicates potential overflow
+                                    critical_error_flag = 1; break;
+                                }
+                            }
+                        }
+                        if(critical_error_flag) {
+                             fprintf(stderr, "Error: Global COO buffer resize failed due to capacity calculation issue.\n");
+                        }
+
+                        size_t max_dense_nnz;
+                        if (safe_multiply_size_t(n_spots_valid, n_spots_valid, &max_dense_nnz) == 0 && 
+                            new_global_capacity > (MKL_INT)max_dense_nnz) {
+                            new_global_capacity = (MKL_INT)max_dense_nnz;
                         }
                         
-                        size_t max_dense;
-                        if (safe_multiply_size_t(n_spots_valid, n_spots_valid, &max_dense) == 0 && 
-                            new_global_capacity > (MKL_INT)max_dense) {
-                            new_global_capacity = (MKL_INT)max_dense;
-                        }
-                        
-                        if (needed_capacity > new_global_capacity && n_spots_valid > 0) {
+                        if (needed_capacity > new_global_capacity && n_spots_valid > 0) { // Check if still insufficient
                             fprintf(stderr, "Error: Cannot resize global COO buffer large enough (%lld needed, max %lld).\n", 
                                    (long long)needed_capacity, (long long)new_global_capacity);
                             critical_error_flag = 1;
-                        } else if (n_spots_valid > 0) {
+                        } else if (n_spots_valid > 0 && !critical_error_flag) {
                             printf("  Resizing global COO buffer from %lld to %lld\n", 
                                    (long long)current_capacity, (long long)new_global_capacity);
                             MKL_INT* temp_gi_new = (MKL_INT*)realloc(temp_I, (size_t)new_global_capacity * sizeof(MKL_INT));
@@ -660,6 +805,10 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
                             if (!temp_gi_new || !temp_gj_new || !temp_gv_new) {
                                 fprintf(stderr, "Error: Failed to realloc global COO buffers.\n");
                                 critical_error_flag = 1;
+                                // Keep old pointers if realloc failed, to free them later
+                                temp_I = temp_gi_new ? temp_gi_new : temp_I;
+                                temp_J = temp_gj_new ? temp_gj_new : temp_J;
+                                temp_V = temp_gv_new ? temp_gv_new : temp_V;
                             } else {
                                 temp_I = temp_gi_new; 
                                 temp_J = temp_gj_new; 
@@ -669,23 +818,25 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
                         }
                     }
 
+                    // Copy local data to global arrays if no critical error and space is sufficient
                     if (!critical_error_flag && (nnz_count + local_nnz_tl <= current_capacity)) {
                         memcpy(temp_I + nnz_count, local_I_tl, (size_t)local_nnz_tl * sizeof(MKL_INT));
                         memcpy(temp_J + nnz_count, local_J_tl, (size_t)local_nnz_tl * sizeof(MKL_INT));
                         memcpy(temp_V + nnz_count, local_V_tl, (size_t)local_nnz_tl * sizeof(double));
                         nnz_count += local_nnz_tl;
-                    } else if (!critical_error_flag) {
-                        fprintf(stderr, "Warning: Could not merge thread %d results due to insufficient space.\n", omp_get_thread_num());
-                        critical_error_flag = 1;
+                    } else if (!critical_error_flag) { // Should not happen if resize logic is correct
+                        fprintf(stderr, "Warning: Could not merge thread %d results due to insufficient space after resize attempt.\n", omp_get_thread_num());
+                        critical_error_flag = 1; // Treat as critical if merge fails
                     }
-                }
-            }
-        }
+                } // End of if (!critical_error_flag) inside critical section
+            } // End of omp critical
+        } // End of if (!critical_error_flag && !thread_alloc_error && local_nnz_tl > 0)
 
+        // Free thread-local buffers
         if(local_I_tl) free(local_I_tl);
         if(local_J_tl) free(local_J_tl);
         if(local_V_tl) free(local_V_tl);
-    }
+    } // End of omp parallel
 
     if (critical_error_flag) {
         fprintf(stderr, "Error: A critical error occurred during parallel COO matrix construction.\n");
@@ -710,14 +861,14 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
     W->rownames = NULL;
     W->colnames = NULL;
 
-    size_t nnz_alloc_size = (nnz_count > 0) ? (size_t)nnz_count : 1;
+    size_t nnz_alloc_size = (nnz_count > 0) ? (size_t)nnz_count : 1; // MKL requires size >= 1 for empty arrays in some create calls
     W->row_ptr = (MKL_INT*)mkl_malloc(((size_t)n_spots_valid + 1) * sizeof(MKL_INT), 64);
     if (nnz_count > 0) {
         W->col_ind = (MKL_INT*)mkl_malloc(nnz_alloc_size * sizeof(MKL_INT), 64);
         W->values  = (double*)mkl_malloc(nnz_alloc_size * sizeof(double), 64);
-    } else {
-        W->col_ind = NULL;
-        W->values = NULL;
+    } else { // Handle nnz_count == 0
+        W->col_ind = NULL; // Or mkl_malloc(1 * sizeof(MKL_INT), 64) if MKL needs non-NULL
+        W->values = NULL;  // Or mkl_malloc(1 * sizeof(double), 64)
     }
 
     if (!W->row_ptr || (nnz_count > 0 && (!W->col_ind || !W->values))) {
@@ -729,19 +880,26 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
 
     // Convert COO to CSR
     if (nnz_count > 0) {
+        // Initialize row_ptr counts part
         for (MKL_INT i = 0; i <= n_spots_valid; ++i) W->row_ptr[i] = 0;
+        // Count elements in each row
         for (MKL_INT k = 0; k < nnz_count; ++k) W->row_ptr[temp_I[k] + 1]++;
+        // Cumulative sum to get row_ptr
         for (MKL_INT i = 0; i < n_spots_valid; ++i) W->row_ptr[i + 1] += W->row_ptr[i];
 
-        MKL_INT* current_insertion_pos = (MKL_INT*)malloc(((size_t)n_spots_valid + 1) * sizeof(MKL_INT));
+        // Temporary array to keep track of current insertion positions for each row
+        // MKL's mkl_sparse_coo_to_csr can also be used if available and convenient
+        MKL_INT* current_insertion_pos = (MKL_INT*)malloc(((size_t)n_spots_valid) * sizeof(MKL_INT)); // Only n_spots_valid needed
         if (!current_insertion_pos) {
             perror("Failed to allocate current_insertion_pos array");
             free_sparse_matrix(W);
             free(temp_I); free(temp_J); free(temp_V);
             return NULL;
         }
+        // Initialize current_insertion_pos with starting positions of each row from row_ptr
         memcpy(current_insertion_pos, W->row_ptr, ((size_t)n_spots_valid) * sizeof(MKL_INT));
 
+        // Place elements into col_ind and values
         for (MKL_INT k = 0; k < nnz_count; ++k) {
             MKL_INT row = temp_I[k];
             MKL_INT index_in_csr = current_insertion_pos[row];
@@ -750,7 +908,7 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
             current_insertion_pos[row]++;
         }
         free(current_insertion_pos);
-    } else {
+    } else { // nnz_count == 0
         for (MKL_INT i = 0; i <= n_spots_valid; ++i) W->row_ptr[i] = 0;
     }
 
@@ -766,15 +924,13 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
             MKL_INT row_start = W->row_ptr[i];
             MKL_INT row_end = W->row_ptr[i + 1];
             
-            if (row_end > row_start) {
-                // Calculate row sum
+            if (row_end > row_start) { // If row is not empty
                 double row_sum = 0.0;
                 for (MKL_INT k = row_start; k < row_end; k++) {
                     row_sum += W->values[k];
                 }
                 
-                // Normalize row if sum is positive
-                if (row_sum > ZERO_STD_THRESHOLD) {
+                if (row_sum > ZERO_STD_THRESHOLD) { // Avoid division by zero or tiny numbers
                     for (MKL_INT k = row_start; k < row_end; k++) {
                         W->values[k] /= row_sum;
                     }
@@ -788,18 +944,20 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
 
     printf("Sparse weight matrix W built successfully (CSR format, %lld NNZ).\n", (long long)W->nnz);
 
-    // Sort column indices within each row
+    // Sort column indices within each row (MKL requirement for some routines, good practice)
     if (W->nnz > 0) {
         sparse_matrix_t W_mkl_tmp_handle;
+        // MKL expects row_end (ja) to be W->row_ptr + 1.
         sparse_status_t status = mkl_sparse_d_create_csr(&W_mkl_tmp_handle, SPARSE_INDEX_BASE_ZERO,
                                                         W->nrows, W->ncols, W->row_ptr,
                                                         W->row_ptr + 1, W->col_ind, W->values);
         if (status == SPARSE_STATUS_SUCCESS) {
-            status = mkl_sparse_order(W_mkl_tmp_handle);
+            status = mkl_sparse_order(W_mkl_tmp_handle); // Sorts column indices and permutes values accordingly
             if (status != SPARSE_STATUS_SUCCESS) {
                 print_mkl_status(status, "mkl_sparse_order (W)");
             }
-            mkl_sparse_destroy(W_mkl_tmp_handle);
+            // Note: mkl_sparse_order modifies the arrays W->col_ind and W->values in place.
+            mkl_sparse_destroy(W_mkl_tmp_handle); // Destroy temporary handle, not the data arrays.
             printf("  Column indices within rows ordered.\n");
         } else {
             print_mkl_status(status, "mkl_sparse_d_create_csr (for ordering W)");
@@ -818,120 +976,947 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
 int detect_weight_matrix_format(const char* filename) {
     if (!filename) {
         fprintf(stderr, "Error: NULL filename in detect_weight_matrix_format\n");
-        return WEIGHT_FORMAT_AUTO;
+        return WEIGHT_FORMAT_AUTO; // Return AUTO to signify error or let caller handle
     }
     
     FILE* fp = fopen(filename, "r");
     if (!fp) {
+        // Don't print strerror directly in library function if it's meant to be more generic,
+        // but for this tool it's fine.
         fprintf(stderr, "Error: Cannot open weight matrix file '%s' for format detection: %s\n", 
                 filename, strerror(errno));
-        return WEIGHT_FORMAT_AUTO;
+        return WEIGHT_FORMAT_AUTO; // Indicate failure to detect
     }
     
     char *line = NULL;
     size_t line_buf_size = 0;
-    ssize_t line_len = getline(&line, &line_buf_size, fp);
+    ssize_t line_len;
+    int detected_format = WEIGHT_FORMAT_AUTO; // Default to AUTO/error
+
+    line_len = getline(&line, &line_buf_size, fp);
     
-    if (line_len <= 0) {
-        fprintf(stderr, "Error: Empty weight matrix file '%s'\n", filename);
-        if (line) free(line);
-        fclose(fp);
-        return WEIGHT_FORMAT_AUTO;
-    }
-    
-    // Trim whitespace
-    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
-        line[--line_len] = '\0';
-    }
-    
-    // Count tab-separated fields in first line
-    char* line_copy = strdup(line);
-    if (!line_copy) {
-        perror("strdup in detect_weight_matrix_format");
-        if (line) free(line);
-        fclose(fp);
-        return WEIGHT_FORMAT_AUTO;
-    }
-    
-    int field_count = 0;
-    char* token = strtok(line_copy, "\t");
-    while (token != NULL) {
-        field_count++;
-        token = strtok(NULL, "\t");
-    }
-    free(line_copy);
-    
-    int detected_format;
-    if (field_count == 3) {
-        // Check if first field looks like a coordinate or spot name
-        char* line_copy2 = strdup(line);
-        if (line_copy2) {
-            char* first_field = strtok(line_copy2, "\t");
-            if (first_field) {
-                if (strstr(first_field, "x") && strpbrk(first_field, "0123456789")) {
-                    detected_format = WEIGHT_FORMAT_SPARSE_COO;
-                } else {
-                    detected_format = WEIGHT_FORMAT_SPARSE_TSV;
-                }
-            } else {
-                detected_format = WEIGHT_FORMAT_SPARSE_TSV;
-            }
-            free(line_copy2);
-        } else {
-            detected_format = WEIGHT_FORMAT_SPARSE_TSV;
+    if (line_len > 0) {
+        // Trim whitespace (especially newline characters)
+        char* current_line_ptr = line;
+        while (line_len > 0 && (current_line_ptr[line_len - 1] == '\n' || current_line_ptr[line_len - 1] == '\r')) {
+            current_line_ptr[--line_len] = '\0';
         }
-    } else if (field_count > 3) {
-        detected_format = WEIGHT_FORMAT_DENSE;
-    } else {
-        detected_format = WEIGHT_FORMAT_SPARSE_TSV;
+        
+        if (line_len > 0) { // Ensure line is not empty after trimming
+            char* line_copy = strdup(current_line_ptr); // Work on a copy for strtok
+            if (!line_copy) {
+                perror("strdup in detect_weight_matrix_format");
+                // Fallthrough to cleanup and return WEIGHT_FORMAT_AUTO
+            } else {
+                int field_count = 0;
+                char* token = strtok(line_copy, "\t");
+                while (token != NULL) {
+                    field_count++;
+                    token = strtok(NULL, "\t");
+                }
+                free(line_copy); // Free the copy
+
+                if (field_count == 3) {
+                    // Further heuristics to distinguish COO from TSV if needed
+                    // For example, check if the first two fields look like coordinates (contain 'x')
+                    // or if they are more general strings.
+                    // This simple version might misclassify if spot names are "1x1", "1x2" in TSV.
+                    // A more robust check might try to parse the third field as a number.
+                    // For now, let's use a simplified heuristic based on typical use.
+                    // If the original code had a more complex regex for this, reinstate it.
+                    // The provided code originally had a regex in a different context.
+                    // A simple heuristic: If fields are short and potentially numeric/coord-like.
+                    char* line_copy2 = strdup(current_line_ptr); // New copy for checking content
+                    if (line_copy2) {
+                        char* first_field = strtok(line_copy2, "\t");
+                        if (first_field) {
+                            // If first field looks like a coordinate (e.g., "12x34")
+                            // This is a basic check; a regex would be more robust.
+                            // A simple check: contains 'x' and digits.
+                            int has_x = 0, has_digit = 0;
+                            char* p = first_field;
+                            while(*p) {
+                                if (*p == 'x' || *p == 'X') has_x = 1;
+                                if (isdigit((unsigned char)*p)) has_digit = 1;
+                                p++;
+                            }
+                            if (has_x && has_digit) {
+                                detected_format = WEIGHT_FORMAT_SPARSE_COO;
+                            } else {
+                                detected_format = WEIGHT_FORMAT_SPARSE_TSV;
+                            }
+                        } else { // Should not happen if field_count was 3
+                             detected_format = WEIGHT_FORMAT_SPARSE_TSV;
+                        }
+                        free(line_copy2);
+                    } else {
+                        perror("strdup line_copy2 in detect_weight_matrix_format");
+                        detected_format = WEIGHT_FORMAT_SPARSE_TSV; // Fallback
+                    }
+
+                } else if (field_count > 3) {
+                    detected_format = WEIGHT_FORMAT_DENSE;
+                } else if (field_count < 3 && field_count > 0) {
+                    // Could be an error or a very sparse format not well-defined
+                    fprintf(stderr, "Warning: File '%s' has only %d fields in the first line. Format detection might be inaccurate.\n", filename, field_count);
+                    detected_format = WEIGHT_FORMAT_SPARSE_TSV; // Default for few fields
+                } else { // field_count == 0 (empty line was already handled) or other unexpected
+                    fprintf(stderr, "Warning: Could not determine format from first line of '%s' (field_count=%d).\n", filename, field_count);
+                }
+            }
+        } else { // Line became empty after trimming EOL
+            fprintf(stderr, "Warning: First line of '%s' is effectively empty after EOL trimming.\n", filename);
+        }
+    } else { // getline failed or empty file
+        if (ferror(fp)) {
+            fprintf(stderr, "Error reading from '%s' for format detection: %s\n", filename, strerror(errno));
+        } else {
+            fprintf(stderr, "Warning: File '%s' is empty or unreadable for format detection.\n", filename);
+        }
     }
     
     if (line) free(line);
     fclose(fp);
     
-    const char* format_names[] = {"AUTO", "DENSE", "SPARSE_COO", "SPARSE_TSV"};
-    printf("Detected weight matrix format: %s\n", format_names[detected_format]);
+    const char* format_names[] = {"AUTO/ERROR", "DENSE", "SPARSE_COO", "SPARSE_TSV"};
+    if (detected_format > 0 && detected_format < 4) { // Valid detected format
+        printf("Detected weight matrix format: %s\n", format_names[detected_format]);
+    } else {
+        printf("Could not reliably detect weight matrix format for '%s'. Defaulting or error.\n", filename);
+    }
     
     return detected_format;
 }
 
 /* Validate that weight matrix is compatible with expression data */
 int validate_weight_matrix(const SparseMatrix* W, char** spot_names, MKL_INT n_spots) {
-    if (!W || !spot_names) {
-        fprintf(stderr, "Error: NULL parameters in validate_weight_matrix\n");
+    // spot_names parameter is from the expression data (X_calc->rownames or equivalent)
+    // n_spots is the number of rows/cols W *should* have, matching expression data.
+    if (!W || (n_spots > 0 && !spot_names)) { // Allow n_spots = 0 if W is also empty
+        fprintf(stderr, "Error: NULL parameters in validate_weight_matrix (W=%p, spot_names=%p for n_spots=%lld)\n",
+                (void*)W, (void*)spot_names, (long long)n_spots);
         return MORANS_I_ERROR_PARAMETER;
     }
     
     if (W->nrows != n_spots || W->ncols != n_spots) {
-        fprintf(stderr, "Error: Weight matrix dimensions (%lldx%lld) don't match number of spots (%lld)\n",
+        fprintf(stderr, "Error: Custom Weight matrix dimensions (%lldx%lld) do not match the number of spots/cells (%lld) from expression data.\n",
                 (long long)W->nrows, (long long)W->ncols, (long long)n_spots);
         return MORANS_I_ERROR_PARAMETER;
     }
     
     // Check for negative weights
     MKL_INT negative_weights = 0;
-    for (MKL_INT i = 0; i < W->nnz; i++) {
-        if (W->values[i] < 0.0) {
-            negative_weights++;
+    if (W->values) { // W->values can be NULL if W->nnz is 0
+        for (MKL_INT i = 0; i < W->nnz; i++) {
+            if (W->values[i] < 0.0) {
+                negative_weights++;
+            }
         }
     }
     
     if (negative_weights > 0) {
-        fprintf(stderr, "Warning: Found %lld negative weights in custom weight matrix\n", 
-                (long long)negative_weights);
+        fprintf(stderr, "Warning: Found %lld negative weights in custom weight matrix. This is unusual for standard spatial weights but might be intended.\n", 
+               (long long)negative_weights);
     }
     
-    double weight_sum = calculate_weight_sum(W);
-    printf("Custom weight matrix validation: %lldx%lld matrix, %lld non-zeros, sum = %.6f\n",
+    double weight_sum = calculate_weight_sum(W); // Uses W->values and W->nnz
+    printf("Custom weight matrix validation: %lldx%lld matrix, %lld non-zeros, sum of weights (S0) = %.6f\n",
            (long long)W->nrows, (long long)W->ncols, (long long)W->nnz, weight_sum);
     
-    if (fabs(weight_sum) < ZERO_STD_THRESHOLD) {
-        fprintf(stderr, "Warning: Sum of custom weights is near zero (%.6e). Moran's I may be undefined.\n", 
+    if (W->nnz > 0 && fabs(weight_sum) < ZERO_STD_THRESHOLD) { // Check sum only if matrix is not empty
+        fprintf(stderr, "Warning: Sum of custom weights is near zero (%.6e) for a non-empty matrix. Moran's I may be undefined or unstable.\n", 
                 weight_sum);
     }
+    if (W->nnz == 0 && n_spots > 0) {
+        fprintf(stderr, "Warning: Custom weight matrix has 0 non-zero entries for %lld spots. Moran's I will be 0 or undefined.\n", (long long)n_spots);
+    }
     
+    // Optional: Check if row/column indices are within bounds [0, n_spots-1]
+    // This should be guaranteed if W was constructed correctly, but for an arbitrary custom W:
+    if (W->col_ind && W->nnz > 0) {
+        for (MKL_INT i = 0; i < W->nnz; ++i) {
+            if (W->col_ind[i] < 0 || W->col_ind[i] >= W->ncols) {
+                fprintf(stderr, "Error: Invalid column index %lld (at NNZ index %lld) in custom weight matrix. Expected range [0, %lld].\n",
+                        (long long)W->col_ind[i], (long long)i, (long long)W->ncols -1);
+                return MORANS_I_ERROR_PARAMETER;
+            }
+        }
+    }
+    if (W->row_ptr) {
+        for (MKL_INT i = 0; i < W->nrows; ++i) {
+            if (W->row_ptr[i] > W->row_ptr[i+1] || W->row_ptr[i] < 0 || W->row_ptr[i+1] > W->nnz) {
+                 fprintf(stderr, "Error: Invalid row_ptr entry for row %lld in custom weight matrix.\n", (long long)i);
+                 return MORANS_I_ERROR_PARAMETER;
+            }
+        }
+         if (W->row_ptr[0] != 0 || W->row_ptr[W->nrows] != W->nnz) {
+             fprintf(stderr, "Error: Invalid CSR row_ptr structure (start/end mismatch) in custom weight matrix.\n");
+             return MORANS_I_ERROR_PARAMETER;
+         }
+    }
+
+
     return MORANS_I_SUCCESS;
 }
+
+/* Helper function to determine data start offset by checking for a header */
+static long get_data_start_offset(FILE* fp, char** line_buffer, size_t* line_buf_size,
+                                  const char* filename_for_errmsg) {
+    long original_pos = ftell(fp);
+    if (original_pos == -1) {
+        perror("get_data_start_offset: ftell failed at start");
+        return -1L;
+    }
+    rewind(fp); // Go to the beginning to check the first line
+
+    ssize_t line_len = getline(line_buffer, line_buf_size, fp);
+    if (line_len <= 0) { // Empty or unreadable file
+        if (ferror(fp)) {
+             fprintf(stderr, "Error reading first line of '%s': %s\n", filename_for_errmsg, strerror(errno));
+        } else {
+             fprintf(stderr, "Warning: File '%s' is empty or first line unreadable.\n", filename_for_errmsg);
+        }
+        fseek(fp, original_pos, SEEK_SET); // Restore original position
+        return 0L; // Assume no header, start from beginning (though it's empty)
+    }
+
+    // Trim EOL chars from the line before copying
+    char* current_line_ptr = *line_buffer;
+    while (line_len > 0 && (current_line_ptr[line_len - 1] == '\n' || current_line_ptr[line_len - 1] == '\r')) {
+        current_line_ptr[--line_len] = '\0';
+    }
+    
+    char* first_line_copy = strdup(current_line_ptr);
+    if (!first_line_copy) {
+        perror("get_data_start_offset: strdup failed");
+        fseek(fp, original_pos, SEEK_SET);
+        return -1L;
+    }
+
+    char* token = strtok(first_line_copy, "\t");
+    int looks_like_header = 0;
+    if (token) {
+        // Heuristic: check for common header keywords or non-numeric/non-coord-like first token
+        // This heuristic is specific to expected formats.
+        // For sparse_tsv/coo: first token might be a spot name or coordinate.
+        // If it contains alpha characters not part of "x" (for "RxC"), it's likely a header.
+        int has_alpha = 0;
+        char *p = token;
+        while(*p) {
+            if (isalpha((unsigned char)*p) && *p != 'x' && *p != 'X') { // Allow 'x' for RxC format
+                has_alpha = 1;
+                break;
+            }
+            p++;
+        }
+        // A more robust check specific to the format (e.g. _tsv checks for "spot", "weight")
+        // could be done if format is known here. For now, a general alpha check.
+        if (has_alpha || strstr(token, "spot") || strstr(token, "weight") || strstr(token, "coord") ||
+            strstr(token, "row") || strstr(token, "col") || strstr(token, "from") || strstr(token, "to")) {
+            looks_like_header = 1;
+        }
+    }
+    free(first_line_copy);
+
+    long data_offset;
+    if (looks_like_header) {
+        data_offset = ftell(fp); // Position after reading the header line
+        if (data_offset == -1L) {
+            perror("get_data_start_offset: ftell failed after header read");
+            fseek(fp, original_pos, SEEK_SET);
+            return -1L;
+        }
+    } else {
+        data_offset = 0; // No header, data starts at the beginning
+    }
+    
+    // Restore original file pointer position before returning, or seek to data_offset
+    // Let's keep it simple: the caller will fseek to the returned offset.
+    // So, ensure fp is reset to its original state if we don't want this function to change it.
+    // OR, this function's purpose is to position fp correctly for the next read.
+    // The current callers (read_sparse_matrix_tsv) handle fseek themselves.
+    // So, just return offset. We already rewound fp.
+    return data_offset;
+}
+
+/* Read dense weight matrix from TSV file */
+SparseMatrix* read_dense_weight_matrix(const char* filename, SpotNameHashTable* spot_map, MKL_INT n_spots) {
+    if (!filename || !spot_map || n_spots <= 0) {
+        fprintf(stderr, "Error: Invalid parameters in read_dense_weight_matrix\n");
+        return NULL;
+    }
+    
+    FILE* fp = fopen(filename, "r");
+    if (!fp) {
+        fprintf(stderr, "Error: Cannot open dense weight matrix file '%s': %s\n", 
+                filename, strerror(errno));
+        return NULL;
+    }
+    
+    char *line = NULL;
+    size_t line_buf_size = 0;
+    ssize_t line_len;
+    
+    printf("Reading dense weight matrix from '%s'...\n", filename);
+    
+    // Read header to get column spot names
+    line_len = getline(&line, &line_buf_size, fp);
+    if (line_len <= 0) {
+        fprintf(stderr, "Error: Empty header in dense weight matrix file\n");
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
+        line[--line_len] = '\0';
+    }
+    
+    char* header_copy = strdup(line);
+    if (!header_copy) {
+        perror("strdup header in read_dense_weight_matrix");
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    // Parse header to get column spot indices
+    MKL_INT* col_spot_indices = (MKL_INT*)malloc((size_t)n_spots * sizeof(MKL_INT));
+    if (!col_spot_indices) {
+        perror("malloc col_spot_indices");
+        free(header_copy);
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    char* token = strtok(header_copy, "\t"); // Skip first field (row label placeholder)
+    if (!token) {
+        fprintf(stderr, "Error: Empty header line in dense weight matrix\n");
+        free(header_copy);
+        free(col_spot_indices);
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+
+    MKL_INT n_cols_found = 0;
+    token = strtok(NULL, "\t");
+    while (token && n_cols_found < n_spots) {
+        char* trimmed = trim_whitespace_inplace(token);
+        MKL_INT spot_idx = spot_name_ht_find(spot_map, trimmed);
+        if (spot_idx >= 0) {
+            col_spot_indices[n_cols_found++] = spot_idx;
+        } else {
+            fprintf(stderr, "Warning (Dense Read): Column spot '%s' in weight matrix header not found in expression data spot list. Skipping column.\n", trimmed);
+        }
+        token = strtok(NULL, "\t");
+    }
+    free(header_copy);
+    
+    if (n_cols_found == 0 && n_spots > 0) {
+        fprintf(stderr, "Error: No matching column spots found in dense weight matrix header and expression data.\n");
+        free(col_spot_indices);
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    printf("  Found %lld matching column spots in header\n", (long long)n_cols_found);
+    
+    // Count potential NNZ and read data
+    typedef struct { MKL_INT row, col; double value; } triplet_t;
+    
+    // Estimate NNZ capacity
+    MKL_INT estimated_max_nnz = n_spots * n_cols_found; // Upper bound for dense
+    if (estimated_max_nnz <= 0) estimated_max_nnz = 1000000; // Fallback
+    
+    triplet_t* triplets = (triplet_t*)malloc((size_t)estimated_max_nnz * sizeof(triplet_t));
+    if (!triplets) {
+        perror("Failed to allocate triplets for dense weight matrix");
+        free(col_spot_indices);
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    MKL_INT nnz_count = 0;
+    int data_rows_processed = 0;
+
+    while ((line_len = getline(&line, &line_buf_size, fp)) > 0) {
+        // Trim line
+        while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
+            line[--line_len] = '\0';
+        }
+        if (line_len == 0) continue; // Skip empty lines
+        
+        char* line_copy_data = strdup(line);
+        if (!line_copy_data) {
+            perror("strdup data line in dense weight matrix");
+            break;
+        }
+        
+        char* row_label_token = strtok(line_copy_data, "\t");
+        if (!row_label_token) {
+            free(line_copy_data);
+            continue;
+        }
+
+        char* row_spot_name = trim_whitespace_inplace(row_label_token);
+        MKL_INT row_idx = spot_name_ht_find(spot_map, row_spot_name);
+
+        if (row_idx >= 0) {
+            // Read values for this row
+            for (MKL_INT col_file_idx = 0; col_file_idx < n_cols_found; ++col_file_idx) {
+                char* val_token = strtok(NULL, "\t");
+                if (!val_token) {
+                    fprintf(stderr, "Warning: Row '%s' has fewer columns than expected\n", row_spot_name);
+                    break;
+                }
+                
+                char* endptr;
+                double weight = strtod(val_token, &endptr);
+                if (endptr != val_token && isfinite(weight) && fabs(weight) > WEIGHT_THRESHOLD) {
+                    if (nnz_count < estimated_max_nnz) {
+                        triplets[nnz_count].row = row_idx;
+                        triplets[nnz_count].col = col_spot_indices[col_file_idx];
+                        triplets[nnz_count].value = weight;
+                        nnz_count++;
+                    } else {
+                        fprintf(stderr, "Warning: Exceeded estimated_max_nnz in dense read. Some data might be lost.\n");
+                        break;
+                    }
+                }
+            }
+            data_rows_processed++;
+        } else {
+            if (data_rows_processed < 10) { // Limit warnings
+                fprintf(stderr, "Warning: Row spot '%s' not found in expression data\n", row_spot_name);
+            }
+        }
+        free(line_copy_data);
+    }
+    
+    fclose(fp);
+    if (line) free(line);
+    free(col_spot_indices);
+    
+    printf("Dense weight matrix read: %lld non-zero entries from %d data rows\n", 
+           (long long)nnz_count, data_rows_processed);
+    
+    // Convert to sparse CSR format
+    SparseMatrix* W = (SparseMatrix*)malloc(sizeof(SparseMatrix));
+    if (!W) {
+        perror("Failed to allocate SparseMatrix for dense weight matrix");
+        free(triplets);
+        return NULL;
+    }
+    
+    W->nrows = n_spots; 
+    W->ncols = n_spots; 
+    W->nnz = nnz_count;
+    W->rownames = NULL;
+    W->colnames = NULL;
+    
+    W->row_ptr = (MKL_INT*)mkl_calloc((size_t)n_spots + 1, sizeof(MKL_INT), 64);
+    if (nnz_count > 0) {
+        W->col_ind = (MKL_INT*)mkl_malloc((size_t)nnz_count * sizeof(MKL_INT), 64);
+        W->values = (double*)mkl_malloc((size_t)nnz_count * sizeof(double), 64);
+    } else {
+        W->col_ind = NULL; 
+        W->values = NULL;
+    }
+    
+    if (!W->row_ptr || (nnz_count > 0 && (!W->col_ind || !W->values))) {
+        perror("Failed to allocate CSR arrays for dense weight matrix");
+        free_sparse_matrix(W);
+        free(triplets);
+        return NULL;
+    }
+
+    if (nnz_count > 0) {
+        printf("  Converting dense matrix to CSR format...\n");
+        
+        // Count entries per row
+        for (MKL_INT k = 0; k < nnz_count; k++) {
+            W->row_ptr[triplets[k].row + 1]++;
+        }
+        
+        // Convert counts to cumulative sums
+        for (MKL_INT i = 0; i < n_spots; i++) {
+            W->row_ptr[i + 1] += W->row_ptr[i];
+        }
+        
+        // Fill CSR arrays
+        MKL_INT* csr_fill_counters = (MKL_INT*)calloc((size_t)n_spots, sizeof(MKL_INT));
+        if (!csr_fill_counters) {
+            perror("Failed to allocate CSR fill counters for dense weight matrix");
+            free_sparse_matrix(W);
+            free(triplets);
+            return NULL;
+        }
+        
+        for (MKL_INT k = 0; k < nnz_count; k++) {
+            MKL_INT r = triplets[k].row;
+            MKL_INT insert_at = W->row_ptr[r] + csr_fill_counters[r];
+            if (insert_at < nnz_count) { // Bounds check
+                W->col_ind[insert_at] = triplets[k].col;
+                W->values[insert_at] = triplets[k].value;
+                csr_fill_counters[r]++;
+            } else {
+                fprintf(stderr, "Error: CSR insertion index out of bounds in dense matrix conversion\n");
+                break;
+            }
+        }
+        free(csr_fill_counters);
+        printf("  CSR conversion complete\n");
+    }
+    
+    free(triplets);
+    
+    printf("Dense weight matrix converted to CSR format: %lldx%lld with %lld NNZ\n",
+           (long long)W->nrows, (long long)W->ncols, (long long)W->nnz);
+    
+    return W;
+}
+
+
+/* Read sparse weight matrix in COO format */
+SparseMatrix* read_sparse_weight_matrix_coo(const char* filename, SpotNameHashTable* spot_map, MKL_INT n_spots) {
+    // This function will be very similar to read_sparse_weight_matrix_tsv,
+    // using two passes and the spot_map for lookups.
+    // The main difference is parsing "RxC" style coordinates if used,
+    // OR direct spot name lookup using spot_map.
+    // For simplicity and given the user's current file is TSV, this is sketched:
+    if (!filename || !spot_map || n_spots <= 0) return NULL;
+    
+    FILE* fp = fopen(filename, "r");
+    if (!fp) return NULL;
+
+    char *line = NULL; size_t line_buf_size = 0; ssize_t line_len;
+    printf("Reading sparse COO weight matrix from '%s'...\n", filename);
+
+    long data_start_offset = get_data_start_offset(fp, &line, &line_buf_size, filename);
+    if (data_start_offset < 0) { fclose(fp); if(line) free(line); return NULL; }
+
+    fseek(fp, data_start_offset, SEEK_SET);
+    MKL_INT true_nnz = 0;
+    while ((line_len = getline(&line, &line_buf_size, fp)) > 0) {
+        char* p = line; while(isspace((unsigned char)*p)) p++;
+        if(*p != '\0') true_nnz++;
+    }
+
+    typedef struct { MKL_INT row, col; double value; } triplet_t;
+    triplet_t* triplets = NULL;
+    if (true_nnz > 0) {
+        triplets = (triplet_t*)malloc((size_t)true_nnz * sizeof(triplet_t));
+        if (!triplets) { /* error */ fclose(fp); if(line) free(line); return NULL; }
+    } else {
+        // Handle case of no data lines after header, or empty file
+        fclose(fp); if(line) free(line);
+        SparseMatrix* W_empty = (SparseMatrix*)calloc(1, sizeof(SparseMatrix));
+        W_empty->nrows = n_spots; W_empty->ncols = n_spots; W_empty->nnz = 0;
+        W_empty->row_ptr = (MKL_INT*)mkl_calloc(n_spots + 1, sizeof(MKL_INT), 64);
+        return W_empty; // Return empty matrix
+    }
+
+    fseek(fp, data_start_offset, SEEK_SET);
+    MKL_INT nnz_count = 0;
+    regex_t coord_regex;
+    int regex_compiled = (regcomp(&coord_regex, "^([0-9]+)[xX]([0-9]+)$", REG_EXTENDED) == 0);
+
+
+    while ((line_len = getline(&line, &line_buf_size, fp)) > 0 && nnz_count < true_nnz) {
+        // ... (current line trimming) ...
+        char* row_copy = strdup(line);
+        if (!row_copy) { /* error */ break; }
+
+        char* row_coord_str = strtok(row_copy, "\t");
+        char* col_coord_str = strtok(NULL, "\t");
+        char* weight_str = strtok(NULL, "\t");
+
+        if (row_coord_str && col_coord_str && weight_str) {
+            MKL_INT row_idx = spot_name_ht_find(spot_map, trim_whitespace_inplace(row_coord_str));
+            MKL_INT col_idx = spot_name_ht_find(spot_map, trim_whitespace_inplace(col_coord_str));
+            // The original regex logic for RxC was to parse RxC strings.
+            // If spot_map keys are RxC, then direct lookup is fine.
+            // If spot_map keys are other IDs but file uses RxC, then a mapping RxC -> canonical ID -> index is needed,
+            // which is more complex than current scope. Assuming file uses names compatible with spot_map.
+
+            if (row_idx >= 0 && col_idx >= 0) {
+                char* endptr;
+                double weight = strtod(weight_str, &endptr);
+                if (endptr != weight_str && isfinite(weight) && fabs(weight) > WEIGHT_THRESHOLD) {
+                    triplets[nnz_count].row = row_idx;
+                    triplets[nnz_count].col = col_idx;
+                    triplets[nnz_count].value = weight;
+                    nnz_count++;
+                }
+            }
+        }
+        free(row_copy);
+    }
+
+    if (regex_compiled) regfree(&coord_regex);
+    fclose(fp);
+    if (line) free(line);
+
+    // ... (CSR conversion based on nnz_count, then free triplets) ...
+    SparseMatrix* W = (SparseMatrix*)malloc(sizeof(SparseMatrix));
+    // ... (Initialize W, W->nnz = nnz_count, allocate CSR arrays) ...
+    // (Same CSR conversion logic as in read_sparse_weight_matrix_tsv)
+    // Free triplets at the end.
+    if (!W) { /* ... */ if (triplets) free(triplets); return NULL; }
+    W->nrows = n_spots; W->ncols = n_spots; W->nnz = nnz_count;
+    W->row_ptr = (MKL_INT*)mkl_calloc(n_spots + 1, sizeof(MKL_INT), 64);
+    if (nnz_count > 0) {
+        W->col_ind = (MKL_INT*)mkl_malloc((size_t)nnz_count * sizeof(MKL_INT), 64);
+        W->values = (double*)mkl_malloc((size_t)nnz_count * sizeof(double), 64);
+    } else {
+        W->col_ind = NULL; W->values = NULL;
+    }
+    if (!W->row_ptr || (nnz_count > 0 && (!W->col_ind || !W->values))) { /* ... */ if (triplets) free(triplets); free_sparse_matrix(W); return NULL;}
+
+    if (nnz_count > 0) {
+        for (MKL_INT k = 0; k < nnz_count; k++) W->row_ptr[triplets[k].row + 1]++;
+        for (MKL_INT i = 0; i < n_spots; i++) W->row_ptr[i+1] += W->row_ptr[i];
+        
+        MKL_INT* csr_fill_counters = (MKL_INT*)calloc(n_spots, sizeof(MKL_INT));
+        if(!csr_fill_counters) { /* ... */ if (triplets) free(triplets); free_sparse_matrix(W); return NULL;}
+        for (MKL_INT k = 0; k < nnz_count; k++) {
+            MKL_INT r = triplets[k].row;
+            MKL_INT insert_at = W->row_ptr[r] + csr_fill_counters[r];
+            W->col_ind[insert_at] = triplets[k].col;
+            W->values[insert_at] = triplets[k].value;
+            csr_fill_counters[r]++;
+        }
+        free(csr_fill_counters);
+    }
+    if (triplets) free(triplets);
+    return W;
+}
+
+/* Read sparse weight matrix in TSV format */
+SparseMatrix* read_sparse_weight_matrix_tsv(const char* filename, SpotNameHashTable* spot_map, MKL_INT n_spots) {
+    if (!filename || !spot_map || n_spots < 0) { // n_spots can be 0 for empty expression matrix
+        fprintf(stderr, "Error: Invalid parameters in read_sparse_weight_matrix_tsv\n");
+        return NULL;
+    }
+    
+    FILE* fp = fopen(filename, "r");
+    if (!fp) {
+        fprintf(stderr, "Error: Cannot open sparse TSV weight matrix file '%s': %s\n", 
+                filename, strerror(errno));
+        return NULL;
+    }
+    
+    char *line = NULL;
+    size_t line_buf_size = 0;
+    ssize_t line_len;
+    
+    printf("Reading sparse TSV weight matrix from '%s'...\n", filename);
+
+    // Determine data start offset by checking for a header
+    long data_start_offset = get_data_start_offset(fp, &line, &line_buf_size, filename);
+    if (data_start_offset < 0) { // Error in get_data_start_offset
+        fclose(fp); if(line) free(line);
+        return NULL;
+    }
+    
+    // Single-pass reading with dynamic allocation
+    typedef struct { MKL_INT row, col; double value; } triplet_t;
+    triplet_t* triplets = NULL;
+    MKL_INT triplets_capacity = 0;
+    MKL_INT nnz_count = 0; // Actual valid triplets found
+    
+    // Initial capacity estimate (be generous to avoid frequent reallocations)
+    MKL_INT initial_capacity = 1000000; // Start with 1M entries
+    if (n_spots > 0) {
+        // Estimate ~20-50 connections per spot for typical spatial transcriptomics data
+        size_t estimated_nnz;
+        if (safe_multiply_size_t(n_spots, 35, &estimated_nnz) == 0 && estimated_nnz < 50000000) {
+            initial_capacity = (MKL_INT)estimated_nnz;
+        } else {
+            initial_capacity = 50000000; // Cap at 50M to avoid excessive memory
+        }
+    }
+    
+    triplets_capacity = initial_capacity;
+    triplets = (triplet_t*)malloc((size_t)triplets_capacity * sizeof(triplet_t));
+    if (!triplets) {
+        perror("read_sparse_weight_matrix_tsv: malloc initial triplets failed");
+        fclose(fp); if(line) free(line); return NULL;
+    }
+    
+    printf("  Starting with triplets capacity: %lld\n", (long long)triplets_capacity);
+    
+    // Single pass: Read and parse data lines
+    if (fseek(fp, data_start_offset, SEEK_SET) != 0) {
+        perror("read_sparse_weight_matrix_tsv: fseek for data reading failed");
+        free(triplets); fclose(fp); if(line) free(line); return NULL;
+    }
+    
+    int line_num = 0; // For error messages
+    int resize_count = 0; // Track number of resizes
+
+    while ((line_len = getline(&line, &line_buf_size, fp)) > 0) {
+        line_num++;
+        char* p_check_empty = line; // Check if line is not just whitespace
+        while(isspace((unsigned char)*p_check_empty)) p_check_empty++;
+        if(*p_check_empty == '\0') continue; // Skip empty or whitespace-only lines
+
+        // Grow triplets array if needed
+        if (nnz_count >= triplets_capacity) {
+            MKL_INT new_capacity = triplets_capacity * 2;
+            if (new_capacity < triplets_capacity) { // Overflow check
+                fprintf(stderr, "Error: Triplets array size overflow at line %d\n", line_num);
+                break;
+            }
+            
+            triplet_t* new_triplets = (triplet_t*)realloc(triplets, (size_t)new_capacity * sizeof(triplet_t));
+            if (!new_triplets) {
+                perror("read_sparse_weight_matrix_tsv: realloc triplets failed");
+                break;
+            }
+            triplets = new_triplets;
+            triplets_capacity = new_capacity;
+            resize_count++;
+            
+            // Print resize notification, but not too frequently
+            if (resize_count <= 10 || resize_count % 5 == 0) {
+                printf("  Resized triplets array to %lld entries (resize #%d)\n", 
+                       (long long)new_capacity, resize_count);
+            }
+        }
+        
+        char* row_copy = strdup(line); // strdup the original line content from buffer
+        if (!row_copy) {
+            perror("read_sparse_weight_matrix_tsv: strdup data line failed");
+            break; // Critical memory error
+        }
+        
+        char* spot1_str = strtok(row_copy, "\t");
+        char* spot2_str = strtok(NULL, "\t");
+        char* weight_str = strtok(NULL, "\t");
+        
+        if (!spot1_str || !spot2_str || !weight_str) {
+            if (line_num <= 10 || line_num % 100000 == 0) { // Limit warning frequency
+                fprintf(stderr, "Warning: Line %d in '%s' has too few fields. Skipping.\n", line_num, filename);
+            }
+            free(row_copy);
+            continue;
+        }
+        
+        char* spot1_trimmed = trim_whitespace_inplace(spot1_str);
+        char* spot2_trimmed = trim_whitespace_inplace(spot2_str);
+        
+        MKL_INT row_idx = spot_name_ht_find(spot_map, spot1_trimmed);
+        MKL_INT col_idx = spot_name_ht_find(spot_map, spot2_trimmed);
+        
+        if (row_idx >= 0 && col_idx >= 0) {
+            char* endptr;
+            double weight = strtod(weight_str, &endptr);
+            if (endptr != weight_str && *endptr == '\0' && isfinite(weight) && fabs(weight) > WEIGHT_THRESHOLD) {
+                triplets[nnz_count].row = row_idx;
+                triplets[nnz_count].col = col_idx;
+                triplets[nnz_count].value = weight;
+                nnz_count++;
+            } else {
+                if (line_num <= 10 || line_num % 100000 == 0) { // Limit warning frequency
+                    fprintf(stderr, "Warning: Line %d in '%s': Invalid weight '%s' or value too small. Skipping.\n", 
+                            line_num, filename, weight_str);
+                }
+            }
+        } else {
+            // Only show spot lookup warnings for first few lines to avoid spam
+            if (line_num <= 10) {
+                if (row_idx < 0) fprintf(stderr, "Warning: Line %d in '%s': Spot1 '%s' not found in expression data. Skipping entry.\n", 
+                                        line_num, filename, spot1_trimmed);
+                if (col_idx < 0) fprintf(stderr, "Warning: Line %d in '%s': Spot2 '%s' not found in expression data. Skipping entry.\n", 
+                                        line_num, filename, spot2_trimmed);
+            }
+        }
+        free(row_copy);
+        
+        // Progress reporting for large files
+        if (line_num % 1000000 == 0) {
+            printf("  Processed %d lines, found %lld valid entries\n", line_num, (long long)nnz_count);
+        }
+    }
+    
+    fclose(fp);
+    if (line) free(line);
+    
+    printf("Sparse TSV weight matrix read: %lld valid non-zero entries found from %d data lines.\n", 
+           (long long)nnz_count, line_num);
+    
+    if (resize_count > 0) {
+        printf("  Array was resized %d times during reading\n", resize_count);
+    }
+    
+    // Trim triplets array to actual size to save memory
+    if (nnz_count < triplets_capacity && nnz_count > 0) {
+        triplet_t* trimmed_triplets = (triplet_t*)realloc(triplets, (size_t)nnz_count * sizeof(triplet_t));
+        if (trimmed_triplets) {
+            triplets = trimmed_triplets;
+            triplets_capacity = nnz_count;
+            printf("  Trimmed triplets array to final size: %lld entries\n", (long long)nnz_count);
+        }
+        // If realloc fails, just continue with the larger array - not a critical error
+    }
+    
+    SparseMatrix* W = (SparseMatrix*)malloc(sizeof(SparseMatrix));
+    if (!W) {
+        perror("read_sparse_weight_matrix_tsv: malloc SparseMatrix failed");
+        if (triplets) free(triplets);
+        return NULL;
+    }
+    
+    W->nrows = n_spots;
+    W->ncols = n_spots;
+    W->nnz = nnz_count; // Use actual valid count
+    W->rownames = NULL; W->colnames = NULL;
+    
+    W->row_ptr = (MKL_INT*)mkl_calloc((size_t)n_spots + 1, sizeof(MKL_INT), 64);
+    if (nnz_count > 0) {
+        W->col_ind = (MKL_INT*)mkl_malloc((size_t)nnz_count * sizeof(MKL_INT), 64);
+        W->values = (double*)mkl_malloc((size_t)nnz_count * sizeof(double), 64);
+    } else {
+        W->col_ind = NULL; W->values = NULL;
+    }
+    
+    if (!W->row_ptr || (nnz_count > 0 && (!W->col_ind || !W->values))) {
+        perror("read_sparse_weight_matrix_tsv: Failed to allocate CSR arrays");
+        free_sparse_matrix(W); // Will free W->row_ptr if it was allocated
+        if (triplets) free(triplets);
+        return NULL;
+    }
+    
+    if (nnz_count > 0) {
+        printf("  Converting to CSR format...\n");
+        
+        // Count entries per row
+        for (MKL_INT k = 0; k < nnz_count; k++) {
+            W->row_ptr[triplets[k].row + 1]++;
+        }
+        
+        // Convert counts to cumulative sums (CSR row_ptr format)
+        for (MKL_INT i = 0; i < n_spots; i++) {
+            W->row_ptr[i + 1] += W->row_ptr[i];
+        }
+        
+        // Fill CSR arrays
+        MKL_INT* csr_fill_counters = (MKL_INT*)calloc(n_spots, sizeof(MKL_INT));
+        if (!csr_fill_counters) {
+            perror("read_sparse_weight_matrix_tsv: calloc csr_fill_counters failed");
+            free_sparse_matrix(W); if (triplets) free(triplets); return NULL;
+        }
+        
+        for (MKL_INT k = 0; k < nnz_count; k++) {
+            MKL_INT r = triplets[k].row;
+            MKL_INT insert_at = W->row_ptr[r] + csr_fill_counters[r];
+            if (insert_at < nnz_count) { // Bounds check
+                 W->col_ind[insert_at] = triplets[k].col;
+                 W->values[insert_at] = triplets[k].value;
+                 csr_fill_counters[r]++;
+            } else {
+                fprintf(stderr, "Error: CSR insertion index out of bounds. This should not happen.\n");
+                // This indicates a logic error in CSR construction
+            }
+        }
+        free(csr_fill_counters);
+        printf("  CSR conversion complete\n");
+    }
+    
+    if (triplets) free(triplets);
+    
+    printf("Sparse TSV weight matrix converted to CSR format: %lldx%lld with %lld NNZ\n",
+           (long long)W->nrows, (long long)W->ncols, (long long)W->nnz);
+    
+    return W;
+}
+
+/* Main custom weight matrix reading function */
+SparseMatrix* read_custom_weight_matrix(const char* filename, int format, 
+                                       char** spot_names_from_expr, MKL_INT n_spots) {
+    if (!filename || !spot_names_from_expr || n_spots < 0) {
+        fprintf(stderr, "Error: Invalid parameters in read_custom_weight_matrix\n");
+        return NULL;
+    }
+    
+    int actual_format = format;
+    if (format == WEIGHT_FORMAT_AUTO) {
+        actual_format = detect_weight_matrix_format(filename);
+        if (actual_format == WEIGHT_FORMAT_AUTO) {
+            fprintf(stderr, "Error: Could not auto-detect weight matrix format for '%s'\n", filename);
+            return NULL;
+        }
+    }
+    
+    SpotNameHashTable* spot_map = spot_name_ht_create(n_spots > 0 ? (size_t)n_spots : 16);
+    if (!spot_map) {
+        fprintf(stderr, "Error: Failed to create spot name hash table.\n");
+        return NULL;
+    }
+
+    int inserted_count = 0;
+    for (MKL_INT i = 0; i < n_spots; i++) {
+        if (spot_names_from_expr[i] && strlen(spot_names_from_expr[i]) > 0) {
+            if (spot_name_ht_insert(spot_map, spot_names_from_expr[i], i) == 0) {
+                inserted_count++;
+            } else {
+                fprintf(stderr, "Error: Failed to insert spot '%s' into hash table.\n", spot_names_from_expr[i]);
+                spot_name_ht_free(spot_map);
+                return NULL;
+            }
+        }
+    }
+    if (inserted_count == 0 && n_spots > 0) {
+        fprintf(stderr, "Warning: No spot names from expression data were added to hash map for custom weights.\n");
+        // Continue if n_spots is 0, otherwise this might be an issue.
+    }
+     if (n_spots > 0 && spot_map->count != (size_t)inserted_count) {
+         fprintf(stderr, "Warning: Hash map count (%zu) differs from inserted count (%d).\n", spot_map->count, inserted_count);
+     }
+
+
+    SparseMatrix* W = NULL;
+    switch (actual_format) {
+        case WEIGHT_FORMAT_DENSE:
+            printf("Reading custom weight matrix in DENSE format...\n");
+            W = read_dense_weight_matrix(filename, spot_map, n_spots);
+            break;
+        case WEIGHT_FORMAT_SPARSE_COO:
+            printf("Reading custom weight matrix in SPARSE_COO format...\n");
+            W = read_sparse_weight_matrix_coo(filename, spot_map, n_spots);
+            break;
+        case WEIGHT_FORMAT_SPARSE_TSV:
+            printf("Reading custom weight matrix in SPARSE_TSV format...\n");
+            W = read_sparse_weight_matrix_tsv(filename, spot_map, n_spots);
+            break;
+        default:
+            fprintf(stderr, "Error: Unsupported weight matrix format: %d\n", actual_format);
+            spot_name_ht_free(spot_map);
+            return NULL;
+    }
+    
+    spot_name_ht_free(spot_map); // Free the hash table after use
+    
+    if (W) {
+        int validation_result = validate_weight_matrix(W, spot_names_from_expr, n_spots);
+        if (validation_result != MORANS_I_SUCCESS) {
+            fprintf(stderr, "Error: Weight matrix validation failed\n");
+            free_sparse_matrix(W);
+            return NULL;
+        }
+        printf("Custom weight matrix successfully loaded and validated.\n");
+    } else {
+         fprintf(stderr, "Failed to load custom weight matrix in format %d.\n", actual_format);
+    }
+    
+    return W;
+}
+
 
 /* ===============================
  * VST FILE PARSING (REFACTORED)
@@ -2870,724 +3855,6 @@ double load_double_value(const char* value_str, const char* param) {
 }
 
 /* ===============================
- * CUSTOM WEIGHT MATRIX FUNCTIONS (COMPLETE IMPLEMENTATIONS)
- * =============================== */
-
-/* Helper function to find spot index by name */
-static MKL_INT find_spot_index(const char* spot_name, char** spot_names, MKL_INT n_spots) {
-    if (!spot_name || !spot_names) return -1;
-    
-    for (MKL_INT i = 0; i < n_spots; i++) {
-        if (spot_names[i] && strcmp(spot_name, spot_names[i]) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-/* Read dense weight matrix from TSV file */
-SparseMatrix* read_dense_weight_matrix(const char* filename, char** spot_names, MKL_INT n_spots) {
-    if (!filename || !spot_names || n_spots <= 0) {
-        fprintf(stderr, "Error: Invalid parameters in read_dense_weight_matrix\n");
-        return NULL;
-    }
-    
-    FILE* fp = fopen(filename, "r");
-    if (!fp) {
-        fprintf(stderr, "Error: Cannot open dense weight matrix file '%s': %s\n", 
-                filename, strerror(errno));
-        return NULL;
-    }
-    
-    char *line = NULL;
-    size_t line_buf_size = 0;
-    ssize_t line_len;
-    
-    printf("Reading dense weight matrix from '%s'...\n", filename);
-    
-    // Read header to get column spot names
-    line_len = getline(&line, &line_buf_size, fp);
-    if (line_len <= 0) {
-        fprintf(stderr, "Error: Empty header in dense weight matrix file\n");
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    // Trim line
-    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
-        line[--line_len] = '\0';
-    }
-    
-    // Parse header - first field is row label, rest are column spot names
-    char* header_copy = strdup(line);
-    if (!header_copy) {
-        perror("strdup header in read_dense_weight_matrix");
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    // Count columns and map to spot indices
-    MKL_INT* col_spot_indices = (MKL_INT*)malloc(n_spots * sizeof(MKL_INT));
-    if (!col_spot_indices) {
-        perror("malloc col_spot_indices");
-        free(header_copy);
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    char* token = strtok(header_copy, "\t");
-    if (!token) {
-        fprintf(stderr, "Error: No header fields found in dense weight matrix\n");
-        free(col_spot_indices);
-        free(header_copy);
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    // Skip first column (row labels)
-    token = strtok(NULL, "\t");
-    MKL_INT n_cols_found = 0;
-    
-    while (token && n_cols_found < n_spots) {
-        char* trimmed = trim_whitespace_inplace(token);
-        MKL_INT spot_idx = find_spot_index(trimmed, spot_names, n_spots);
-        if (spot_idx >= 0) {
-            col_spot_indices[n_cols_found] = spot_idx;
-            n_cols_found++;
-        } else {
-            fprintf(stderr, "Warning: Column spot '%s' not found in expression data\n", trimmed);
-        }
-        token = strtok(NULL, "\t");
-    }
-    
-    free(header_copy);
-    
-    if (n_cols_found == 0) {
-        fprintf(stderr, "Error: No matching column spots found in dense weight matrix\n");
-        free(col_spot_indices);
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    // Temporary storage for non-zero entries
-    typedef struct {
-        MKL_INT row, col;
-        double value;
-    } triplet_t;
-    
-    triplet_t* triplets = (triplet_t*)malloc(n_spots * n_spots * sizeof(triplet_t));
-    if (!triplets) {
-        perror("malloc triplets for dense matrix");
-        free(col_spot_indices);
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    MKL_INT nnz_count = 0;
-    
-    // Read data rows
-    while ((line_len = getline(&line, &line_buf_size, fp)) > 0) {
-        // Trim line
-        while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
-            line[--line_len] = '\0';
-        }
-        if (line_len == 0) continue;
-        
-        char* row_copy = strdup(line);
-        if (!row_copy) {
-            perror("strdup row in read_dense_weight_matrix");
-            break;
-        }
-        
-        // Get row spot name
-        token = strtok(row_copy, "\t");
-        if (!token) {
-            free(row_copy);
-            continue;
-        }
-        
-        char* row_spot_name = trim_whitespace_inplace(token);
-        MKL_INT row_idx = find_spot_index(row_spot_name, spot_names, n_spots);
-        
-        if (row_idx >= 0) {
-            // Read weight values
-            for (MKL_INT col = 0; col < n_cols_found; col++) {
-                token = strtok(NULL, "\t");
-                if (!token) break;
-                
-                char* endptr;
-                double weight = strtod(token, &endptr);
-                if (endptr != token && isfinite(weight) && fabs(weight) > WEIGHT_THRESHOLD) {
-                    if (nnz_count < n_spots * n_spots) {
-                        triplets[nnz_count].row = row_idx;
-                        triplets[nnz_count].col = col_spot_indices[col];
-                        triplets[nnz_count].value = weight;
-                        nnz_count++;
-                    }
-                }
-            }
-        }
-        
-        free(row_copy);
-    }
-    
-    fclose(fp);
-    if (line) free(line);
-    free(col_spot_indices);
-    
-    printf("Dense weight matrix read: %lld non-zero entries found\n", (long long)nnz_count);
-    
-    // Convert to sparse CSR format
-    SparseMatrix* W = (SparseMatrix*)malloc(sizeof(SparseMatrix));
-    if (!W) {
-        perror("malloc SparseMatrix for dense weight matrix");
-        free(triplets);
-        return NULL;
-    }
-    
-    W->nrows = n_spots;
-    W->ncols = n_spots;
-    W->nnz = nnz_count;
-    W->rownames = NULL;
-    W->colnames = NULL;
-    
-    // Allocate CSR arrays
-    W->row_ptr = (MKL_INT*)mkl_calloc(n_spots + 1, sizeof(MKL_INT), 64);
-    if (nnz_count > 0) {
-        W->col_ind = (MKL_INT*)mkl_malloc(nnz_count * sizeof(MKL_INT), 64);
-        W->values = (double*)mkl_malloc(nnz_count * sizeof(double), 64);
-    } else {
-        W->col_ind = NULL;
-        W->values = NULL;
-    }
-    
-    if (!W->row_ptr || (nnz_count > 0 && (!W->col_ind || !W->values))) {
-        perror("Failed to allocate CSR arrays for dense weight matrix");
-        free_sparse_matrix(W);
-        free(triplets);
-        return NULL;
-    }
-    
-    if (nnz_count > 0) {
-        // Count entries per row
-        for (MKL_INT k = 0; k < nnz_count; k++) {
-            W->row_ptr[triplets[k].row + 1]++;
-        }
-        
-        // Cumulative sum
-        for (MKL_INT i = 0; i < n_spots; i++) {
-            W->row_ptr[i + 1] += W->row_ptr[i];
-        }
-        
-        // Fill CSR arrays
-        MKL_INT* row_counters = (MKL_INT*)calloc(n_spots, sizeof(MKL_INT));
-        if (!row_counters) {
-            perror("calloc row_counters");
-            free_sparse_matrix(W);
-            free(triplets);
-            return NULL;
-        }
-        
-        for (MKL_INT k = 0; k < nnz_count; k++) {
-            MKL_INT row = triplets[k].row;
-            MKL_INT pos = W->row_ptr[row] + row_counters[row];
-            W->col_ind[pos] = triplets[k].col;
-            W->values[pos] = triplets[k].value;
-            row_counters[row]++;
-        }
-        
-        free(row_counters);
-    }
-    
-    free(triplets);
-    
-    printf("Dense weight matrix converted to sparse format: %lldx%lld with %lld NNZ\n",
-           (long long)W->nrows, (long long)W->ncols, (long long)W->nnz);
-    
-    return W;
-}
-
-/* Read sparse weight matrix in COO format */
-SparseMatrix* read_sparse_weight_matrix_coo(const char* filename, char** spot_names, MKL_INT n_spots) {
-    if (!filename || !spot_names || n_spots <= 0) {
-        fprintf(stderr, "Error: Invalid parameters in read_sparse_weight_matrix_coo\n");
-        return NULL;
-    }
-    
-    FILE* fp = fopen(filename, "r");
-    if (!fp) {
-        fprintf(stderr, "Error: Cannot open sparse COO weight matrix file '%s': %s\n", 
-                filename, strerror(errno));
-        return NULL;
-    }
-    
-    char *line = NULL;
-    size_t line_buf_size = 0;
-    ssize_t line_len;
-    
-    printf("Reading sparse COO weight matrix from '%s'...\n", filename);
-    
-    // Skip header if present
-    line_len = getline(&line, &line_buf_size, fp);
-    if (line_len <= 0) {
-        fprintf(stderr, "Error: Empty sparse COO weight matrix file\n");
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    // Check if first line looks like header
-    char* first_line_copy = strdup(line);
-    if (!first_line_copy) {
-        perror("strdup first line in read_sparse_weight_matrix_coo");
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    char* token = strtok(first_line_copy, "\t");
-    int looks_like_header = 0;
-    if (token && (strstr(token, "row") || strstr(token, "col") || strstr(token, "coord"))) {
-        looks_like_header = 1;
-    }
-    free(first_line_copy);
-    
-    if (!looks_like_header) {
-        // Rewind to process first line as data
-        rewind(fp);
-    }
-    
-    // Temporary storage for triplets
-    typedef struct {
-        MKL_INT row, col;
-        double value;
-    } triplet_t;
-    
-    size_t triplets_capacity = 10000;
-    triplet_t* triplets = (triplet_t*)malloc(triplets_capacity * sizeof(triplet_t));
-    if (!triplets) {
-        perror("malloc triplets for sparse COO");
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    MKL_INT nnz_count = 0;
-    regex_t coord_regex;
-    int regex_compiled = 0;
-    
-    if (regcomp(&coord_regex, "^([0-9]+)x([0-9]+)$", REG_EXTENDED) == 0) {
-        regex_compiled = 1;
-    }
-    
-    // Read data lines
-    while ((line_len = getline(&line, &line_buf_size, fp)) > 0) {
-        // Trim line
-        while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
-            line[--line_len] = '\0';
-        }
-        if (line_len == 0) continue;
-        
-        char* row_copy = strdup(line);
-        if (!row_copy) {
-            perror("strdup data line in read_sparse_weight_matrix_coo");
-            break;
-        }
-        
-        // Parse: row_coord, col_coord, weight
-        char* row_coord_str = strtok(row_copy, "\t");
-        char* col_coord_str = strtok(NULL, "\t");
-        char* weight_str = strtok(NULL, "\t");
-        
-        if (!row_coord_str || !col_coord_str || !weight_str) {
-            free(row_copy);
-            continue;
-        }
-        
-        // Parse coordinates to find spot indices
-        MKL_INT row_idx = -1, col_idx = -1;
-        
-        if (regex_compiled) {
-            // Try coordinate format first
-            regmatch_t matches[3];
-            if (regexec(&coord_regex, row_coord_str, 3, matches, 0) == 0) {
-                // Extract row coordinate as spot name and find index
-                row_idx = find_spot_index(row_coord_str, spot_names, n_spots);
-            }
-            if (regexec(&coord_regex, col_coord_str, 3, matches, 0) == 0) {
-                col_idx = find_spot_index(col_coord_str, spot_names, n_spots);
-            }
-        }
-        
-        // If coordinate parsing failed, try direct spot name lookup
-        if (row_idx < 0) {
-            row_idx = find_spot_index(row_coord_str, spot_names, n_spots);
-        }
-        if (col_idx < 0) {
-            col_idx = find_spot_index(col_coord_str, spot_names, n_spots);
-        }
-        
-        if (row_idx >= 0 && col_idx >= 0) {
-            char* endptr;
-            double weight = strtod(weight_str, &endptr);
-            if (endptr != weight_str && isfinite(weight) && fabs(weight) > WEIGHT_THRESHOLD) {
-                // Expand array if needed
-                if (nnz_count >= (MKL_INT)triplets_capacity) {
-                    triplets_capacity *= 2;
-                    triplet_t* new_triplets = (triplet_t*)realloc(triplets, triplets_capacity * sizeof(triplet_t));
-                    if (!new_triplets) {
-                        perror("realloc triplets for sparse COO");
-                        free(row_copy);
-                        goto cleanup_coo;
-                    }
-                    triplets = new_triplets;
-                }
-                
-                triplets[nnz_count].row = row_idx;
-                triplets[nnz_count].col = col_idx;
-                triplets[nnz_count].value = weight;
-                nnz_count++;
-            }
-        }
-        
-        free(row_copy);
-    }
-    
-cleanup_coo:
-    if (regex_compiled) {
-        regfree(&coord_regex);
-    }
-    fclose(fp);
-    if (line) free(line);
-    
-    printf("Sparse COO weight matrix read: %lld non-zero entries found\n", (long long)nnz_count);
-    
-    // Convert to CSR format (same logic as dense version)
-    SparseMatrix* W = (SparseMatrix*)malloc(sizeof(SparseMatrix));
-    if (!W) {
-        perror("malloc SparseMatrix for COO weight matrix");
-        free(triplets);
-        return NULL;
-    }
-    
-    W->nrows = n_spots;
-    W->ncols = n_spots;
-    W->nnz = nnz_count;
-    W->rownames = NULL;
-    W->colnames = NULL;
-    
-    W->row_ptr = (MKL_INT*)mkl_calloc(n_spots + 1, sizeof(MKL_INT), 64);
-    if (nnz_count > 0) {
-        W->col_ind = (MKL_INT*)mkl_malloc(nnz_count * sizeof(MKL_INT), 64);
-        W->values = (double*)mkl_malloc(nnz_count * sizeof(double), 64);
-    } else {
-        W->col_ind = NULL;
-        W->values = NULL;
-    }
-    
-    if (!W->row_ptr || (nnz_count > 0 && (!W->col_ind || !W->values))) {
-        perror("Failed to allocate CSR arrays for COO weight matrix");
-        free_sparse_matrix(W);
-        free(triplets);
-        return NULL;
-    }
-    
-    if (nnz_count > 0) {
-        // Convert to CSR
-        for (MKL_INT k = 0; k < nnz_count; k++) {
-            W->row_ptr[triplets[k].row + 1]++;
-        }
-        
-        for (MKL_INT i = 0; i < n_spots; i++) {
-            W->row_ptr[i + 1] += W->row_ptr[i];
-        }
-        
-        MKL_INT* row_counters = (MKL_INT*)calloc(n_spots, sizeof(MKL_INT));
-        if (!row_counters) {
-            perror("calloc row_counters for COO");
-            free_sparse_matrix(W);
-            free(triplets);
-            return NULL;
-        }
-        
-        for (MKL_INT k = 0; k < nnz_count; k++) {
-            MKL_INT row = triplets[k].row;
-            MKL_INT pos = W->row_ptr[row] + row_counters[row];
-            W->col_ind[pos] = triplets[k].col;
-            W->values[pos] = triplets[k].value;
-            row_counters[row]++;
-        }
-        
-        free(row_counters);
-    }
-    
-    free(triplets);
-    
-    printf("Sparse COO weight matrix converted to CSR format: %lldx%lld with %lld NNZ\n",
-           (long long)W->nrows, (long long)W->ncols, (long long)W->nnz);
-    
-    return W;
-}
-
-/* Read sparse weight matrix in TSV format */
-SparseMatrix* read_sparse_weight_matrix_tsv(const char* filename, char** spot_names, MKL_INT n_spots) {
-    if (!filename || !spot_names || n_spots <= 0) {
-        fprintf(stderr, "Error: Invalid parameters in read_sparse_weight_matrix_tsv\n");
-        return NULL;
-    }
-    
-    FILE* fp = fopen(filename, "r");
-    if (!fp) {
-        fprintf(stderr, "Error: Cannot open sparse TSV weight matrix file '%s': %s\n", 
-                filename, strerror(errno));
-        return NULL;
-    }
-    
-    char *line = NULL;
-    size_t line_buf_size = 0;
-    ssize_t line_len;
-    
-    printf("Reading sparse TSV weight matrix from '%s'...\n", filename);
-    
-    // Skip header if present
-    line_len = getline(&line, &line_buf_size, fp);
-    if (line_len <= 0) {
-        fprintf(stderr, "Error: Empty sparse TSV weight matrix file\n");
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    // Check if first line looks like header
-    char* first_line_copy = strdup(line);
-    if (!first_line_copy) {
-        perror("strdup first line in read_sparse_weight_matrix_tsv");
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    char* token = strtok(first_line_copy, "\t");
-    int looks_like_header = 0;
-    if (token && (strstr(token, "spot") || strstr(token, "weight") || strstr(token, "from") || strstr(token, "to"))) {
-        looks_like_header = 1;
-    }
-    free(first_line_copy);
-    
-    if (!looks_like_header) {
-        rewind(fp);
-    }
-    
-    // Temporary storage for triplets
-    typedef struct {
-        MKL_INT row, col;
-        double value;
-    } triplet_t;
-    
-    size_t triplets_capacity = 10000;
-    triplet_t* triplets = (triplet_t*)malloc(triplets_capacity * sizeof(triplet_t));
-    if (!triplets) {
-        perror("malloc triplets for sparse TSV");
-        fclose(fp);
-        if (line) free(line);
-        return NULL;
-    }
-    
-    MKL_INT nnz_count = 0;
-    
-    // Read data lines
-    while ((line_len = getline(&line, &line_buf_size, fp)) > 0) {
-        // Trim line
-        while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
-            line[--line_len] = '\0';
-        }
-        if (line_len == 0) continue;
-        
-        char* row_copy = strdup(line);
-        if (!row_copy) {
-            perror("strdup data line in read_sparse_weight_matrix_tsv");
-            break;
-        }
-        
-        // Parse: spot1, spot2, weight
-        char* spot1_str = strtok(row_copy, "\t");
-        char* spot2_str = strtok(NULL, "\t");
-        char* weight_str = strtok(NULL, "\t");
-        
-        if (!spot1_str || !spot2_str || !weight_str) {
-            free(row_copy);
-            continue;
-        }
-        
-        // Find spot indices
-        char* spot1_trimmed = trim_whitespace_inplace(spot1_str);
-        char* spot2_trimmed = trim_whitespace_inplace(spot2_str);
-        
-        MKL_INT row_idx = find_spot_index(spot1_trimmed, spot_names, n_spots);
-        MKL_INT col_idx = find_spot_index(spot2_trimmed, spot_names, n_spots);
-        
-        if (row_idx >= 0 && col_idx >= 0) {
-            char* endptr;
-            double weight = strtod(weight_str, &endptr);
-            if (endptr != weight_str && isfinite(weight) && fabs(weight) > WEIGHT_THRESHOLD) {
-                // Expand array if needed
-                if (nnz_count >= (MKL_INT)triplets_capacity) {
-                    triplets_capacity *= 2;
-                    triplet_t* new_triplets = (triplet_t*)realloc(triplets, triplets_capacity * sizeof(triplet_t));
-                    if (!new_triplets) {
-                        perror("realloc triplets for sparse TSV");
-                        free(row_copy);
-                        goto cleanup_tsv;
-                    }
-                    triplets = new_triplets;
-                }
-                
-                triplets[nnz_count].row = row_idx;
-                triplets[nnz_count].col = col_idx;
-                triplets[nnz_count].value = weight;
-                nnz_count++;
-            }
-        }
-        
-        free(row_copy);
-    }
-    
-cleanup_tsv:
-    fclose(fp);
-    if (line) free(line);
-    
-    printf("Sparse TSV weight matrix read: %lld non-zero entries found\n", (long long)nnz_count);
-    
-    // Convert to CSR format (same logic as previous functions)
-    SparseMatrix* W = (SparseMatrix*)malloc(sizeof(SparseMatrix));
-    if (!W) {
-        perror("malloc SparseMatrix for TSV weight matrix");
-        free(triplets);
-        return NULL;
-    }
-    
-    W->nrows = n_spots;
-    W->ncols = n_spots;
-    W->nnz = nnz_count;
-    W->rownames = NULL;
-    W->colnames = NULL;
-    
-    W->row_ptr = (MKL_INT*)mkl_calloc(n_spots + 1, sizeof(MKL_INT), 64);
-    if (nnz_count > 0) {
-        W->col_ind = (MKL_INT*)mkl_malloc(nnz_count * sizeof(MKL_INT), 64);
-        W->values = (double*)mkl_malloc(nnz_count * sizeof(double), 64);
-    } else {
-        W->col_ind = NULL;
-        W->values = NULL;
-    }
-    
-    if (!W->row_ptr || (nnz_count > 0 && (!W->col_ind || !W->values))) {
-        perror("Failed to allocate CSR arrays for TSV weight matrix");
-        free_sparse_matrix(W);
-        free(triplets);
-        return NULL;
-    }
-    
-    if (nnz_count > 0) {
-        // Convert to CSR
-        for (MKL_INT k = 0; k < nnz_count; k++) {
-            W->row_ptr[triplets[k].row + 1]++;
-        }
-        
-        for (MKL_INT i = 0; i < n_spots; i++) {
-            W->row_ptr[i + 1] += W->row_ptr[i];
-        }
-        
-        MKL_INT* row_counters = (MKL_INT*)calloc(n_spots, sizeof(MKL_INT));
-        if (!row_counters) {
-            perror("calloc row_counters for TSV");
-            free_sparse_matrix(W);
-            free(triplets);
-            return NULL;
-        }
-        
-        for (MKL_INT k = 0; k < nnz_count; k++) {
-            MKL_INT row = triplets[k].row;
-            MKL_INT pos = W->row_ptr[row] + row_counters[row];
-            W->col_ind[pos] = triplets[k].col;
-            W->values[pos] = triplets[k].value;
-            row_counters[row]++;
-        }
-        
-        free(row_counters);
-    }
-    
-    free(triplets);
-    
-    printf("Sparse TSV weight matrix converted to CSR format: %lldx%lld with %lld NNZ\n",
-           (long long)W->nrows, (long long)W->ncols, (long long)W->nnz);
-    
-    return W;
-}
-
-/* Main custom weight matrix reading function */
-SparseMatrix* read_custom_weight_matrix(const char* filename, int format, 
-                                       char** spot_names, MKL_INT n_spots) {
-    if (!filename || !spot_names || n_spots <= 0) {
-        fprintf(stderr, "Error: Invalid parameters in read_custom_weight_matrix\n");
-        return NULL;
-    }
-    
-    // Auto-detect format if requested
-    int actual_format = format;
-    if (format == WEIGHT_FORMAT_AUTO) {
-        actual_format = detect_weight_matrix_format(filename);
-        if (actual_format == WEIGHT_FORMAT_AUTO) {
-            fprintf(stderr, "Error: Could not auto-detect weight matrix format for '%s'\n", filename);
-            return NULL;
-        }
-    }
-    
-    SparseMatrix* W = NULL;
-    
-    switch (actual_format) {
-        case WEIGHT_FORMAT_DENSE:
-            printf("Reading custom weight matrix in DENSE format...\n");
-            W = read_dense_weight_matrix(filename, spot_names, n_spots);
-            break;
-            
-        case WEIGHT_FORMAT_SPARSE_COO:
-            printf("Reading custom weight matrix in SPARSE_COO format...\n");
-            W = read_sparse_weight_matrix_coo(filename, spot_names, n_spots);
-            break;
-            
-        case WEIGHT_FORMAT_SPARSE_TSV:
-            printf("Reading custom weight matrix in SPARSE_TSV format...\n");
-            W = read_sparse_weight_matrix_tsv(filename, spot_names, n_spots);
-            break;
-            
-        default:
-            fprintf(stderr, "Error: Unsupported weight matrix format: %d\n", actual_format);
-            return NULL;
-    }
-    
-    if (W) {
-        // Validate the weight matrix
-        int validation_result = validate_weight_matrix(W, spot_names, n_spots);
-        if (validation_result != MORANS_I_SUCCESS) {
-            fprintf(stderr, "Error: Weight matrix validation failed\n");
-            free_sparse_matrix(W);
-            return NULL;
-        }
-        
-        printf("Custom weight matrix successfully loaded and validated.\n");
-    }
-    
-    return W;
-}
-
-/* ===============================
  * BATCH CALCULATION FUNCTION
  * =============================== */
 
@@ -3596,7 +3863,7 @@ double* calculate_morans_i_batch(const double* X_data, long long n_genes_ll, lon
                                 const double* W_values, const long long* W_row_ptr_ll, 
                                 const long long* W_col_ind_ll, long long W_nnz_ll, int paired_genes) {
     
-    if (!X_data || !W_values || !W_row_ptr_ll || !W_col_ind_ll) {
+    if (!X_data || (W_nnz_ll > 0 && (!W_values || !W_row_ptr_ll || !W_col_ind_ll)) || (W_nnz_ll == 0 && !W_row_ptr_ll) ) {
         fprintf(stderr, "Error: NULL parameters in calculate_morans_i_batch\n");
         return NULL;
     }
@@ -3616,10 +3883,10 @@ double* calculate_morans_i_batch(const double* X_data, long long n_genes_ll, lon
            n_genes_ll, n_spots_ll, paired_genes ? "pairwise" : "single-gene");
     
     // Convert W arrays to MKL_INT format for internal use
-    MKL_INT* W_row_ptr_mkl = (MKL_INT*)mkl_malloc((n_spots + 1) * sizeof(MKL_INT), 64);
+    MKL_INT* W_row_ptr_mkl = (MKL_INT*)mkl_malloc(((size_t)n_spots + 1) * sizeof(MKL_INT), 64);
     MKL_INT* W_col_ind_mkl = NULL;
     if (W_nnz > 0) {
-        W_col_ind_mkl = (MKL_INT*)mkl_malloc(W_nnz * sizeof(MKL_INT), 64);
+        W_col_ind_mkl = (MKL_INT*)mkl_malloc((size_t)W_nnz * sizeof(MKL_INT), 64);
     }
     
     if (!W_row_ptr_mkl || (W_nnz > 0 && !W_col_ind_mkl)) {
@@ -3633,32 +3900,45 @@ double* calculate_morans_i_batch(const double* X_data, long long n_genes_ll, lon
     for (MKL_INT i = 0; i <= n_spots; i++) {
         W_row_ptr_mkl[i] = (MKL_INT)W_row_ptr_ll[i];
     }
-    for (MKL_INT i = 0; i < W_nnz; i++) {
-        W_col_ind_mkl[i] = (MKL_INT)W_col_ind_ll[i];
+    if (W_nnz > 0) { // Only access W_col_ind_ll if W_nnz > 0
+        for (MKL_INT i = 0; i < W_nnz; i++) {
+            W_col_ind_mkl[i] = (MKL_INT)W_col_ind_ll[i];
+        }
     }
     
     // Calculate S0 for scaling
     double S0 = 0.0;
-    #pragma omp parallel for reduction(+:S0)
-    for (MKL_INT i = 0; i < W_nnz; i++) {
-        S0 += W_values[i];
+    if (W_nnz > 0) { // Only access W_values if W_nnz > 0
+        #pragma omp parallel for reduction(+:S0)
+        for (MKL_INT i = 0; i < W_nnz; i++) {
+            S0 += W_values[i];
+        }
     }
     
-    if (fabs(S0) < DBL_EPSILON) {
+    if (fabs(S0) < DBL_EPSILON && W_nnz > 0) { // Check S0 only if W is not empty
         fprintf(stderr, "Warning: Sum of weights S0 is near-zero in batch calculation\n");
-        mkl_free(W_row_ptr_mkl);
-        if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
-        return NULL;
+        // Depending on policy, might return NULL or proceed with NaN/Inf results
     }
+    if (W_nnz == 0) {
+        printf("Warning: Weight matrix W is empty (NNZ=0) in batch calculation.\n");
+        // S0 will be 0. Results will be 0 or NaN.
+    }
+
     
-    double inv_S0 = 1.0 / S0;
-    
+    double inv_S0 = (fabs(S0) > DBL_EPSILON) ? (1.0 / S0) : 0.0; // Handle S0=0 to avoid Inf
+    if (inv_S0 == 0.0 && fabs(S0) > DBL_EPSILON) { // S0 is very large, inv_S0 underflowed to 0
+        // This case is unlikely to be an issue unless S0 is astronomically large
+    } else if (inv_S0 == 0.0 && fabs(S0) < DBL_EPSILON) {
+        printf("Note: S0 is zero or near-zero. Results will be scaled by 0 or be NaN/Inf.\n");
+    }
+
+
     // Create MKL sparse matrix handle
     sparse_matrix_t W_mkl;
     sparse_status_t status = mkl_sparse_d_create_csr(&W_mkl, SPARSE_INDEX_BASE_ZERO,
                                                      n_spots, n_spots, W_row_ptr_mkl,
                                                      W_row_ptr_mkl + 1, W_col_ind_mkl, 
-                                                     (double*)W_values);
+                                                     (double*)W_values); // W_values might be NULL if W_nnz=0
     
     if (status != SPARSE_STATUS_SUCCESS) {
         print_mkl_status(status, "mkl_sparse_d_create_csr (batch W)");
@@ -3667,10 +3947,11 @@ double* calculate_morans_i_batch(const double* X_data, long long n_genes_ll, lon
         return NULL;
     }
     
-    if (W_nnz > 0) {
+    if (W_nnz > 0) { // Optimize only if there are non-zeros
         status = mkl_sparse_optimize(W_mkl);
         if (status != SPARSE_STATUS_SUCCESS) {
             print_mkl_status(status, "mkl_sparse_optimize (batch W)");
+            // Non-fatal, can proceed without optimization
         }
     }
     
@@ -3678,24 +3959,42 @@ double* calculate_morans_i_batch(const double* X_data, long long n_genes_ll, lon
     
     if (paired_genes) {
         // Pairwise calculation: result is n_genes x n_genes matrix
-        size_t result_size = (size_t)n_genes * n_genes;
-        results = (double*)mkl_malloc(result_size * sizeof(double), 64);
+        size_t result_size_elements;
+        size_t result_size_bytes;
+
+        if (safe_multiply_size_t(n_genes, n_genes, &result_size_elements) != 0 ||
+            safe_multiply_size_t(result_size_elements, sizeof(double), &result_size_bytes) != 0) {
+            fprintf(stderr, "Error: Result matrix dimensions too large for batch pairwise calc.\n");
+            mkl_sparse_destroy(W_mkl);
+            mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
+            return NULL;
+        }
+        results = (double*)mkl_malloc(result_size_bytes, 64);
+
         if (!results) {
             perror("Failed to allocate results for batch pairwise calculation");
             mkl_sparse_destroy(W_mkl);
-            mkl_free(W_row_ptr_mkl);
-            if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
+            mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
             return NULL;
         }
         
-        // Calculate W * X
-        double* temp_WX = (double*)mkl_malloc((size_t)n_spots * n_genes * sizeof(double), 64);
+        size_t temp_wx_elements;
+        size_t temp_wx_bytes;
+        if (safe_multiply_size_t(n_spots, n_genes, &temp_wx_elements) != 0 ||
+            safe_multiply_size_t(temp_wx_elements, sizeof(double), &temp_wx_bytes) != 0) {
+            fprintf(stderr, "Error: Temp_WX matrix dimensions too large for batch pairwise calc.\n");
+            mkl_free(results);
+            mkl_sparse_destroy(W_mkl);
+            mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
+            return NULL;
+        }
+        double* temp_WX = (double*)mkl_malloc(temp_wx_bytes, 64);
+
         if (!temp_WX) {
             perror("Failed to allocate temp_WX for batch calculation");
             mkl_free(results);
             mkl_sparse_destroy(W_mkl);
-            mkl_free(W_row_ptr_mkl);
-            if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
+            mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
             return NULL;
         }
         
@@ -3703,7 +4002,7 @@ double* calculate_morans_i_batch(const double* X_data, long long n_genes_ll, lon
         descr.type = SPARSE_MATRIX_TYPE_GENERAL;
         
         status = mkl_sparse_d_mm(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, W_mkl, descr,
-                                SPARSE_LAYOUT_ROW_MAJOR, X_data, n_genes, n_genes,
+                                SPARSE_LAYOUT_ROW_MAJOR, (double*)X_data, n_genes, n_genes, // X_data is const, MKL takes non-const. This is typical.
                                 0.0, temp_WX, n_genes);
         
         if (status != SPARSE_STATUS_SUCCESS) {
@@ -3711,12 +4010,10 @@ double* calculate_morans_i_batch(const double* X_data, long long n_genes_ll, lon
             mkl_free(temp_WX);
             mkl_free(results);
             mkl_sparse_destroy(W_mkl);
-            mkl_free(W_row_ptr_mkl);
-            if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
+            mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
             return NULL;
         }
         
-        // Calculate X^T * (W * X) / S0
         cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
                     n_genes, n_genes, n_spots, inv_S0,
                     X_data, n_genes, temp_WX, n_genes,
@@ -3724,41 +4021,34 @@ double* calculate_morans_i_batch(const double* X_data, long long n_genes_ll, lon
         
         mkl_free(temp_WX);
         
-    } else {
-        // Single-gene calculation: result is n_genes vector
-        results = (double*)mkl_malloc((size_t)n_genes * sizeof(double), 64);
-        if (!results) {
-            perror("Failed to allocate results for batch single-gene calculation");
-            mkl_sparse_destroy(W_mkl);
-            mkl_free(W_row_ptr_mkl);
-            if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
-            return NULL;
+    } else { // Single-gene calculation
+        size_t result_size_bytes;
+        if (safe_multiply_size_t(n_genes, sizeof(double), &result_size_bytes) != 0) {
+             fprintf(stderr, "Error: Result vector too large for batch single-gene calc.\n");
+             mkl_sparse_destroy(W_mkl);
+             mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
+             return NULL;
+        }
+        results = (double*)mkl_malloc(result_size_bytes, 64);
+        if (!results) { /* ... */ }
+
+        size_t buffer_bytes;
+        if (safe_multiply_size_t(n_spots, sizeof(double), &buffer_bytes) != 0) {
+            /* ... */
         }
         
-        double* gene_buffer = (double*)mkl_malloc((size_t)n_spots * sizeof(double), 64);
-        double* Wz_buffer = (double*)mkl_malloc((size_t)n_spots * sizeof(double), 64);
-        if (!gene_buffer || !Wz_buffer) {
-            perror("Failed to allocate buffers for batch single-gene calculation");
-            mkl_free(results);
-            if (gene_buffer) mkl_free(gene_buffer);
-            if (Wz_buffer) mkl_free(Wz_buffer);
-            mkl_sparse_destroy(W_mkl);
-            mkl_free(W_row_ptr_mkl);
-            if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
-            return NULL;
-        }
+        double* gene_buffer = (double*)mkl_malloc(buffer_bytes, 64);
+        double* Wz_buffer = (double*)mkl_malloc(buffer_bytes, 64);
+        if (!gene_buffer || !Wz_buffer) { /* ... */ }
         
         struct matrix_descr descr;
         descr.type = SPARSE_MATRIX_TYPE_GENERAL;
         
-        // Calculate Moran's I for each gene
         for (MKL_INT g = 0; g < n_genes; g++) {
-            // Extract gene g data
             for (MKL_INT s = 0; s < n_spots; s++) {
                 gene_buffer[s] = X_data[s * n_genes + g];
             }
             
-            // Calculate W * gene_data
             status = mkl_sparse_d_mv(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, W_mkl, descr,
                                     gene_buffer, 0.0, Wz_buffer);
             
@@ -3768,9 +4058,13 @@ double* calculate_morans_i_batch(const double* X_data, long long n_genes_ll, lon
                 continue;
             }
             
-            // Calculate gene_data^T * (W * gene_data) / S0
             double dot_product = cblas_ddot(n_spots, gene_buffer, 1, Wz_buffer, 1);
-            results[g] = dot_product * inv_S0;
+            if (fabs(S0) < DBL_EPSILON) { // Explicit check for S0 for single gene case if inv_S0 might be 0.0
+                 results[g] = (dot_product == 0.0) ? 0.0 : (dot_product > 0 ? INFINITY : -INFINITY) ; // Or NAN
+                 if(dot_product == 0.0 && S0 == 0.0) results[g] = NAN; // 0/0 is NaN
+            } else {
+                 results[g] = dot_product * inv_S0;
+            }
         }
         
         mkl_free(gene_buffer);

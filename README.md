@@ -1,6 +1,6 @@
 # Moran's I Calculator for Spatial Transcriptomics
 
-**Version 1.2.1**
+**Version 1.2.2**
 
 ## Overview
 

@@ -1,6 +1,6 @@
 /* main.c - Main program for Moran's I calculation using Intel MKL
  *
- * Version: 1.2.1 (Updated for improved safety and performance)
+ * Version: 1.2.2 (Updated for improved safety and performance)
  * Refactored: Improved code structure and resource management
  */
 
@@ -108,25 +108,63 @@ static void initialize_resources(AnalysisResources* resources) {
 static void cleanup_resources(AnalysisResources* resources) {
     if (!resources) return;
     
-    if (resources->vst_matrix) free_dense_matrix(resources->vst_matrix);
-    if (resources->znorm_matrix) free_dense_matrix(resources->znorm_matrix);
-    if (resources->spot_coords) free_spot_coordinates(resources->spot_coords);
-    if (resources->decay_matrix) free_dense_matrix(resources->decay_matrix);
-    if (resources->W_matrix) free_sparse_matrix(resources->W_matrix);
-    if (resources->X_calc) free_dense_matrix(resources->X_calc);
-    if (resources->observed_results) free_dense_matrix(resources->observed_results);
-    if (resources->perm_results) free_permutation_results(resources->perm_results);
+    if (resources->vst_matrix) {
+        free_dense_matrix(resources->vst_matrix);
+        resources->vst_matrix = NULL;
+    }
+    if (resources->znorm_matrix) {
+        free_dense_matrix(resources->znorm_matrix);
+        resources->znorm_matrix = NULL;
+    }
+    if (resources->spot_coords) {
+        free_spot_coordinates(resources->spot_coords);
+        resources->spot_coords = NULL;
+    }
+    if (resources->decay_matrix) {
+        free_dense_matrix(resources->decay_matrix);
+        resources->decay_matrix = NULL;
+    }
+    if (resources->W_matrix) {
+        free_sparse_matrix(resources->W_matrix);
+        resources->W_matrix = NULL;
+    }
+    if (resources->X_calc) {
+        free_dense_matrix(resources->X_calc);
+        resources->X_calc = NULL;
+    }
+    if (resources->observed_results) {
+        free_dense_matrix(resources->observed_results);
+        resources->observed_results = NULL;
+    }
+    if (resources->perm_results) {
+        free_permutation_results(resources->perm_results);
+        resources->perm_results = NULL;
+    }
     
     if (resources->valid_spot_names) {
         for (MKL_INT k = 0; k < resources->num_valid_spots; k++) {
-            if (resources->valid_spot_names[k]) free(resources->valid_spot_names[k]);
+            if (resources->valid_spot_names[k]) {
+                free(resources->valid_spot_names[k]);
+                resources->valid_spot_names[k] = NULL;
+            }
         }
         free(resources->valid_spot_names);
+        resources->valid_spot_names = NULL;
     }
-    if (resources->valid_spot_indices) free(resources->valid_spot_indices);
-    if (resources->valid_spot_rows) free(resources->valid_spot_rows);
-    if (resources->valid_spot_cols) free(resources->valid_spot_cols);
+    if (resources->valid_spot_indices) {
+        free(resources->valid_spot_indices);
+        resources->valid_spot_indices = NULL;
+    }
+    if (resources->valid_spot_rows) {
+        free(resources->valid_spot_rows);
+        resources->valid_spot_rows = NULL;
+    }
+    if (resources->valid_spot_cols) {
+        free(resources->valid_spot_cols);
+        resources->valid_spot_cols = NULL;
+    }
     
+    resources->num_valid_spots = 0;
     memset(resources, 0, sizeof(AnalysisResources));
 }
 

@@ -3,7 +3,7 @@
  * This library provides efficient calculation of Moran's I spatial autocorrelation
  * statistics for gene expression data, optimized using Intel MKL.
  *
- * Version: 1.2.1 - Added row normalization support
+ * Version: 1.2.2 (Optimized custom weight matrix reading)
  */
 
 #ifndef MORANS_I_MKL_H
@@ -21,7 +21,7 @@
 #include "mkl_vml.h"  /* For vdDiv and other VML functions */
 
 /* Library version */
-#define MORANS_I_MKL_VERSION "1.2.1"
+#define MORANS_I_MKL_VERSION "1.2.2"
 
 /* Constants */
 #define VISIUM 0                      /* Visium platform with hexagonal grid */
@@ -54,6 +54,28 @@
 #define MORANS_I_ERROR_FILE -2
 #define MORANS_I_ERROR_PARAMETER -3
 #define MORANS_I_ERROR_COMPUTATION -4
+
+/* Forward declaration for SpotNameHashTable to break potential circular dependency if needed,
+   though direct inclusion of struct definition is usually fine here.
+   If SpotNameHashTable itself used DenseMatrix/SparseMatrix, then forward declare those too.
+   For now, assuming direct definition is okay.
+*/
+// struct SpotNameHashTable_st; // Not strictly needed if defined before use
+
+
+/* Hash Table for Spot Name Lookup (Moved from .c to .h) */
+typedef struct SpotNameHashNode_st {
+    char* name;
+    MKL_INT index;
+    struct SpotNameHashNode_st* next;
+} SpotNameHashNode;
+
+typedef struct SpotNameHashTable_st {
+    SpotNameHashNode** buckets;
+    size_t num_buckets;
+    size_t count;
+} SpotNameHashTable;
+
 
 /**
  * Dense matrix structure
@@ -159,11 +181,12 @@ void print_mkl_status(sparse_status_t status, const char* function_name);
 double get_time(void); // Prototype for get_time
 
 /* Custom Weight Matrix Functions */
-SparseMatrix* read_custom_weight_matrix(const char* filename, int format, char** spot_names, MKL_INT n_spots);
+// The second argument of these three functions is now SpotNameHashTable*
+SparseMatrix* read_custom_weight_matrix(const char* filename, int format, char** spot_names_from_expr, MKL_INT n_spots); // This one still needs char** to build the map initially
 int detect_weight_matrix_format(const char* filename);
-SparseMatrix* read_dense_weight_matrix(const char* filename, char** spot_names, MKL_INT n_spots);
-SparseMatrix* read_sparse_weight_matrix_coo(const char* filename, char** spot_names, MKL_INT n_spots);
-SparseMatrix* read_sparse_weight_matrix_tsv(const char* filename, char** spot_names, MKL_INT n_spots);
+SparseMatrix* read_dense_weight_matrix(const char* filename, SpotNameHashTable* spot_map, MKL_INT n_spots);
+SparseMatrix* read_sparse_weight_matrix_coo(const char* filename, SpotNameHashTable* spot_map, MKL_INT n_spots);
+SparseMatrix* read_sparse_weight_matrix_tsv(const char* filename, SpotNameHashTable* spot_map, MKL_INT n_spots);
 int validate_weight_matrix(const SparseMatrix* W, char** spot_names, MKL_INT n_spots);
 
 /* Spatial Data Processing */
