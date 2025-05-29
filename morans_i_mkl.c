@@ -1,9 +1,10 @@
 /* morans_i_mkl.c - Optimized MKL-based Moran's I implementation
  *
- * Version: 1.2.2 (Optimized custom weight matrix reading)
+ * Version: 1.3.0 (Added Residual Moran's I functionality)
  *
  * This implements efficient calculation of Moran's I spatial autocorrelation
- * statistics for spatial transcriptomics data using Intel MKL.
+ * statistics for spatial transcriptomics data using Intel MKL, including
+ * residual Moran's I for cell type correction.
  */
 
 #include <stdio.h>
@@ -51,7 +52,6 @@ typedef struct {
 
 /* Forward declarations for helper functions */
 static void cleanup_list_init(cleanup_list_t* list);
-//static int cleanup_list_add(cleanup_list_t* list, void* ptr, void (*free_func)(void*));
 static void cleanup_list_free_all(cleanup_list_t* list);
 static void cleanup_list_destroy(cleanup_list_t* list);
 
@@ -80,9 +80,21 @@ static int permutation_worker(const DenseMatrix* X_original,
                              double* local_p_counts,
                              const DenseMatrix* observed_results);
 
-/* Hash Table Helper Function DEFINITIONS (these stay in .c and are static) */
-// The SpotNameHashNode and SpotNameHashTable struct definitions are now in morans_i_mkl.h
+/* Cell type file parsing helpers */
+static int parse_celltype_header(const char* header_line, char delimiter,
+                                const char* expected_id_col,
+                                const char* expected_type_col,
+                                const char* expected_x_col,
+                                const char* expected_y_col,
+                                int* id_col_idx,
+                                int* type_col_idx,
+                                int* x_col_idx,
+                                int* y_col_idx);
 
+static char** collect_unique_celltypes(FILE* fp, char delimiter, int type_col_idx, 
+                                      MKL_INT* n_celltypes_out, MKL_INT* n_cells_out);
+
+/* Hash Table Helper Function DEFINITIONS (these stay in .c and are static) */
 static unsigned long spot_name_hash(const char* str) {
     unsigned long hash = 5381;
     int c;
@@ -115,7 +127,6 @@ static size_t get_next_prime(size_t n) {
     return prime;
 }
 
-
 static SpotNameHashTable* spot_name_ht_create(size_t num_spots_hint) {
     SpotNameHashTable* ht = (SpotNameHashTable*)malloc(sizeof(SpotNameHashTable));
     if (!ht) {
@@ -127,7 +138,6 @@ static SpotNameHashTable* spot_name_ht_create(size_t num_spots_hint) {
     // Ensure num_buckets is at least a small prime if hint is 0 or very small.
     size_t buckets_n = (num_spots_hint > 16) ? num_spots_hint : 17; // Use 17 as a small prime default
     ht->num_buckets = get_next_prime(buckets_n);
-
 
     ht->buckets = (SpotNameHashNode**)calloc(ht->num_buckets, sizeof(SpotNameHashNode*));
     if (!ht->buckets) {
@@ -205,10 +215,9 @@ static void spot_name_ht_free(SpotNameHashTable* ht) {
     free(ht);
 }
 
-
 /* Library version information */
 const char* morans_i_mkl_version(void) {
-    return "1.2.2"; 
+    return "1.3.0"; 
 }
 
 /* ===============================
@@ -223,33 +232,6 @@ static void cleanup_list_init(cleanup_list_t* list) {
     list->count = 0;
     list->capacity = 0;
 }
-
-/*
-static int cleanup_list_add(cleanup_list_t* list, void* ptr, void (*free_func)(void*)) {
-    if (!list || !ptr) return -1;
-    
-    if (list->count >= list->capacity) {
-        size_t new_capacity = list->capacity == 0 ? 8 : list->capacity * 2;
-        void** new_ptrs = realloc(list->ptrs, new_capacity * sizeof(void*));
-        void (**new_funcs)(void*) = realloc(list->free_funcs, new_capacity * sizeof(void(*)(void*)));
-        
-        if (!new_ptrs || !new_funcs) {
-            free(new_ptrs);
-            free(new_funcs);
-            return -1;
-        }
-        
-        list->ptrs = new_ptrs;
-        list->free_funcs = new_funcs;
-        list->capacity = new_capacity;
-    }
-    
-    list->ptrs[list->count] = ptr;
-    list->free_funcs[list->count] = free_func ? free_func : free;
-    list->count++;
-    return 0;
-}
-*/
 
 static void cleanup_list_free_all(cleanup_list_t* list) {
     if (!list) return;
@@ -350,6 +332,20 @@ MoransIConfig initialize_default_config(void) {
     config.perm_seed = (unsigned int)time(NULL);
     config.perm_output_zscores = 1;
     config.perm_output_pvalues = 1;
+    
+    // Residual analysis defaults
+    config.residual_config.analysis_mode = DEFAULT_ANALYSIS_MODE;
+    config.residual_config.celltype_file = NULL;
+    config.residual_config.celltype_format = DEFAULT_CELLTYPE_FORMAT;
+    config.residual_config.celltype_id_col = strdup("cell_ID");
+    config.residual_config.celltype_type_col = strdup("cellType");
+    config.residual_config.celltype_x_col = strdup("sdimx");
+    config.residual_config.celltype_y_col = strdup("sdimy");
+    config.residual_config.spot_id_col = strdup("spot_id");
+    config.residual_config.include_intercept = DEFAULT_INCLUDE_INTERCEPT;
+    config.residual_config.regularization_lambda = DEFAULT_REGULARIZATION_LAMBDA;
+    config.residual_config.normalize_residuals = DEFAULT_NORMALIZE_RESIDUALS;
+    
     return config;
 }
 
@@ -422,6 +418,14 @@ void print_help(const char* program_name) {
     printf("  -t <int>\tSet number of OpenMP threads. Default: %d (or OMP_NUM_THREADS environment variable).\n",
            DEFAULT_NUM_THREADS);
     printf("  -m <int>\tSet number of MKL threads. Default: Value of -t, or OpenMP default if -t is not set.\n");
+    printf("\nResidual Moran's I Options:\n");
+    printf("  --analysis-mode <standard|residual>\tAnalysis mode. Default: standard.\n");
+    printf("  --celltype-file <file>\t\tCell type composition/annotation file.\n");
+    printf("  --celltype-format <deconv|sc>\t\tFormat: deconvolution or single_cell. Default: single_cell.\n");
+    printf("  --celltype-id-col <name>\t\tCell ID column name. Default: cell_ID.\n");
+    printf("  --celltype-type-col <name>\t\tCell type column name. Default: cellType.\n");
+    printf("  --include-intercept <0|1>\t\tInclude intercept in regression. Default: 1.\n");
+    printf("  --regularization <float>\t\tRidge regularization parameter. Default: 0.0.\n");
     printf("\nPermutation Test Options (apply if -b 1 and -g 1):\n");
     printf("  --run-perm <0|1>\tRun permutation test? 0 = No, 1 = Yes. Default: 0.\n");
     printf("  --num-perm <int>\tNumber of permutations. Default: %d.\n", DEFAULT_NUM_PERMUTATIONS);
@@ -442,9 +446,2214 @@ void print_help(const char* program_name) {
     printf("  If -b 1 and -g 1 (Pairwise All): <output_prefix>_all_pairs_moran_i.tsv (Symmetric matrix, or _raw.tsv for lower-tri).\n");
     printf("    Permutation outputs (if --run-perm 1): <prefix>_zscores_lower_tri.tsv, <prefix>_pvalues_lower_tri.tsv\n");
     printf("  If -b 1 and -g 0 (Pairwise First Gene): <output_prefix>_first_vs_all_moran_i.tsv (Gene, MoranI_vs_Gene0).\n");
+    printf("  Residual Analysis outputs: <prefix>_residual_morans_i_raw.tsv, <prefix>_regression_coefficients.tsv\n");
     printf("\nExample:\n");
     printf("  %s -i expression.tsv -o morans_i_run1 -r 3 -p 0 -b 1 -g 1 -t 8 --run-perm 1 --num-perm 500\n\n", program_name);
     printf("Version: %s\n", morans_i_mkl_version());
+}
+
+/* ===============================
+ * CELL TYPE DATA PROCESSING
+ * =============================== */
+
+/* Detect file delimiter (CSV vs TSV) */
+int detect_file_delimiter(const char* filename) {
+    if (!filename) {
+        fprintf(stderr, "Error: NULL filename in detect_file_delimiter\n");
+        return '\t'; // Default to tab
+    }
+    
+    FILE* fp = fopen(filename, "r");
+    if (!fp) {
+        fprintf(stderr, "Warning: Cannot open file '%s' for delimiter detection: %s\n", 
+                filename, strerror(errno));
+        return '\t'; // Default to tab
+    }
+    
+    char* line = NULL;
+    size_t line_buf_size = 0;
+    ssize_t line_len = getline(&line, &line_buf_size, fp);
+    fclose(fp);
+    
+    if (line_len <= 0) {
+        if (line) free(line);
+        return '\t'; // Default to tab
+    }
+    
+    int comma_count = 0, tab_count = 0;
+    for (ssize_t i = 0; i < line_len; i++) {
+        if (line[i] == ',') comma_count++;
+        else if (line[i] == '\t') tab_count++;
+    }
+    
+    free(line);
+    DEBUG_PRINT("Delimiter detection: commas=%d, tabs=%d", comma_count, tab_count);
+    return (comma_count > tab_count) ? ',' : '\t';
+}
+
+/* Parse cell type header to find column indices */
+static int parse_celltype_header(const char* header_line, char delimiter,
+                                const char* expected_id_col,
+                                const char* expected_type_col,
+                                const char* expected_x_col,
+                                const char* expected_y_col,
+                                int* id_col_idx,
+                                int* type_col_idx,
+                                int* x_col_idx,
+                                int* y_col_idx) {
+    if (!header_line || !expected_id_col || !expected_type_col) {
+        return MORANS_I_ERROR_PARAMETER;
+    }
+    
+    *id_col_idx = *type_col_idx = *x_col_idx = *y_col_idx = -1;
+    
+    char* header_copy = strdup(header_line);
+    if (!header_copy) {
+        perror("strdup header in parse_celltype_header");
+        return MORANS_I_ERROR_MEMORY;
+    }
+    
+    char delim_str[2] = {delimiter, '\0'};
+    char* token = strtok(header_copy, delim_str);
+    int col_idx = 0;
+    
+    while (token) {
+        char* trimmed = trim_whitespace_inplace(token);
+        
+        // Skip first column if it's an index column (empty or numeric-looking)
+        if (col_idx == 0 && (strlen(trimmed) == 0 || isdigit((unsigned char)trimmed[0]))) {
+            token = strtok(NULL, delim_str);
+            col_idx++;
+            continue;
+        }
+        
+        if (strcmp(trimmed, expected_id_col) == 0) {
+            *id_col_idx = col_idx;
+        } else if (strcmp(trimmed, expected_type_col) == 0) {
+            *type_col_idx = col_idx;
+        } else if (expected_x_col && strcmp(trimmed, expected_x_col) == 0) {
+            *x_col_idx = col_idx;
+        } else if (expected_y_col && strcmp(trimmed, expected_y_col) == 0) {
+            *y_col_idx = col_idx;
+        }
+        
+        token = strtok(NULL, delim_str);
+        col_idx++;
+    }
+    
+    free(header_copy);
+    
+    DEBUG_PRINT("Column indices: ID=%d, Type=%d, X=%d, Y=%d", 
+                *id_col_idx, *type_col_idx, *x_col_idx, *y_col_idx);
+    
+    return MORANS_I_SUCCESS;
+}
+
+/* Collect unique cell types from file */
+static char** collect_unique_celltypes(FILE* fp, char delimiter, int type_col_idx, 
+                                      MKL_INT* n_celltypes_out, MKL_INT* n_cells_out) {
+    if (!fp || type_col_idx < 0 || !n_celltypes_out || !n_cells_out) {
+        return NULL;
+    }
+    
+    long current_pos = ftell(fp);
+    char* line = NULL;
+    size_t line_buf_size = 0;
+    ssize_t line_len;
+    
+    // First pass: collect all cell types
+    char** temp_celltypes = NULL;
+    MKL_INT temp_capacity = 100;
+    MKL_INT temp_count = 0;
+    MKL_INT cell_count = 0;
+    
+    temp_celltypes = (char**)malloc(temp_capacity * sizeof(char*));
+    if (!temp_celltypes) {
+        perror("malloc temp_celltypes");
+        return NULL;
+    }
+    
+    char delim_str[2] = {delimiter, '\0'};
+    
+    while ((line_len = getline(&line, &line_buf_size, fp)) > 0) {
+        char* p = line;
+        while(isspace((unsigned char)*p)) p++;
+        if(*p == '\0') continue; // Skip empty lines
+        
+        char* line_copy = strdup(line);
+        if (!line_copy) continue;
+        
+        char* token = strtok(line_copy, delim_str);
+        int col_idx = 0;
+        
+        while (token && col_idx <= type_col_idx) {
+            if (col_idx == type_col_idx) {
+                char* celltype = trim_whitespace_inplace(token);
+                if (strlen(celltype) > 0) {
+                    // Check if this cell type is already in our list
+                    int found = 0;
+                    for (MKL_INT i = 0; i < temp_count; i++) {
+                        if (strcmp(temp_celltypes[i], celltype) == 0) {
+                            found = 1;
+                            break;
+                        }
+                    }
+                    
+                    if (!found) {
+                        if (temp_count >= temp_capacity) {
+                            temp_capacity *= 2;
+                            char** new_temp = (char**)realloc(temp_celltypes, temp_capacity * sizeof(char*));
+                            if (!new_temp) {
+                                for (MKL_INT i = 0; i < temp_count; i++) {
+                                    free(temp_celltypes[i]);
+                                }
+                                free(temp_celltypes);
+                                free(line_copy);
+                                if (line) free(line);
+                                return NULL;
+                            }
+                            temp_celltypes = new_temp;
+                        }
+                        temp_celltypes[temp_count] = strdup(celltype);
+                        if (!temp_celltypes[temp_count]) {
+                            perror("strdup celltype");
+                            for (MKL_INT i = 0; i < temp_count; i++) {
+                                free(temp_celltypes[i]);
+                            }
+                            free(temp_celltypes);
+                            free(line_copy);
+                            if (line) free(line);
+                            return NULL;
+                        }
+                        temp_count++;
+                    }
+                    cell_count++;
+                }
+                break;
+            }
+            token = strtok(NULL, delim_str);
+            col_idx++;
+        }
+        free(line_copy);
+    }
+    
+    if (line) free(line);
+    fseek(fp, current_pos, SEEK_SET);
+    
+    *n_celltypes_out = temp_count;
+    *n_cells_out = cell_count;
+    
+    printf("Found %lld unique cell types from %lld cells\n", 
+           (long long)temp_count, (long long)cell_count);
+    
+    return temp_celltypes;
+}
+
+/* Read cell type data in single-cell format */
+CellTypeMatrix* read_celltype_singlecell_file(const char* filename, 
+                                             const char* cell_id_col,
+                                             const char* celltype_col,
+                                             const char* x_col,
+                                             const char* y_col) {
+    if (!filename || !cell_id_col || !celltype_col) {
+        fprintf(stderr, "Error: NULL parameters in read_celltype_singlecell_file\n");
+        return NULL;
+    }
+    
+    FILE* fp = fopen(filename, "r");
+    if (!fp) {
+        fprintf(stderr, "Error: Cannot open cell type file '%s': %s\n", filename, strerror(errno));
+        return NULL;
+    }
+    
+    char delimiter = detect_file_delimiter(filename);
+    printf("Reading single-cell annotations from '%s' with delimiter '%c'\n", filename, delimiter);
+    
+    char* line = NULL;
+    size_t line_buf_size = 0;
+    ssize_t line_len;
+    
+    // Read and parse header
+    line_len = getline(&line, &line_buf_size, fp);
+    if (line_len <= 0) {
+        fprintf(stderr, "Error: Empty header in cell type file\n");
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    int id_col_idx, type_col_idx, x_col_idx, y_col_idx;
+    if (parse_celltype_header(line, delimiter, cell_id_col, celltype_col, x_col, y_col,
+                             &id_col_idx, &type_col_idx, &x_col_idx, &y_col_idx) != MORANS_I_SUCCESS) {
+        fprintf(stderr, "Error: Failed to parse cell type file header\n");
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    if (id_col_idx < 0 || type_col_idx < 0) {
+        fprintf(stderr, "Error: Required columns not found: %s=%s, %s=%s\n",
+                cell_id_col, (id_col_idx >= 0 ? "Found" : "Missing"),
+                celltype_col, (type_col_idx >= 0 ? "Found" : "Missing"));
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    // Collect unique cell types
+    MKL_INT n_celltypes, n_cells;
+    char** unique_celltypes = collect_unique_celltypes(fp, delimiter, type_col_idx, &n_celltypes, &n_cells);
+    if (!unique_celltypes || n_celltypes == 0) {
+        fprintf(stderr, "Error: No cell types found in file\n");
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    // Create cell type matrix
+    CellTypeMatrix* celltype_matrix = (CellTypeMatrix*)malloc(sizeof(CellTypeMatrix));
+    if (!celltype_matrix) {
+        perror("malloc CellTypeMatrix");
+        for (MKL_INT i = 0; i < n_celltypes; i++) {
+            free(unique_celltypes[i]);
+        }
+        free(unique_celltypes);
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    celltype_matrix->nrows = n_cells;
+    celltype_matrix->ncols = n_celltypes;
+    celltype_matrix->is_binary = 1;
+    celltype_matrix->format_type = CELLTYPE_FORMAT_SINGLE_CELL;
+    
+    size_t values_size;
+    if (safe_multiply_size_t(n_cells, n_celltypes, &values_size) != 0 ||
+        safe_multiply_size_t(values_size, sizeof(double), &values_size) != 0) {
+        fprintf(stderr, "Error: Cell type matrix dimensions too large\n");
+        free(celltype_matrix);
+        for (MKL_INT i = 0; i < n_celltypes; i++) {
+            free(unique_celltypes[i]);
+        }
+        free(unique_celltypes);
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    celltype_matrix->values = (double*)mkl_calloc(values_size / sizeof(double), sizeof(double), 64);
+    celltype_matrix->rownames = (char**)calloc(n_cells, sizeof(char*));
+    celltype_matrix->colnames = (char**)calloc(n_celltypes, sizeof(char*));
+    
+    if (!celltype_matrix->values || !celltype_matrix->rownames || !celltype_matrix->colnames) {
+        perror("Failed to allocate cell type matrix components");
+        free_celltype_matrix(celltype_matrix);
+        for (MKL_INT i = 0; i < n_celltypes; i++) {
+            free(unique_celltypes[i]);
+        }
+        free(unique_celltypes);
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    // Copy cell type names
+    for (MKL_INT i = 0; i < n_celltypes; i++) {
+        celltype_matrix->colnames[i] = strdup(unique_celltypes[i]);
+        if (!celltype_matrix->colnames[i]) {
+            perror("strdup cell type name");
+            free_celltype_matrix(celltype_matrix);
+            for (MKL_INT j = 0; j < n_celltypes; j++) {
+                free(unique_celltypes[j]);
+            }
+            free(unique_celltypes);
+            fclose(fp);
+            if (line) free(line);
+            return NULL;
+        }
+    }
+    
+    // Read data and populate matrix
+    MKL_INT cell_idx = 0;
+    char delim_str[2] = {delimiter, '\0'};
+    
+    while ((line_len = getline(&line, &line_buf_size, fp)) > 0 && cell_idx < n_cells) {
+        char* p = line;
+        while(isspace((unsigned char)*p)) p++;
+        if(*p == '\0') continue;
+        
+        char* line_copy = strdup(line);
+        if (!line_copy) continue;
+        
+        char* token = strtok(line_copy, delim_str);
+        int col_idx = 0;
+        char* cell_id = NULL;
+        char* cell_type = NULL;
+        
+        while (token) {
+            if (col_idx == id_col_idx) {
+                cell_id = trim_whitespace_inplace(token);
+            } else if (col_idx == type_col_idx) {
+                cell_type = trim_whitespace_inplace(token);
+            }
+            token = strtok(NULL, delim_str);
+            col_idx++;
+        }
+        
+        if (cell_id && cell_type && strlen(cell_id) > 0 && strlen(cell_type) > 0) {
+            // Store cell ID
+            celltype_matrix->rownames[cell_idx] = strdup(cell_id);
+            if (!celltype_matrix->rownames[cell_idx]) {
+                perror("strdup cell_id");
+                free(line_copy);
+                break;
+            }
+            
+            // Find cell type index and set binary indicator
+            for (MKL_INT ct_idx = 0; ct_idx < n_celltypes; ct_idx++) {
+                if (strcmp(cell_type, unique_celltypes[ct_idx]) == 0) {
+                    celltype_matrix->values[cell_idx * n_celltypes + ct_idx] = 1.0;
+                    break;
+                }
+            }
+            cell_idx++;
+        }
+        free(line_copy);
+    }
+    
+    // Cleanup
+    for (MKL_INT i = 0; i < n_celltypes; i++) {
+        free(unique_celltypes[i]);
+    }
+    free(unique_celltypes);
+    fclose(fp);
+    if (line) free(line);
+    
+    if (cell_idx != n_cells) {
+        fprintf(stderr, "Warning: Expected %lld cells but processed %lld\n", 
+                (long long)n_cells, (long long)cell_idx);
+        celltype_matrix->nrows = cell_idx;
+    }
+    
+    printf("Successfully loaded single-cell annotations: %lld cells x %lld cell types\n",
+           (long long)celltype_matrix->nrows, (long long)celltype_matrix->ncols);
+    
+    return celltype_matrix;
+}
+
+
+/* Read cell type data in deconvolution format */
+CellTypeMatrix* read_celltype_deconvolution_file(const char* filename, const char* spot_id_col) {
+    if (!filename || !spot_id_col) {
+        fprintf(stderr, "Error: NULL parameters in read_celltype_deconvolution_file\n");
+        return NULL;
+    }
+    
+    FILE* fp = fopen(filename, "r");
+    if (!fp) {
+        fprintf(stderr, "Error: Cannot open deconvolution file '%s': %s\n", filename, strerror(errno));
+        return NULL;
+    }
+    
+    char delimiter = detect_file_delimiter(filename);
+    printf("Reading deconvolution data from '%s' with delimiter '%c'\n", filename, delimiter);
+    
+    char* line = NULL;
+    size_t line_buf_size = 0;
+    ssize_t line_len;
+    
+    // Read and parse header
+    line_len = getline(&line, &line_buf_size, fp);
+    if (line_len <= 0) {
+        fprintf(stderr, "Error: Empty header in deconvolution file\n");
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    // Trim line
+    while (line_len > 0 && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
+        line[--line_len] = '\0';
+    }
+    
+    char* header_copy = strdup(line);
+    if (!header_copy) {
+        perror("strdup header");
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    // Count fields and find spot ID column
+    char delim_str[2] = {delimiter, '\0'};
+    char* token = strtok(header_copy, delim_str);
+    int field_count = 0;
+    int spot_id_col_idx = -1;
+    
+    while (token) {
+        char* trimmed = trim_whitespace_inplace(token);
+        if (strcmp(trimmed, spot_id_col) == 0) {
+            spot_id_col_idx = field_count;
+        }
+        field_count++;
+        token = strtok(NULL, delim_str);
+    }
+    free(header_copy);
+    
+    if (spot_id_col_idx < 0) {
+        fprintf(stderr, "Error: Spot ID column '%s' not found in header\n", spot_id_col);
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    MKL_INT n_celltypes = field_count - 1; // Subtract spot ID column
+    if (n_celltypes <= 0) {
+        fprintf(stderr, "Error: No cell type columns found\n");
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    // Count data rows
+    long current_pos = ftell(fp);
+    MKL_INT n_spots = 0;
+    while ((line_len = getline(&line, &line_buf_size, fp)) > 0) {
+        char* p = line;
+        while(isspace((unsigned char)*p)) p++;
+        if(*p != '\0') n_spots++;
+    }
+    fseek(fp, current_pos, SEEK_SET);
+    
+    if (n_spots == 0) {
+        fprintf(stderr, "Error: No data rows found\n");
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    // Create cell type matrix
+    CellTypeMatrix* celltype_matrix = (CellTypeMatrix*)malloc(sizeof(CellTypeMatrix));
+    if (!celltype_matrix) {
+        perror("malloc CellTypeMatrix");
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    celltype_matrix->nrows = n_spots;
+    celltype_matrix->ncols = n_celltypes;
+    celltype_matrix->is_binary = 0;
+    celltype_matrix->format_type = CELLTYPE_FORMAT_DECONVOLUTION;
+    
+    size_t values_size;
+    if (safe_multiply_size_t(n_spots, n_celltypes, &values_size) != 0 ||
+        safe_multiply_size_t(values_size, sizeof(double), &values_size) != 0) {
+        fprintf(stderr, "Error: Deconvolution matrix dimensions too large\n");
+        free(celltype_matrix);
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    celltype_matrix->values = (double*)mkl_malloc(values_size, 64);
+    celltype_matrix->rownames = (char**)calloc(n_spots, sizeof(char*));
+    celltype_matrix->colnames = (char**)calloc(n_celltypes, sizeof(char*));
+    
+    if (!celltype_matrix->values || !celltype_matrix->rownames || !celltype_matrix->colnames) {
+        perror("Failed to allocate deconvolution matrix components");
+        free_celltype_matrix(celltype_matrix);
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
+    }
+    
+    // Read header again to get column names
+    fseek(fp, 0, SEEK_SET);
+    getline(&line, &line_buf_size, fp); // Re-read header
+    header_copy = strdup(line);
+    token = strtok(header_copy, delim_str);
+    int col_idx = 0;
+    int celltype_col_idx = 0;
+    
+    while (token) {
+        char* trimmed = trim_whitespace_inplace(token);
+        if (col_idx != spot_id_col_idx) {
+            celltype_matrix->colnames[celltype_col_idx] = strdup(trimmed);
+            if (!celltype_matrix->colnames[celltype_col_idx]) {
+                perror("strdup cell type column name");
+                free(header_copy);
+                free_celltype_matrix(celltype_matrix);
+                fclose(fp);
+                if (line) free(line);
+                return NULL;
+            }
+            celltype_col_idx++;
+        }
+        col_idx++;
+        token = strtok(NULL, delim_str);
+    }
+    free(header_copy);
+    
+    // Read data rows
+    MKL_INT spot_idx = 0;
+    while ((line_len = getline(&line, &line_buf_size, fp)) > 0 && spot_idx < n_spots) {
+        char* p = line;
+        while(isspace((unsigned char)*p)) p++;
+        if(*p == '\0') continue;
+        
+        char* line_copy = strdup(line);
+        if (!line_copy) continue;
+        
+        token = strtok(line_copy, delim_str);
+        col_idx = 0;
+        celltype_col_idx = 0;
+        char* spot_id = NULL;
+        
+        while (token) {
+            char* trimmed = trim_whitespace_inplace(token);
+            if (col_idx == spot_id_col_idx) {
+                spot_id = trimmed;
+            } else {
+                char* endptr;
+                double value = strtod(trimmed, &endptr);
+                if (endptr != trimmed && isfinite(value)) {
+                    celltype_matrix->values[spot_idx * n_celltypes + celltype_col_idx] = value;
+                } else {
+                    celltype_matrix->values[spot_idx * n_celltypes + celltype_col_idx] = 0.0;
+                }
+                celltype_col_idx++;
+            }
+            col_idx++;
+            token = strtok(NULL, delim_str);
+        }
+        
+        if (spot_id && strlen(spot_id) > 0) {
+            celltype_matrix->rownames[spot_idx] = strdup(spot_id);
+            if (!celltype_matrix->rownames[spot_idx]) {
+                perror("strdup spot_id");
+                free(line_copy);
+                break;
+            }
+            spot_idx++;
+        }
+        free(line_copy);
+    }
+    
+    fclose(fp);
+    if (line) free(line);
+    
+    if (spot_idx != n_spots) {
+        fprintf(stderr, "Warning: Expected %lld spots but processed %lld\n", 
+                (long long)n_spots, (long long)spot_idx);
+        celltype_matrix->nrows = spot_idx;
+    }
+    
+    printf("Successfully loaded deconvolution data: %lld spots x %lld cell types\n",
+           (long long)celltype_matrix->nrows, (long long)celltype_matrix->ncols);
+    
+    return celltype_matrix;
+}
+
+/* Validate cell type matrix against expression matrix */
+int validate_celltype_matrix(const CellTypeMatrix* Z, const DenseMatrix* X) {
+    if (!Z || !X) {
+        fprintf(stderr, "Error: NULL parameters in validate_celltype_matrix\n");
+        return MORANS_I_ERROR_PARAMETER;
+    }
+    
+    if (Z->nrows == 0 || Z->ncols == 0) {
+        fprintf(stderr, "Error: Cell type matrix has zero dimensions\n");
+        return MORANS_I_ERROR_PARAMETER;
+    }
+    
+    printf("Validating cell type matrix (%lld x %lld) against expression matrix (%lld x %lld)\n",
+           (long long)Z->nrows, (long long)Z->ncols, (long long)X->nrows, (long long)X->ncols);
+    
+    return MORANS_I_SUCCESS;
+}
+
+/* Map cell type matrix to expression matrix spots */
+int map_celltype_to_expression(const CellTypeMatrix* celltype_matrix, const DenseMatrix* expr_matrix,
+                               CellTypeMatrix** mapped_celltype_out) {
+    if (!celltype_matrix || !expr_matrix || !mapped_celltype_out) {
+        fprintf(stderr, "Error: NULL parameters in map_celltype_to_expression\n");
+        return MORANS_I_ERROR_PARAMETER;
+    }
+    
+    *mapped_celltype_out = NULL;
+    
+    if (celltype_matrix->format_type == CELLTYPE_FORMAT_SINGLE_CELL) {
+        // For single-cell data, need to map cell IDs to expression spots
+        printf("Mapping single-cell annotations to expression matrix spots...\n");
+        
+        // Create hash table for fast cell ID lookup
+        SpotNameHashTable* cell_map = spot_name_ht_create(celltype_matrix->nrows);
+        if (!cell_map) {
+            fprintf(stderr, "Error: Failed to create cell ID hash table\n");
+            return MORANS_I_ERROR_MEMORY;
+        }
+        
+        for (MKL_INT i = 0; i < celltype_matrix->nrows; i++) {
+            if (celltype_matrix->rownames[i]) {
+                if (spot_name_ht_insert(cell_map, celltype_matrix->rownames[i], i) != 0) {
+                    fprintf(stderr, "Error: Failed to insert cell ID into hash table\n");
+                    spot_name_ht_free(cell_map);
+                    return MORANS_I_ERROR_MEMORY;
+                }
+            }
+        }
+        
+        // Create new mapped cell type matrix
+        CellTypeMatrix* mapped = (CellTypeMatrix*)malloc(sizeof(CellTypeMatrix));
+        if (!mapped) {
+            perror("malloc mapped CellTypeMatrix");
+            spot_name_ht_free(cell_map);
+            return MORANS_I_ERROR_MEMORY;
+        }
+        
+        mapped->nrows = expr_matrix->nrows;  // Use expression matrix spot count
+        mapped->ncols = celltype_matrix->ncols;
+        mapped->is_binary = celltype_matrix->is_binary;
+        mapped->format_type = celltype_matrix->format_type;
+        
+        size_t mapped_values_size;
+        if (safe_multiply_size_t(mapped->nrows, mapped->ncols, &mapped_values_size) != 0 ||
+            safe_multiply_size_t(mapped_values_size, sizeof(double), &mapped_values_size) != 0) {
+            fprintf(stderr, "Error: Mapped matrix dimensions too large\n");
+            free(mapped);
+            spot_name_ht_free(cell_map);
+            return MORANS_I_ERROR_MEMORY;
+        }
+        
+        mapped->values = (double*)mkl_calloc(mapped_values_size / sizeof(double), sizeof(double), 64);
+        mapped->rownames = (char**)calloc(mapped->nrows, sizeof(char*));
+        mapped->colnames = (char**)calloc(mapped->ncols, sizeof(char*));
+        
+        if (!mapped->values || !mapped->rownames || !mapped->colnames) {
+            perror("Failed to allocate mapped matrix components");
+            free_celltype_matrix(mapped);
+            spot_name_ht_free(cell_map);
+            return MORANS_I_ERROR_MEMORY;
+        }
+        
+        // Copy cell type names
+        for (MKL_INT j = 0; j < mapped->ncols; j++) {
+            mapped->colnames[j] = strdup(celltype_matrix->colnames[j]);
+            if (!mapped->colnames[j]) {
+                perror("strdup cell type name");
+                free_celltype_matrix(mapped);
+                spot_name_ht_free(cell_map);
+                return MORANS_I_ERROR_MEMORY;
+            }
+        }
+        
+        // Map cell type data to expression spots
+        MKL_INT mapped_count = 0;
+        for (MKL_INT i = 0; i < expr_matrix->nrows; i++) {
+            const char* spot_name = expr_matrix->rownames[i];
+            if (spot_name) {
+                mapped->rownames[i] = strdup(spot_name);
+                if (!mapped->rownames[i]) {
+                    perror("strdup spot name");
+                    free_celltype_matrix(mapped);
+                    spot_name_ht_free(cell_map);
+                    return MORANS_I_ERROR_MEMORY;
+                }
+                
+                MKL_INT cell_idx = spot_name_ht_find(cell_map, spot_name);
+                if (cell_idx >= 0) {
+                    // Copy cell type data
+                    for (MKL_INT j = 0; j < mapped->ncols; j++) {
+                        mapped->values[i * mapped->ncols + j] = 
+                            celltype_matrix->values[cell_idx * celltype_matrix->ncols + j];
+                    }
+                    mapped_count++;
+                }
+                // If not found, values remain 0 (from calloc)
+            }
+        }
+        
+        spot_name_ht_free(cell_map);
+        
+        printf("Mapped %lld/%lld expression spots to cell type annotations\n",
+               (long long)mapped_count, (long long)expr_matrix->nrows);
+        
+        if (mapped_count == 0) {
+            fprintf(stderr, "Warning: No expression spots could be mapped to cell type data\n");
+        }
+        
+        *mapped_celltype_out = mapped;
+        
+    } else {
+        // For deconvolution data, assume spot names match directly
+        printf("Using deconvolution data directly (assuming spot names match)\n");
+        
+        // For now, just return a reference to the original matrix
+        // In a full implementation, you might want to reorder spots to match expression matrix
+        *mapped_celltype_out = (CellTypeMatrix*)celltype_matrix; // Cast away const - be careful!
+    }
+    
+    return MORANS_I_SUCCESS;
+}
+
+/* ===============================
+ * MATRIX OPERATIONS FOR RESIDUAL ANALYSIS
+ * =============================== */
+
+/* Create centering matrix H_n = I - (1/n) * 1 * 1^T */
+DenseMatrix* create_centering_matrix(MKL_INT n) {
+    if (n <= 0) {
+        fprintf(stderr, "Error: Invalid dimension for centering matrix: %lld\n", (long long)n);
+        return NULL;
+    }
+    
+    DenseMatrix* H = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (!H) {
+        perror("malloc centering matrix");
+        return NULL;
+    }
+    
+    H->nrows = n;
+    H->ncols = n;
+    H->rownames = NULL;
+    H->colnames = NULL;
+    
+    size_t values_size;
+    if (safe_multiply_size_t(n, n, &values_size) != 0 ||
+        safe_multiply_size_t(values_size, sizeof(double), &values_size) != 0) {
+        fprintf(stderr, "Error: Centering matrix dimensions too large\n");
+        free(H);
+        return NULL;
+    }
+    
+    H->values = (double*)mkl_malloc(values_size, 64);
+    if (!H->values) {
+        perror("mkl_malloc centering matrix values");
+        free(H);
+        return NULL;
+    }
+    
+    double inv_n = 1.0 / (double)n;
+    
+    // H = I - (1/n) * J where J is matrix of all ones
+    #pragma omp parallel for
+    for (MKL_INT i = 0; i < n; i++) {
+        for (MKL_INT j = 0; j < n; j++) {
+            if (i == j) {
+                H->values[i * n + j] = 1.0 - inv_n;
+            } else {
+                H->values[i * n + j] = -inv_n;
+            }
+        }
+    }
+    
+    DEBUG_PRINT("Created centering matrix: %lld x %lld", (long long)n, (long long)n);
+    return H;
+}
+
+/* Compute regression coefficients B̂ = (Z^T Z + λI)^(-1) Z^T X^T */
+DenseMatrix* compute_regression_coefficients(const CellTypeMatrix* Z, const DenseMatrix* X, double lambda) {
+    if (!Z || !X || !Z->values || !X->values) {
+        fprintf(stderr, "Error: NULL parameters in compute_regression_coefficients\n");
+        return NULL;
+    }
+    
+    if (Z->nrows != X->nrows) {
+        fprintf(stderr, "Error: Dimension mismatch in regression: Z has %lld rows, X has %lld rows\n",
+                (long long)Z->nrows, (long long)X->nrows);
+        return NULL;
+    }
+    
+    MKL_INT n_spots = Z->nrows;
+    MKL_INT n_celltypes = Z->ncols;
+    MKL_INT n_genes = X->ncols;
+    
+    printf("Computing regression coefficients: %lld cell types x %lld genes (lambda=%.6f)\n",
+           (long long)n_celltypes, (long long)n_genes, lambda);
+    
+    // Compute Z^T Z
+    size_t ztZ_size;
+    if (safe_multiply_size_t(n_celltypes, n_celltypes, &ztZ_size) != 0 ||
+        safe_multiply_size_t(ztZ_size, sizeof(double), &ztZ_size) != 0) {
+        fprintf(stderr, "Error: Z^T Z matrix too large\n");
+        return NULL;
+    }
+    
+    double* ZtZ = (double*)mkl_malloc(ztZ_size, 64);
+    if (!ZtZ) {
+        perror("mkl_malloc ZtZ");
+        return NULL;
+    }
+    
+    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                n_celltypes, n_celltypes, n_spots,
+                1.0, Z->values, n_celltypes,
+                Z->values, n_celltypes,
+                0.0, ZtZ, n_celltypes);
+    
+    // Add regularization: Z^T Z + λI
+    if (lambda > 0.0) {
+        for (MKL_INT i = 0; i < n_celltypes; i++) {
+            ZtZ[i * n_celltypes + i] += lambda;
+        }
+    }
+    
+    // Compute (Z^T Z + λI)^(-1) using Cholesky decomposition
+    MKL_INT* ipiv = (MKL_INT*)mkl_malloc(n_celltypes * sizeof(MKL_INT), 64);
+    if (!ipiv) {
+        perror("mkl_malloc ipiv");
+        mkl_free(ZtZ);
+        return NULL;
+    }
+    
+    MKL_INT info;
+    // LU decomposition
+    info = LAPACKE_dgetrf(LAPACK_ROW_MAJOR, n_celltypes, n_celltypes, ZtZ, n_celltypes, ipiv);
+    if (info != 0) {
+        fprintf(stderr, "Error: LU decomposition failed with info=%lld\n", (long long)info);
+        mkl_free(ipiv);
+        mkl_free(ZtZ);
+        return NULL;
+    }
+    
+    // Matrix inversion
+    info = LAPACKE_dgetri(LAPACK_ROW_MAJOR, n_celltypes, ZtZ, n_celltypes, ipiv);
+    mkl_free(ipiv);
+    if (info != 0) {
+        fprintf(stderr, "Error: Matrix inversion failed with info=%lld\n", (long long)info);
+        mkl_free(ZtZ);
+        return NULL;
+    }
+    
+    // Now ZtZ contains (Z^T Z + λI)^(-1)
+    
+    // Compute Z^T X
+    size_t ZtX_size;
+    if (safe_multiply_size_t(n_celltypes, n_genes, &ZtX_size) != 0 ||
+        safe_multiply_size_t(ZtX_size, sizeof(double), &ZtX_size) != 0) {
+        fprintf(stderr, "Error: Z^T X matrix too large\n");
+        mkl_free(ZtZ);
+        return NULL;
+    }
+    
+    double* ZtX = (double*)mkl_malloc(ZtX_size, 64);
+    if (!ZtX) {
+        perror("mkl_malloc ZtX");
+        mkl_free(ZtZ);
+        return NULL;
+    }
+    
+    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                n_celltypes, n_genes, n_spots,
+                1.0, Z->values, n_celltypes,
+                X->values, n_genes,
+                0.0, ZtX, n_genes);
+    
+    // Create result matrix for B̂
+    DenseMatrix* B = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (!B) {
+        perror("malloc regression coefficients matrix");
+        mkl_free(ZtZ);
+        mkl_free(ZtX);
+        return NULL;
+    }
+    
+    B->nrows = n_celltypes;
+    B->ncols = n_genes;
+    B->rownames = (char**)calloc(n_celltypes, sizeof(char*));
+    B->colnames = (char**)calloc(n_genes, sizeof(char*));
+    B->values = (double*)mkl_malloc(ZtX_size, 64);
+    
+    if (!B->values || !B->rownames || !B->colnames) {
+        perror("Failed to allocate regression coefficients components");
+        mkl_free(ZtZ);
+        mkl_free(ZtX);
+        free_dense_matrix(B);
+        return NULL;
+    }
+    
+    // Copy names
+    for (MKL_INT i = 0; i < n_celltypes; i++) {
+        if (Z->colnames && Z->colnames[i]) {
+            B->rownames[i] = strdup(Z->colnames[i]);
+        } else {
+            char temp[32];
+            snprintf(temp, sizeof(temp), "CellType_%lld", (long long)i);
+            B->rownames[i] = strdup(temp);
+        }
+        if (!B->rownames[i]) {
+            perror("strdup cell type name for coefficients");
+            mkl_free(ZtZ);
+            mkl_free(ZtX);
+            free_dense_matrix(B);
+            return NULL;
+        }
+    }
+    
+    for (MKL_INT j = 0; j < n_genes; j++) {
+        if (X->colnames && X->colnames[j]) {
+            B->colnames[j] = strdup(X->colnames[j]);
+        } else {
+            char temp[32];
+            snprintf(temp, sizeof(temp), "Gene_%lld", (long long)j);
+            B->colnames[j] = strdup(temp);
+        }
+        if (!B->colnames[j]) {
+            perror("strdup gene name for coefficients");
+            mkl_free(ZtZ);
+            mkl_free(ZtX);
+            free_dense_matrix(B);
+            return NULL;
+        }
+    }
+    
+    // Compute final result: B̂ = (Z^T Z + λI)^(-1) Z^T X
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                n_celltypes, n_genes, n_celltypes,
+                1.0, ZtZ, n_celltypes,
+                ZtX, n_genes,
+                0.0, B->values, n_genes);
+    
+    mkl_free(ZtZ);
+    mkl_free(ZtX);
+    
+    printf("Regression coefficients computed successfully\n");
+    return B;
+}
+
+/* Compute residual projection matrix M_res = I - Z(Z^T Z + λI)^(-1) Z^T */
+DenseMatrix* compute_residual_projection_matrix(const CellTypeMatrix* Z, double lambda) {
+    if (!Z || !Z->values) {
+        fprintf(stderr, "Error: NULL parameters in compute_residual_projection_matrix\n");
+        return NULL;
+    }
+    
+    MKL_INT n_spots = Z->nrows;
+    MKL_INT n_celltypes = Z->ncols;
+    
+    printf("Computing residual projection matrix: %lld x %lld (lambda=%.6f)\n",
+           (long long)n_spots, (long long)n_spots, lambda);
+    
+    // Compute Z^T Z + λI and its inverse (reuse code from regression coefficients)
+    size_t ztZ_size;
+    if (safe_multiply_size_t(n_celltypes, n_celltypes, &ztZ_size) != 0 ||
+        safe_multiply_size_t(ztZ_size, sizeof(double), &ztZ_size) != 0) {
+        fprintf(stderr, "Error: Z^T Z matrix too large for projection\n");
+        return NULL;
+    }
+    
+    double* ZtZ_inv = (double*)mkl_malloc(ztZ_size, 64);
+    if (!ZtZ_inv) {
+        perror("mkl_malloc ZtZ_inv");
+        return NULL;
+    }
+    
+    // Compute Z^T Z
+    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                n_celltypes, n_celltypes, n_spots,
+                1.0, Z->values, n_celltypes,
+                Z->values, n_celltypes,
+                0.0, ZtZ_inv, n_celltypes);
+    
+    // Add regularization
+    if (lambda > 0.0) {
+        for (MKL_INT i = 0; i < n_celltypes; i++) {
+            ZtZ_inv[i * n_celltypes + i] += lambda;
+        }
+    }
+    
+    // Invert matrix
+    MKL_INT* ipiv = (MKL_INT*)mkl_malloc(n_celltypes * sizeof(MKL_INT), 64);
+    if (!ipiv) {
+        perror("mkl_malloc ipiv");
+        mkl_free(ZtZ_inv);
+        return NULL;
+    }
+    
+    MKL_INT info;
+    info = LAPACKE_dgetrf(LAPACK_ROW_MAJOR, n_celltypes, n_celltypes, ZtZ_inv, n_celltypes, ipiv);
+    if (info != 0) {
+        fprintf(stderr, "Error: LU decomposition failed in projection matrix\n");
+        mkl_free(ipiv);
+        mkl_free(ZtZ_inv);
+        return NULL;
+    }
+    
+    info = LAPACKE_dgetri(LAPACK_ROW_MAJOR, n_celltypes, ZtZ_inv, n_celltypes, ipiv);
+    mkl_free(ipiv);
+    if (info != 0) {
+        fprintf(stderr, "Error: Matrix inversion failed in projection matrix\n");
+        mkl_free(ZtZ_inv);
+        return NULL;
+    }
+    
+    // Compute Z * (Z^T Z + λI)^(-1) * Z^T
+    size_t temp_size;
+    if (safe_multiply_size_t(n_spots, n_celltypes, &temp_size) != 0 ||
+        safe_multiply_size_t(temp_size, sizeof(double), &temp_size) != 0) {
+        fprintf(stderr, "Error: Temporary matrix too large for projection\n");
+        mkl_free(ZtZ_inv);
+        return NULL;
+    }
+    
+    double* temp = (double*)mkl_malloc(temp_size, 64);
+    if (!temp) {
+        perror("mkl_malloc temp for projection");
+        mkl_free(ZtZ_inv);
+        return NULL;
+    }
+    
+    // temp = Z * (Z^T Z + λI)^(-1)
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                n_spots, n_celltypes, n_celltypes,
+                1.0, Z->values, n_celltypes,
+                ZtZ_inv, n_celltypes,
+                0.0, temp, n_celltypes);
+    
+    mkl_free(ZtZ_inv);
+    
+    // Create projection matrix
+    DenseMatrix* M_res = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (!M_res) {
+        perror("malloc projection matrix");
+        mkl_free(temp);
+        return NULL;
+    }
+    
+    M_res->nrows = n_spots;
+    M_res->ncols = n_spots;
+    M_res->rownames = NULL;
+    M_res->colnames = NULL;
+    
+    size_t proj_size;
+    if (safe_multiply_size_t(n_spots, n_spots, &proj_size) != 0 ||
+        safe_multiply_size_t(proj_size, sizeof(double), &proj_size) != 0) {
+        fprintf(stderr, "Error: Projection matrix too large\n");
+        free(M_res);
+        mkl_free(temp);
+        return NULL;
+    }
+    
+    M_res->values = (double*)mkl_malloc(proj_size, 64);
+    if (!M_res->values) {
+        perror("mkl_malloc projection matrix values");
+        free(M_res);
+        mkl_free(temp);
+        return NULL;
+    }
+    
+    // Compute Z * (Z^T Z + λI)^(-1) * Z^T
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                n_spots, n_spots, n_celltypes,
+                1.0, temp, n_celltypes,
+                Z->values, n_celltypes,
+                0.0, M_res->values, n_spots);
+    
+    mkl_free(temp);
+    
+    // Compute M_res = I - Z(Z^T Z + λI)^(-1) Z^T
+    #pragma omp parallel for
+    for (MKL_INT i = 0; i < n_spots; i++) {
+        for (MKL_INT j = 0; j < n_spots; j++) {
+            if (i == j) {
+                M_res->values[i * n_spots + j] = 1.0 - M_res->values[i * n_spots + j];
+            } else {
+                M_res->values[i * n_spots + j] = -M_res->values[i * n_spots + j];
+            }
+        }
+    }
+    
+    printf("Residual projection matrix computed successfully\n");
+    return M_res;
+}
+
+/* Apply residual projection: R = X * M_res */
+DenseMatrix* apply_residual_projection(const DenseMatrix* X, const DenseMatrix* M_res) {
+    if (!X || !M_res || !X->values || !M_res->values) {
+        fprintf(stderr, "Error: NULL parameters in apply_residual_projection\n");
+        return NULL;
+    }
+    
+    if (X->nrows != M_res->nrows || X->nrows != M_res->ncols) {
+        fprintf(stderr, "Error: Dimension mismatch in residual projection\n");
+        return NULL;
+    }
+    
+    MKL_INT n_spots = X->nrows;
+    MKL_INT n_genes = X->ncols;
+    
+    printf("Applying residual projection: %lld spots x %lld genes\n",
+           (long long)n_spots, (long long)n_genes);
+    
+    DenseMatrix* R = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (!R) {
+        perror("malloc residual matrix");
+        return NULL;
+    }
+    
+    R->nrows = n_spots;
+    R->ncols = n_genes;
+    R->rownames = (char**)calloc(n_spots, sizeof(char*));
+    R->colnames = (char**)calloc(n_genes, sizeof(char*));
+    
+    size_t residual_size;
+    if (safe_multiply_size_t(n_spots, n_genes, &residual_size) != 0 ||
+        safe_multiply_size_t(residual_size, sizeof(double), &residual_size) != 0) {
+        fprintf(stderr, "Error: Residual matrix too large\n");
+        free(R);
+        return NULL;
+    }
+    
+    R->values = (double*)mkl_malloc(residual_size, 64);
+    if (!R->values || !R->rownames || !R->colnames) {
+        perror("Failed to allocate residual matrix components");
+        free_dense_matrix(R);
+        return NULL;
+    }
+    
+    // Copy names from X
+    for (MKL_INT i = 0; i < n_spots; i++) {
+        if (X->rownames && X->rownames[i]) {
+            R->rownames[i] = strdup(X->rownames[i]);
+        } else {
+            char temp[32];
+            snprintf(temp, sizeof(temp), "Spot_%lld", (long long)i);
+            R->rownames[i] = strdup(temp);
+        }
+        if (!R->rownames[i]) {
+            perror("strdup spot name for residuals");
+            free_dense_matrix(R);
+            return NULL;
+        }
+    }
+    
+    for (MKL_INT j = 0; j < n_genes; j++) {
+        if (X->colnames && X->colnames[j]) {
+            R->colnames[j] = strdup(X->colnames[j]);
+        } else {
+            char temp[32];
+            snprintf(temp, sizeof(temp), "Gene_%lld", (long long)j);
+            R->colnames[j] = strdup(temp);
+        }
+        if (!R->colnames[j]) {
+            perror("strdup gene name for residuals");
+            free_dense_matrix(R);
+            return NULL;
+        }
+    }
+    
+    // Compute R = M_res * X
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                n_spots, n_genes, n_spots,
+                1.0, M_res->values, n_spots,
+                X->values, n_genes,
+                0.0, R->values, n_genes);
+    
+    printf("Residual projection applied successfully\n");
+    return R;
+}
+
+/* Center matrix columns: R_rc = R * H_n */
+DenseMatrix* center_matrix_columns(const DenseMatrix* matrix) {
+    if (!matrix || !matrix->values) {
+        fprintf(stderr, "Error: NULL parameters in center_matrix_columns\n");
+        return NULL;
+    }
+    
+    MKL_INT n_spots = matrix->nrows;
+    MKL_INT n_genes = matrix->ncols;
+    
+    printf("Centering matrix columns: %lld spots x %lld genes\n",
+           (long long)n_spots, (long long)n_genes);
+    
+    DenseMatrix* centered = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (!centered) {
+        perror("malloc centered matrix");
+        return NULL;
+    }
+    
+    centered->nrows = n_spots;
+    centered->ncols = n_genes;
+    centered->rownames = (char**)calloc(n_spots, sizeof(char*));
+    centered->colnames = (char**)calloc(n_genes, sizeof(char*));
+    
+    size_t matrix_size;
+    if (safe_multiply_size_t(n_spots, n_genes, &matrix_size) != 0 ||
+        safe_multiply_size_t(matrix_size, sizeof(double), &matrix_size) != 0) {
+        fprintf(stderr, "Error: Centered matrix too large\n");
+        free(centered);
+        return NULL;
+    }
+    
+    centered->values = (double*)mkl_malloc(matrix_size, 64);
+    if (!centered->values || !centered->rownames || !centered->colnames) {
+        perror("Failed to allocate centered matrix components");
+        free_dense_matrix(centered);
+        return NULL;
+    }
+    
+    // Copy names
+    for (MKL_INT i = 0; i < n_spots; i++) {
+        if (matrix->rownames && matrix->rownames[i]) {
+            centered->rownames[i] = strdup(matrix->rownames[i]);
+        } else {
+            char temp[32];
+            snprintf(temp, sizeof(temp), "Spot_%lld", (long long)i);
+            centered->rownames[i] = strdup(temp);
+        }
+        if (!centered->rownames[i]) {
+            perror("strdup spot name for centered matrix");
+            free_dense_matrix(centered);
+            return NULL;
+        }
+    }
+    
+    for (MKL_INT j = 0; j < n_genes; j++) {
+        if (matrix->colnames && matrix->colnames[j]) {
+            centered->colnames[j] = strdup(matrix->colnames[j]);
+        } else {
+            char temp[32];
+            snprintf(temp, sizeof(temp), "Gene_%lld", (long long)j);
+            centered->colnames[j] = strdup(temp);
+        }
+        if (!centered->colnames[j]) {
+            perror("strdup gene name for centered matrix");
+            free_dense_matrix(centered);
+            return NULL;
+        }
+    }
+    
+    // Center each column (gene) by subtracting mean
+    #pragma omp parallel for
+    for (MKL_INT j = 0; j < n_genes; j++) {
+        double column_sum = 0.0;
+        for (MKL_INT i = 0; i < n_spots; i++) {
+            column_sum += matrix->values[i * n_genes + j];
+        }
+        double column_mean = column_sum / (double)n_spots;
+        
+        for (MKL_INT i = 0; i < n_spots; i++) {
+            centered->values[i * n_genes + j] = matrix->values[i * n_genes + j] - column_mean;
+        }
+    }
+    
+    printf("Matrix columns centered successfully\n");
+    return centered;
+}
+
+/* Normalize matrix rows: R_normalized = D * R_rc */
+DenseMatrix* normalize_matrix_rows(const DenseMatrix* matrix) {
+    if (!matrix || !matrix->values) {
+        fprintf(stderr, "Error: NULL parameters in normalize_matrix_rows\n");
+        return NULL;
+    }
+    
+    MKL_INT n_spots = matrix->nrows;
+    MKL_INT n_genes = matrix->ncols;
+    
+    printf("Normalizing matrix rows: %lld spots x %lld genes\n",
+           (long long)n_spots, (long long)n_genes);
+    
+    DenseMatrix* normalized = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (!normalized) {
+        perror("malloc normalized matrix");
+        return NULL;
+    }
+    
+    normalized->nrows = n_spots;
+    normalized->ncols = n_genes;
+    normalized->rownames = (char**)calloc(n_spots, sizeof(char*));
+    normalized->colnames = (char**)calloc(n_genes, sizeof(char*));
+    
+    size_t matrix_size;
+    if (safe_multiply_size_t(n_spots, n_genes, &matrix_size) != 0 ||
+        safe_multiply_size_t(matrix_size, sizeof(double), &matrix_size) != 0) {
+        fprintf(stderr, "Error: Normalized matrix too large\n");
+        free(normalized);
+        return NULL;
+    }
+    
+    normalized->values = (double*)mkl_malloc(matrix_size, 64);
+    if (!normalized->values || !normalized->rownames || !normalized->colnames) {
+        perror("Failed to allocate normalized matrix components");
+        free_dense_matrix(normalized);
+        return NULL;
+    }
+    
+    // Copy names
+    for (MKL_INT i = 0; i < n_spots; i++) {
+        if (matrix->rownames && matrix->rownames[i]) {
+            normalized->rownames[i] = strdup(matrix->rownames[i]);
+        } else {
+            char temp[32];
+            snprintf(temp, sizeof(temp), "Spot_%lld", (long long)i);
+            normalized->rownames[i] = strdup(temp);
+        }
+        if (!normalized->rownames[i]) {
+            perror("strdup spot name for normalized matrix");
+            free_dense_matrix(normalized);
+            return NULL;
+        }
+    }
+    
+    for (MKL_INT j = 0; j < n_genes; j++) {
+        if (matrix->colnames && matrix->colnames[j]) {
+            normalized->colnames[j] = strdup(matrix->colnames[j]);
+        } else {
+            char temp[32];
+            snprintf(temp, sizeof(temp), "Gene_%lld", (long long)j);
+            normalized->colnames[j] = strdup(temp);
+        }
+        if (!normalized->colnames[j]) {
+            perror("strdup gene name for normalized matrix");
+            free_dense_matrix(normalized);
+            return NULL;
+        }
+    }
+    
+    // Normalize each row by its L2 norm
+    #pragma omp parallel for
+    for (MKL_INT i = 0; i < n_spots; i++) {
+        double row_sum_sq = 0.0;
+        for (MKL_INT j = 0; j < n_genes; j++) {
+            double val = matrix->values[i * n_genes + j];
+            row_sum_sq += val * val;
+        }
+        
+        double row_norm = sqrt(row_sum_sq / (double)n_genes);
+        
+        if (row_norm < ZERO_STD_THRESHOLD) {
+            // Row is essentially zero, set to zero
+            for (MKL_INT j = 0; j < n_genes; j++) {
+                normalized->values[i * n_genes + j] = 0.0;
+            }
+        } else {
+            // Normalize by row norm
+            for (MKL_INT j = 0; j < n_genes; j++) {
+                normalized->values[i * n_genes + j] = matrix->values[i * n_genes + j] / row_norm;
+            }
+        }
+    }
+    
+    printf("Matrix rows normalized successfully\n");
+    return normalized;
+}
+
+
+/* ===============================
+ * RESIDUAL MORAN'S I CORE CALCULATION
+ * =============================== */
+
+/* Calculate residual Moran's I matrix: I_R = (1/S0) R_normalized W R_normalized^T */
+DenseMatrix* calculate_residual_morans_i_matrix(const DenseMatrix* R_normalized, const SparseMatrix* W) {
+    if (!R_normalized || !W || !R_normalized->values) {
+        fprintf(stderr, "Error: Invalid parameters provided to calculate_residual_morans_i_matrix\n");
+        return NULL;
+    }
+    if (W->nnz > 0 && !W->values) {
+        fprintf(stderr, "Error: W->nnz > 0 but W->values is NULL in calculate_residual_morans_i_matrix\n");
+        return NULL;
+    }
+
+    MKL_INT n_spots = R_normalized->nrows;
+    MKL_INT n_genes = R_normalized->ncols;
+
+    if (n_spots != W->nrows || n_spots != W->ncols) {
+        fprintf(stderr, "Error: Dimension mismatch between R_normalized (%lld spots x %lld genes) and W (%lldx%lld)\n",
+                (long long)n_spots, (long long)n_genes, (long long)W->nrows, (long long)W->ncols);
+        return NULL;
+    }
+    
+    if (validate_matrix_dimensions(n_genes, n_genes, "Residual Moran's I result") != MORANS_I_SUCCESS) {
+        return NULL;
+    }
+
+    printf("Calculating Residual Moran's I for %lld genes using %lld spots...\n",
+           (long long)n_genes, (long long)n_spots);
+
+    DenseMatrix* result = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (!result) {
+        perror("Failed alloc result struct for Residual Moran's I");
+        return NULL;
+    }
+    
+    result->nrows = n_genes;
+    result->ncols = n_genes;
+    result->rownames = NULL;
+    result->colnames = NULL;
+    result->values = NULL;
+    
+    // Allocate with overflow protection
+    size_t result_size;
+    if (safe_multiply_size_t(n_genes, n_genes, &result_size) != 0 ||
+        safe_multiply_size_t(result_size, sizeof(double), &result_size) != 0) {
+        fprintf(stderr, "Error: Result matrix dimensions too large\n");
+        free(result);
+        return NULL;
+    }
+    
+    result->values = (double*)mkl_malloc(result_size, 64);
+    result->rownames = (char**)calloc(n_genes, sizeof(char*));
+    result->colnames = (char**)calloc(n_genes, sizeof(char*));
+
+    if (!result->values || !result->rownames || !result->colnames) {
+        perror("Failed alloc result data for Residual Moran's I");
+        free_dense_matrix(result);
+        return NULL;
+    }
+
+    // Copy gene names
+    for (MKL_INT i = 0; i < n_genes; i++) {
+        if (R_normalized->colnames && R_normalized->colnames[i]) {
+            result->rownames[i] = strdup(R_normalized->colnames[i]);
+            result->colnames[i] = strdup(R_normalized->colnames[i]);
+            if (!result->rownames[i] || !result->colnames[i]) {
+                perror("Failed to duplicate gene names for Residual Moran's I result");
+                free_dense_matrix(result);
+                return NULL;
+            }
+        } else {
+            char default_name_buf[32];
+            snprintf(default_name_buf, sizeof(default_name_buf), "Gene%lld", (long long)i);
+            result->rownames[i] = strdup(default_name_buf);
+            result->colnames[i] = strdup(default_name_buf);
+            if (!result->rownames[i] || !result->colnames[i]) {
+                perror("Failed to duplicate default gene names");
+                free_dense_matrix(result);
+                return NULL;
+            }
+        }
+    }
+
+    /* Calculate scaling factor */
+    double S0 = calculate_weight_sum(W);
+    printf("  Sum of weights S0: %.6f\n", S0);
+
+    if (fabs(S0) < DBL_EPSILON) {
+        fprintf(stderr, "Warning: Sum of weights S0 is near-zero (%.4e). Residual Moran's I results will be NaN/Inf or 0.\n", S0);
+        if (S0 == 0.0) {
+            for(size_t i=0; i < (size_t)n_genes * n_genes; ++i) result->values[i] = NAN;
+            return result;
+        }
+    }
+    
+    double scaling_factor = 1.0 / S0;
+    printf("  Using 1/S0 = %.6e as scaling factor\n", scaling_factor);
+
+    sparse_matrix_t W_mkl;
+    sparse_status_t status = mkl_sparse_d_create_csr(
+        &W_mkl, SPARSE_INDEX_BASE_ZERO, W->nrows, W->ncols,
+        W->row_ptr, W->row_ptr + 1, W->col_ind, W->values);
+
+    if (status != SPARSE_STATUS_SUCCESS) {
+        print_mkl_status(status, "mkl_sparse_d_create_csr (W for residual)");
+        free_dense_matrix(result);
+        return NULL;
+    }
+
+    if (W->nnz > 0) {
+        status = mkl_sparse_optimize(W_mkl);
+        if (status != SPARSE_STATUS_SUCCESS) {
+            print_mkl_status(status, "mkl_sparse_optimize (W for residual)");
+        }
+    }
+
+    printf("  Step 1: Calculating Temp_WR = W * R_normalized ...\n");
+    
+    size_t temp_size;
+    if (safe_multiply_size_t(n_spots, n_genes, &temp_size) != 0 ||
+        safe_multiply_size_t(temp_size, sizeof(double), &temp_size) != 0) {
+        fprintf(stderr, "Error: Temporary matrix dimensions too large\n");
+        mkl_sparse_destroy(W_mkl);
+        free_dense_matrix(result);
+        return NULL;
+    }
+    
+    double* Temp_WR_values = (double*)mkl_malloc(temp_size, 64);
+    if (!Temp_WR_values) {
+        perror("Failed alloc Temp_WR_values");
+        mkl_sparse_destroy(W_mkl);
+        free_dense_matrix(result);
+        return NULL;
+    }
+
+    struct matrix_descr descrW;
+    descrW.type = SPARSE_MATRIX_TYPE_GENERAL;
+    
+    double alpha_mm = 1.0, beta_mm = 0.0;
+
+    status = mkl_sparse_d_mm(
+        SPARSE_OPERATION_NON_TRANSPOSE,
+        alpha_mm,
+        W_mkl,
+        descrW,
+        SPARSE_LAYOUT_ROW_MAJOR,
+        R_normalized->values,
+        n_genes,
+        n_genes,
+        beta_mm,
+        Temp_WR_values,
+        n_genes
+    );
+
+    if (status != SPARSE_STATUS_SUCCESS) {
+        print_mkl_status(status, "mkl_sparse_d_mm (W * R_normalized)");
+        mkl_free(Temp_WR_values);
+        mkl_sparse_destroy(W_mkl);
+        free_dense_matrix(result);
+        return NULL;
+    }
+
+    printf("  Step 2: Calculating Result = (R_normalized_T * Temp_WR) * scaling_factor ...\n");
+    cblas_dgemm(
+        CblasRowMajor,
+        CblasTrans,
+        CblasNoTrans,
+        n_genes,
+        n_genes,
+        n_spots,
+        scaling_factor,
+        R_normalized->values,
+        n_genes,
+        Temp_WR_values,
+        n_genes,
+        beta_mm,
+        result->values,
+        n_genes
+    );
+
+    mkl_free(Temp_WR_values);
+    mkl_sparse_destroy(W_mkl);
+
+    printf("Residual Moran's I matrix calculation complete and scaled.\n");
+    DEBUG_MATRIX_INFO(result, "residual_morans_i_result");
+    return result;
+}
+
+/* Main residual Moran's I calculation function */
+ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTypeMatrix* Z, 
+                                           const SparseMatrix* W, const ResidualConfig* config) {
+    if (!X || !Z || !W || !config) {
+        fprintf(stderr, "Error: NULL parameters in calculate_residual_morans_i\n");
+        return NULL;
+    }
+    
+    printf("Starting residual Moran's I analysis...\n");
+    
+    ResidualResults* results = (ResidualResults*)calloc(1, sizeof(ResidualResults));
+    if (!results) {
+        perror("Failed to allocate ResidualResults");
+        return NULL;
+    }
+    
+    // Step 1: Compute regression coefficients B̂ = (Z^T Z + λI)^(-1) Z^T X^T
+    printf("Step 1: Computing regression coefficients...\n");
+    results->regression_coefficients = compute_regression_coefficients(Z, X, config->regularization_lambda);
+    if (!results->regression_coefficients) {
+        fprintf(stderr, "Error: Failed to compute regression coefficients\n");
+        free_residual_results(results);
+        return NULL;
+    }
+    
+    // Step 2: Compute residual projection matrix M_res = I - Z(Z^T Z + λI)^(-1) Z^T
+    printf("Step 2: Computing residual projection matrix...\n");
+    DenseMatrix* M_res = compute_residual_projection_matrix(Z, config->regularization_lambda);
+    if (!M_res) {
+        fprintf(stderr, "Error: Failed to compute residual projection matrix\n");
+        free_residual_results(results);
+        return NULL;
+    }
+    
+    // Step 3: Apply residual projection R = X * M_res
+    printf("Step 3: Applying residual projection...\n");
+    DenseMatrix* R = apply_residual_projection(X, M_res);
+    free_dense_matrix(M_res); // Free intermediate matrix
+    if (!R) {
+        fprintf(stderr, "Error: Failed to apply residual projection\n");
+        free_residual_results(results);
+        return NULL;
+    }
+    
+    // Step 4: Center residuals R_rc = R * H_n
+    printf("Step 4: Centering residuals...\n");
+    DenseMatrix* R_centered = center_matrix_columns(R);
+    free_dense_matrix(R); // Free intermediate matrix
+    if (!R_centered) {
+        fprintf(stderr, "Error: Failed to center residuals\n");
+        free_residual_results(results);
+        return NULL;
+    }
+    
+    // Store residuals (before normalization)
+    results->residuals = R_centered;
+    
+    // Step 5: Normalize residuals R_normalized = D * R_rc (if requested)
+    DenseMatrix* R_normalized;
+    if (config->normalize_residuals) {
+        printf("Step 5: Normalizing residuals...\n");
+        R_normalized = normalize_matrix_rows(R_centered);
+        if (!R_normalized) {
+            fprintf(stderr, "Error: Failed to normalize residuals\n");
+            free_residual_results(results);
+            return NULL;
+        }
+    } else {
+        printf("Step 5: Skipping residual normalization (as requested)\n");
+        // Use centered residuals directly
+        R_normalized = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+        if (!R_normalized) {
+            perror("malloc R_normalized");
+            free_residual_results(results);
+            return NULL;
+        }
+        *R_normalized = *R_centered; // Shallow copy
+        // Don't free R_centered since results->residuals points to it
+    }
+    
+    // Step 6: Compute residual Moran's I I_R = (1/S0) R_normalized W R_normalized^T
+    printf("Step 6: Computing residual Moran's I...\n");
+    results->residual_morans_i = calculate_residual_morans_i_matrix(R_normalized, W);
+    
+    if (config->normalize_residuals) {
+        free_dense_matrix(R_normalized); // Free if we created a separate normalized matrix
+    } else {
+        free(R_normalized); // Just free the structure, not the data
+    }
+    
+    if (!results->residual_morans_i) {
+        fprintf(stderr, "Error: Failed to compute residual Moran's I matrix\n");
+        free_residual_results(results);
+        return NULL;
+    }
+    
+    printf("Residual Moran's I analysis completed successfully.\n");
+    return results;
+}
+
+/* ===============================
+ * RESIDUAL PERMUTATION TESTING
+ * =============================== */
+
+/* Residual permutation worker function */
+static int residual_permutation_worker(const DenseMatrix* X_original,
+                                      const CellTypeMatrix* Z,
+                                      const SparseMatrix* W,
+                                      const ResidualConfig* config,
+                                      const PermutationParams* params,
+                                      int thread_id,
+                                      int start_perm,
+                                      int end_perm,
+                                      double* local_mean_sum,
+                                      double* local_var_sum_sq,
+                                      double* local_p_counts,
+                                      const DenseMatrix* observed_results) {
+    
+    MKL_INT n_spots = X_original->nrows;
+    MKL_INT n_genes = X_original->ncols;
+    size_t matrix_elements = (size_t)n_genes * n_genes;
+    
+    // Thread-local allocations
+    DenseMatrix X_perm;
+    X_perm.nrows = n_spots;
+    X_perm.ncols = n_genes;
+    X_perm.rownames = NULL;
+    X_perm.colnames = NULL;
+    X_perm.values = (double*)mkl_malloc((size_t)n_spots * n_genes * sizeof(double), 64);
+    
+    double* gene_buffer = (double*)mkl_malloc((size_t)n_spots * sizeof(double), 64);
+    MKL_INT* indices_buffer = (MKL_INT*)mkl_malloc((size_t)n_spots * sizeof(MKL_INT), 64);
+    
+    if (!X_perm.values || !gene_buffer || !indices_buffer) {
+        DEBUG_PRINT("Thread %d: Memory allocation failed for residual permutation", thread_id);
+        // Cleanup
+        if (X_perm.values) mkl_free(X_perm.values);
+        if (gene_buffer) mkl_free(gene_buffer);
+        if (indices_buffer) mkl_free(indices_buffer);
+        return -1;
+    }
+    
+    unsigned int local_seed = params->seed + thread_id + 1;
+    
+    // Perform permutations
+    for (int perm = start_perm; perm < end_perm; perm++) {
+        // Permute each gene independently
+        for (MKL_INT j = 0; j < n_genes; j++) {
+            // Copy original values
+            for (MKL_INT i = 0; i < n_spots; i++) {
+                gene_buffer[i] = X_original->values[i * n_genes + j];
+                indices_buffer[i] = i;
+            }
+            
+            // Fisher-Yates shuffle
+            if (n_spots > 1) {
+                for (MKL_INT i = n_spots - 1; i > 0; i--) {
+                    MKL_INT k = rand_r(&local_seed) % (i + 1);
+                    MKL_INT temp_idx = indices_buffer[i];
+                    indices_buffer[i] = indices_buffer[k];
+                    indices_buffer[k] = temp_idx;
+                }
+            }
+            
+            // Apply permutation
+            for (MKL_INT i = 0; i < n_spots; i++) {
+                X_perm.values[i * n_genes + j] = gene_buffer[indices_buffer[i]];
+            }
+        }
+        
+        // Calculate residual Moran's I for permuted data
+        // This involves the full residual analysis pipeline
+        ResidualResults* perm_results = calculate_residual_morans_i(&X_perm, Z, W, config);
+        if (!perm_results || !perm_results->residual_morans_i) {
+            DEBUG_PRINT("Thread %d: Permutation %d failed", thread_id, perm);
+            if (perm_results) free_residual_results(perm_results);
+            continue; // Skip this permutation
+        }
+        
+        // Accumulate statistics
+        for (size_t idx = 0; idx < matrix_elements; idx++) {
+            double perm_val = perm_results->residual_morans_i->values[idx];
+            if (!isfinite(perm_val)) perm_val = 0.0;
+            
+            local_mean_sum[idx] += perm_val;
+            local_var_sum_sq[idx] += perm_val * perm_val;
+            
+            if (params->p_value_output && local_p_counts && observed_results) {
+                if (fabs(perm_val) >= fabs(observed_results->values[idx])) {
+                    local_p_counts[idx]++;
+                }
+            }
+        }
+        
+        free_residual_results(perm_results);
+    }
+    
+    // Cleanup
+    mkl_free(X_perm.values);
+    mkl_free(gene_buffer);
+    mkl_free(indices_buffer);
+    
+    return 0;
+}
+
+/* Run residual permutation test */
+PermutationResults* run_residual_permutation_test(const DenseMatrix* X, const CellTypeMatrix* Z,
+                                                 const SparseMatrix* W, const PermutationParams* params,
+                                                 const ResidualConfig* config) {
+    
+    if (!X || !Z || !W || !params || !config || !X->values || !X->colnames) {
+        fprintf(stderr, "Error: Invalid parameters provided to run_residual_permutation_test\n");
+        return NULL;
+    }
+    if (W->nnz > 0 && !W->values) {
+        fprintf(stderr, "Error: W->nnz > 0 but W->values is NULL in run_residual_permutation_test\n");
+        return NULL;
+    }
+
+    MKL_INT n_spots = X->nrows;
+    MKL_INT n_genes = X->ncols;
+    int n_perm = params->n_permutations;
+
+    if (validate_matrix_dimensions(n_spots, n_genes, "residual permutation test input") != MORANS_I_SUCCESS) {
+        return NULL;
+    }
+
+    if (n_genes == 0 || n_spots == 0) {
+        fprintf(stderr, "Error: Expression matrix has zero dimensions in run_residual_permutation_test\n");
+        return NULL;
+    }
+    if (n_perm <= 0) {
+        fprintf(stderr, "Error: Number of permutations (%d) must be positive\n", n_perm);
+        return NULL;
+    }
+
+    printf("Running residual permutation test with %d permutations for %lld genes...\n", 
+           n_perm, (long long)n_genes);
+
+    // Calculate observed residual Moran's I for comparison
+    ResidualResults* observed_residual_results = calculate_residual_morans_i(X, Z, W, config);
+    if (!observed_residual_results || !observed_residual_results->residual_morans_i) {
+        fprintf(stderr, "Error: Failed to calculate observed residual Moran's I for permutation test\n");
+        if (observed_residual_results) free_residual_results(observed_residual_results);
+        return NULL;
+    }
+
+    DenseMatrix* observed_results = observed_residual_results->residual_morans_i;
+
+    // Allocate results structure
+    PermutationResults* results = (PermutationResults*)calloc(1, sizeof(PermutationResults));
+    if (!results) {
+        perror("Failed to allocate PermutationResults structure for residual test");
+        free_residual_results(observed_residual_results);
+        return NULL;
+    }
+
+    size_t matrix_elements = (size_t)n_genes * n_genes;
+    size_t matrix_bytes;
+    if (safe_multiply_size_t(matrix_elements, sizeof(double), &matrix_bytes) != 0) {
+        fprintf(stderr, "Error: Matrix size too large for residual permutation results\n");
+        free(results);
+        free_residual_results(observed_residual_results);
+        return NULL;
+    }
+
+    // Allocate result matrices
+    results->mean_perm = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    results->var_perm = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (params->z_score_output) {
+        results->z_scores = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    }
+    if (params->p_value_output) {
+        results->p_values = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    }
+
+    if (!results->mean_perm || !results->var_perm ||
+        (params->z_score_output && !results->z_scores) ||
+        (params->p_value_output && !results->p_values)) {
+        perror("Failed to allocate result matrix structures for residual test");
+        free_permutation_results(results);
+        free_residual_results(observed_residual_results);
+        return NULL;
+    }
+
+    // Initialize result matrices
+    DenseMatrix* matrices[] = {results->mean_perm, results->var_perm, results->z_scores, results->p_values};
+    int num_matrices = 2 + (params->z_score_output ? 1 : 0) + (params->p_value_output ? 1 : 0);
+
+    for (int m = 0; m < num_matrices; m++) {
+        if (!matrices[m]) continue;
+        
+        matrices[m]->nrows = n_genes;
+        matrices[m]->ncols = n_genes;
+        matrices[m]->values = (double*)mkl_calloc(matrix_elements, sizeof(double), 64);
+        matrices[m]->rownames = (char**)calloc(n_genes, sizeof(char*));
+        matrices[m]->colnames = (char**)calloc(n_genes, sizeof(char*));
+        
+        if (!matrices[m]->values || !matrices[m]->rownames || !matrices[m]->colnames) {
+            perror("Failed to allocate result matrix components for residual test");
+            free_permutation_results(results);
+            free_residual_results(observed_residual_results);
+            return NULL;
+        }
+        
+        // Copy gene names
+        for (MKL_INT i = 0; i < n_genes; i++) {
+            const char* gene_name = (X->colnames[i]) ? X->colnames[i] : "UNKNOWN_GENE";
+            matrices[m]->rownames[i] = strdup(gene_name);
+            matrices[m]->colnames[i] = strdup(gene_name);
+            if (!matrices[m]->rownames[i] || !matrices[m]->colnames[i]) {
+                perror("Failed to duplicate gene names for residual permutation results");
+                free_permutation_results(results);
+                free_residual_results(observed_residual_results);
+                return NULL;
+            }
+        }
+    }
+
+    // Run permutations using multiple threads
+    int num_threads = omp_get_max_threads();
+    int perms_per_thread = n_perm / num_threads;
+    int remaining_perms = n_perm % num_threads;
+    
+    printf("Starting residual permutation loop (%d permutations) using %d OpenMP threads...\n", 
+           n_perm, num_threads);
+    
+    volatile int error_occurred = 0;
+    double loop_start_time = get_time();
+
+    #pragma omp parallel
+    {
+        int thread_id = omp_get_thread_num();
+        int start_perm = thread_id * perms_per_thread;
+        int end_perm = start_perm + perms_per_thread;
+        if (thread_id == num_threads - 1) {
+            end_perm += remaining_perms;
+        }
+        
+        // Thread-local accumulators
+        double* local_mean_sum = (double*)mkl_calloc(matrix_elements, sizeof(double), 64);
+        double* local_var_sum_sq = (double*)mkl_calloc(matrix_elements, sizeof(double), 64);
+        double* local_p_counts = NULL;
+        
+        if (params->p_value_output) {
+            local_p_counts = (double*)mkl_calloc(matrix_elements, sizeof(double), 64);
+        }
+        
+        if (!local_mean_sum || !local_var_sum_sq || 
+            (params->p_value_output && !local_p_counts)) {
+            #pragma omp critical
+            {
+                fprintf(stderr, "Thread %d: Failed to allocate local buffers for residual permutation\n", thread_id);
+                error_occurred = 1;
+            }
+        } else if (!error_occurred) {
+            // Run permutations for this thread
+            int worker_result = residual_permutation_worker(X, Z, W, config, params, thread_id, 
+                                                          start_perm, end_perm,
+                                                          local_mean_sum, local_var_sum_sq,
+                                                          local_p_counts, observed_results);
+            
+            if (worker_result != 0) {
+                #pragma omp critical
+                {
+                    fprintf(stderr, "Thread %d: Residual permutation worker failed\n", thread_id);
+                    error_occurred = 1;
+                }
+            } else {
+                // Merge results
+                #pragma omp critical
+                {
+                    if (!error_occurred) {
+                        for (size_t k = 0; k < matrix_elements; k++) {
+                            results->mean_perm->values[k] += local_mean_sum[k];
+                            results->var_perm->values[k] += local_var_sum_sq[k];
+                            if (params->p_value_output && local_p_counts) {
+                                results->p_values->values[k] += local_p_counts[k];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Cleanup thread-local buffers
+        if (local_mean_sum) mkl_free(local_mean_sum);
+        if (local_var_sum_sq) mkl_free(local_var_sum_sq);
+        if (local_p_counts) mkl_free(local_p_counts);
+    }
+
+    double loop_end_time = get_time();
+    printf("Residual permutation loop completed in %.2f seconds\n", loop_end_time - loop_start_time);
+
+    if (error_occurred) {
+        fprintf(stderr, "Error occurred during residual permutation execution\n");
+        free_permutation_results(results);
+        free_residual_results(observed_residual_results);
+        return NULL;
+    }
+
+    // Finalize statistics
+    double inv_n_perm = 1.0 / (double)n_perm;
+    for (MKL_INT r = 0; r < n_genes; r++) {
+        for (MKL_INT c = 0; c < n_genes; c++) {
+            MKL_INT idx = r * n_genes + c;
+            
+            double sum_val = results->mean_perm->values[idx];
+            double sum_sq_val = results->var_perm->values[idx];
+            
+            double mean_perm = sum_val * inv_n_perm;
+            double var_perm = (sum_sq_val * inv_n_perm) - (mean_perm * mean_perm);
+            
+            if (var_perm < 0.0 && var_perm > -ZERO_STD_THRESHOLD) {
+                var_perm = 0.0;
+            } else if (var_perm < 0.0) {
+                fprintf(stderr, "Warning: Negative variance (%.4e) for gene pair (%lld,%lld) in residual test\n",
+                        var_perm, (long long)r, (long long)c);
+                var_perm = 0.0;
+            }
+            
+            results->mean_perm->values[idx] = mean_perm;
+            results->var_perm->values[idx] = var_perm;
+            
+            if (params->p_value_output && results->p_values) {
+                results->p_values->values[idx] = (results->p_values->values[idx] + 1.0) / (double)(n_perm + 1);
+            }
+            
+            if (params->z_score_output && results->z_scores) {
+                double std_dev = sqrt(var_perm);
+                double observed_val = observed_results->values[idx];
+                
+                if (std_dev < ZERO_STD_THRESHOLD) {
+                    if (fabs(observed_val - mean_perm) < ZERO_STD_THRESHOLD) {
+                        results->z_scores->values[idx] = 0.0;
+                    } else {
+                        results->z_scores->values[idx] = (observed_val > mean_perm) ? INFINITY : -INFINITY;
+                    }
+                } else {
+                    results->z_scores->values[idx] = (observed_val - mean_perm) / std_dev;
+                }
+            }
+        }
+    }
+
+    free_residual_results(observed_residual_results);
+    printf("Residual permutation test complete.\n");
+    return results;
+}
+
+/* ===============================
+ * UPDATED FILE I/O FUNCTIONS
+ * =============================== */
+
+/* Save regression coefficients */
+int save_regression_coefficients(const DenseMatrix* coefficients, const char* output_file) {
+    if (!coefficients || !output_file) {
+        fprintf(stderr, "Error: Cannot save NULL regression coefficients or empty filename\n");
+        return MORANS_I_ERROR_PARAMETER;
+    }
+
+    FILE* fp = fopen(output_file, "w");
+    if (!fp) {
+        fprintf(stderr, "Error: Failed to open output file '%s': %s\n", output_file, strerror(errno));
+        return MORANS_I_ERROR_FILE;
+    }
+    
+    MKL_INT n_celltypes = coefficients->nrows;
+    MKL_INT n_genes = coefficients->ncols;
+    
+    printf("Saving regression coefficients to %s...\n", output_file);
+    
+    // Write header
+    fprintf(fp, "CellType");
+    for (MKL_INT j = 0; j < n_genes; j++) {
+        fprintf(fp, "\t%s", coefficients->colnames && coefficients->colnames[j] ? 
+                coefficients->colnames[j] : "UNKNOWN_GENE");
+    }
+    fprintf(fp, "\n");
+    
+    // Write data rows
+    for (MKL_INT i = 0; i < n_celltypes; i++) {
+        fprintf(fp, "%s", coefficients->rownames && coefficients->rownames[i] ? 
+                coefficients->rownames[i] : "UNKNOWN_CELLTYPE");
+        
+        for (MKL_INT j = 0; j < n_genes; j++) {
+            double value = coefficients->values[i * n_genes + j];
+            fprintf(fp, "\t");
+            
+            if (isnan(value)) {
+                fprintf(fp, "NaN");
+            } else if (isinf(value)) {
+                fprintf(fp, "%sInf", (value > 0 ? "" : "-"));
+            } else {
+                if ((fabs(value) > 0 && fabs(value) < 1e-4) || fabs(value) > 1e6) {
+                    fprintf(fp, "%.6e", value);
+                } else {
+                    fprintf(fp, "%.8f", value);
+                }
+            }
+        }
+        fprintf(fp, "\n");
+    }
+    
+    fclose(fp);
+    printf("Regression coefficients saved to: %s\n", output_file);
+    return MORANS_I_SUCCESS;
+}
+
+/* Save residual analysis results */
+int save_residual_results(const ResidualResults* results, const char* output_prefix) {
+    if (!results || !output_prefix) {
+        fprintf(stderr, "Error: Cannot save NULL residual results or empty prefix\n");
+        return MORANS_I_ERROR_PARAMETER;
+    }
+    
+    char filename_buffer[BUFFER_SIZE];
+    int status = MORANS_I_SUCCESS;
+    
+    printf("--- Saving Residual Analysis Results ---\n");
+    
+    // Save residual Moran's I matrix (lower triangular)
+    if (results->residual_morans_i && results->residual_morans_i->values) {
+        snprintf(filename_buffer, BUFFER_SIZE, "%s_residual_morans_i_raw.tsv", output_prefix);
+        printf("Saving residual Moran's I (lower triangular) to: %s\n", filename_buffer);
+        int temp_status = save_lower_triangular_matrix_raw(results->residual_morans_i, filename_buffer);
+        if (temp_status != MORANS_I_SUCCESS) {
+            fprintf(stderr, "Error saving residual Moran's I matrix\n");
+            if (status == MORANS_I_SUCCESS) status = temp_status;
+        }
+    }
+    
+    // Save regression coefficients
+    if (results->regression_coefficients && results->regression_coefficients->values) {
+        snprintf(filename_buffer, BUFFER_SIZE, "%s_regression_coefficients.tsv", output_prefix);
+        printf("Saving regression coefficients to: %s\n", filename_buffer);
+        int temp_status = save_regression_coefficients(results->regression_coefficients, filename_buffer);
+        if (temp_status != MORANS_I_SUCCESS) {
+            fprintf(stderr, "Error saving regression coefficients\n");
+            if (status == MORANS_I_SUCCESS) status = temp_status;
+        }
+    }
+    
+    // Save residual Z-scores (if available)
+    if (results->residual_zscores && results->residual_zscores->values) {
+        snprintf(filename_buffer, BUFFER_SIZE, "%s_residual_zscores_lower_tri.tsv", output_prefix);
+        printf("Saving residual Z-scores (lower triangular) to: %s\n", filename_buffer);
+        int temp_status = save_lower_triangular_matrix_raw(results->residual_zscores, filename_buffer);
+        if (temp_status != MORANS_I_SUCCESS) {
+            fprintf(stderr, "Error saving residual Z-scores\n");
+            if (status == MORANS_I_SUCCESS) status = temp_status;
+        }
+    }
+    
+    // Save residual P-values (if available)
+    if (results->residual_pvalues && results->residual_pvalues->values) {
+        snprintf(filename_buffer, BUFFER_SIZE, "%s_residual_pvalues_lower_tri.tsv", output_prefix);
+        printf("Saving residual P-values (lower triangular) to: %s\n", filename_buffer);
+        int temp_status = save_lower_triangular_matrix_raw(results->residual_pvalues, filename_buffer);
+        if (temp_status != MORANS_I_SUCCESS) {
+            fprintf(stderr, "Error saving residual P-values\n");
+            if (status == MORANS_I_SUCCESS) status = temp_status;
+        }
+    }
+    
+    // Save residuals matrix (full matrix)
+    if (results->residuals && results->residuals->values) {
+        snprintf(filename_buffer, BUFFER_SIZE, "%s_residuals_matrix.tsv", output_prefix);
+        printf("Saving residuals matrix to: %s\n", filename_buffer);
+        int temp_status = save_results(results->residuals, filename_buffer);
+        if (temp_status != MORANS_I_SUCCESS) {
+            fprintf(stderr, "Error saving residuals matrix\n");
+            if (status == MORANS_I_SUCCESS) status = temp_status;
+        }
+    }
+    
+    if (status == MORANS_I_SUCCESS) {
+        printf("Residual analysis results saved with prefix: %s\n", output_prefix);
+    }
+    return status;
+}
+
+/* ===============================
+ * MEMORY MANAGEMENT FUNCTIONS (UPDATED)
+ * =============================== */
+
+/* Free cell type matrix */
+void free_celltype_matrix(CellTypeMatrix* matrix) {
+    if (!matrix) return;
+    
+    if (matrix->values) mkl_free(matrix->values);
+    
+    if (matrix->rownames) {
+        for (MKL_INT i = 0; i < matrix->nrows; i++) {
+            if(matrix->rownames[i]) free(matrix->rownames[i]);
+        }
+        free(matrix->rownames);
+    }
+    
+    if (matrix->colnames) {
+        for (MKL_INT i = 0; i < matrix->ncols; i++) {
+            if(matrix->colnames[i]) free(matrix->colnames[i]);
+        }
+        free(matrix->colnames);
+    }
+    
+    free(matrix);
+}
+
+/* Free residual results */
+void free_residual_results(ResidualResults* results) {
+    if (!results) return;
+    
+    if (results->regression_coefficients) free_dense_matrix(results->regression_coefficients);
+    if (results->residuals) free_dense_matrix(results->residuals);
+    if (results->residual_morans_i) free_dense_matrix(results->residual_morans_i);
+    if (results->residual_mean_perm) free_dense_matrix(results->residual_mean_perm);
+    if (results->residual_var_perm) free_dense_matrix(results->residual_var_perm);
+    if (results->residual_zscores) free_dense_matrix(results->residual_zscores);
+    if (results->residual_pvalues) free_dense_matrix(results->residual_pvalues);
+    
+    free(results);
 }
 
 /* ===============================

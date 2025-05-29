@@ -1,6 +1,6 @@
 # Moran's I Calculator for Spatial Transcriptomics
 
-**Version 1.2.2**
+**Version 1.3.0**
 
 ## Overview
 
@@ -13,22 +13,49 @@ This package provides an optimized implementation of Moran's I spatial autocorre
   - 10x Genomics Visium (hexagonal grid)
   - Older Spatial Transcriptomics (ST) platforms
   - Single-cell data with spatial coordinates
-  - **NEW: Custom weight matrices (any spatial relationship)**
+  - Custom weight matrices (any spatial relationship)
 - Multiple calculation modes:
   - Single-gene Moran's I (spatial autocorrelation for each gene)
   - Pairwise Moran's I (correlation between the first gene and all others)
   - All-vs-all pairwise Moran's I (correlation between all gene pairs)
+- **NEW: Residual Moran's I analysis (cell type corrected spatial autocorrelation)**
 - Z-normalization of input gene expression data
 - RBF kernel for spatial weights with platform-specific parameters
-- **NEW: Support for user-defined spatial weight matrices**
-- **NEW: Python weight matrix generator tool**
+- Support for user-defined spatial weight matrices
+- Python weight matrix generator tool
 - Configurable maximum neighbor search radius
-- Permutation testing to assess statistical significance 
+- Permutation testing to assess statistical significance (standard and residual)
 - Optimized sparse matrix operations
 - Multi-threaded implementation with OpenMP and MKL
 - Robust error handling and memory management
 - Unified configuration structure for parameter management
 - Support for high-resolution timing and performance analysis
+
+## What's New in Version 1.3.0
+
+### Residual Moran's I Analysis
+
+A major new feature that enables cell type-corrected spatial autocorrelation analysis:
+
+- **Cell type correction**: Remove cell type composition effects from gene expression before calculating spatial autocorrelation
+- **Multiple data formats**: Support for both deconvolution proportions and single-cell annotations
+- **Ridge regression**: Optional regularization for stable coefficient estimation
+- **Residual permutation testing**: Statistical significance testing for residual spatial patterns
+- **Comprehensive outputs**: Regression coefficients, residuals, and residual Moran's I results
+
+### Cell Type Data Support
+
+Two formats supported for cell type information:
+
+1. **Deconvolution format**: Pre-computed cell type proportions per spot
+2. **Single-cell format**: Individual cell annotations with spatial coordinates
+
+### Enhanced Analysis Pipeline
+
+- **Analysis mode selection**: Choose between standard and residual analysis
+- **Flexible configuration**: Extensive options for residual analysis parameters
+- **Integrated permutation testing**: Both standard and residual permutation tests
+- **Improved output organization**: Clear separation of standard and residual results
 
 ## What's New in Version 1.2.0
 
@@ -113,26 +140,71 @@ The provided Makefile supports several targets:
 
 ## Input Format
 
-The program accepts tab-separated files (TSV) with the following structure:
+The program accepts tab-separated (TSV) or comma-separated (CSV) files with automatic format detection based on file content. Both formats follow the same structure:
 
-- **Header row**: Contains spot/cell identifiers. For Visium/ST data, these should be coordinates in the format `ROWxCOL` (e.g., `12x34`). For single-cell data, these should be cell IDs that match those in the coordinate file.
+- **Header row**: Contains spot/cell identifiers. For Visium/ST data, these should be coordinates in the format `ROWxCOL` (e.g., `12x34`, `50x102`). For single-cell data, these should be cell IDs that match those in the coordinate file.
 - **Data rows**: Each row starts with a gene name followed by expression values for each spot/cell.
 - The first cell in the header row can be empty or contain a label for the gene column.
 
-Example:
+Example (TSV format):
 ```
 Gene  1x1   1x2   1x3   2x1   2x2   2x3
 Gene1 0.5   1.2   0.8   0.3   1.5   0.7
 Gene2 2.1   1.8   0.9   1.4   0.6   1.2
 ```
 
-For single-cell data, a coordinate file in TSV format is required with columns for cell IDs and their spatial coordinates.
-
-Example coordinate file:
+Example (CSV format):
 ```
-cell_ID sdimx  sdimy
-cell_1  10.5   20.3
-cell_2  15.8   18.7
+Gene,1x1,1x2,1x3,2x1,2x2,2x3
+Gene1,0.5,1.2,0.8,0.3,1.5,0.7
+Gene2,2.1,1.8,0.9,1.4,0.6,1.2
+```
+
+For single-cell data, a coordinate file in TSV or CSV format is required with columns for cell IDs and their spatial coordinates.
+
+Example coordinate file (CSV format):
+```
+cell_ID,sdimx,sdimy
+cell_1,10.5,20.3
+cell_2,15.8,18.7
+```
+
+## Cell Type Data Formats
+
+Both TSV and CSV formats are supported with automatic format detection. The program handles two types of cell type data:
+
+### Deconvolution Format
+
+Cell type proportions per spot in TSV or CSV format. Two orientations are supported:
+
+**Option 1: Spots as rows, cell types as columns (spots × cell_types)**
+```
+spot_id,Tcell,Bcell,Macrophage,Epithelial
+spot_1,0.3,0.1,0.2,0.4
+spot_2,0.4,0.0,0.3,0.3
+spot_3,0.2,0.2,0.1,0.5
+```
+
+**Option 2: Cell types as rows, spots as columns (cell_types × spots)**
+```
+cell_type,1x1,1x2,2x1,2x2,3x1
+Tcell,0.3,0.4,0.2,0.1,0.3
+Bcell,0.1,0.0,0.2,0.3,0.1
+Macrophage,0.2,0.3,0.1,0.4,0.2
+Epithelial,0.4,0.3,0.5,0.2,0.4
+```
+
+For Visium datasets, spot names typically follow the format `ROWxCOL` (e.g., `50x102`, `59x19`).
+
+### Single-cell Format
+
+Individual cell annotations with coordinates in TSV or CSV format:
+
+```
+cell_ID,cellType,sdimx,sdimy
+cell_1,Tcell,10.5,20.3
+cell_2,Macrophage,15.8,18.7
+cell_3,Epithelial,12.1,25.4
 ```
 
 ## Usage
@@ -157,6 +229,7 @@ General Options:
   -g <0|1>         Gene selection (only applies if -b 1): 0 = Compute between first gene and all others,
                    1 = Compute for all gene pairs. Default: 1.
   -s <0|1>         Include self-comparison (spot i vs spot i)? 0 = No, 1 = Yes. Default: 0.
+  --row-normalize <0|1>  Normalize each row of weight matrix to sum to 1? 0 = No, 1 = Yes. Default: 0.
   -t <int>         Set number of OpenMP threads. Default: 4 (or OMP_NUM_THREADS).
   -m <int>         Set number of MKL threads. Default: Value of -t.
   --sigma <float>  Custom sigma parameter for RBF kernel.
@@ -175,14 +248,30 @@ Single-cell specific options:
   --scale <float>  Scaling factor for coordinates to convert to integer grid. Default: 100.0.
 ```
 
+### Residual Moran's I Options
+
+```
+  --analysis-mode <standard|residual>  Analysis mode. Default: standard.
+  --celltype-file <file>               Cell type composition/annotation file.
+  --celltype-format <deconv|sc>        Format: deconvolution or single_cell. Default: single_cell.
+  --celltype-id-col <name>             Cell ID column name. Default: cell_ID.
+  --celltype-type-col <name>           Cell type column name. Default: cellType.
+  --celltype-x-col <name>              X coordinate column name. Default: sdimx.
+  --celltype-y-col <name>              Y coordinate column name. Default: sdimy.
+  --spot-id-col <name>                 Spot ID column for deconvolution format. Default: spot_id.
+  --include-intercept <0|1>            Include intercept in regression. Default: 1.
+  --regularization <float>             Ridge regularization parameter. Default: 0.0.
+  --normalize-residuals <0|1>          Normalize residuals. Default: 1.
+```
+
 ### Permutation Test Options
 
 ```
-  --run-perms             Enable permutation testing (with default settings).
-  --n-perms <int>         Number of permutations. Default: 1000. Implies --run-perms.
-  --perm-seed <int>       Seed for RNG in permutations. Default: Based on system time.
-  --perm-output-zscores   Output Z-scores from permutation test.
-  --perm-output-pvalues   Output p-values from permutation test.
+  --run-perm                Enable permutation testing.
+  --num-perm <int>         Number of permutations. Default: 1000. Implies --run-perm.
+  --perm-seed <int>        Seed for RNG in permutations. Default: Based on system time.
+  --perm-out-z <0|1>       Output Z-scores from permutation test. Default: 1.
+  --perm-out-p <0|1>       Output p-values from permutation test. Default: 1.
 ```
 
 ### Toy Example Mode
@@ -216,40 +305,6 @@ Options:
   --sigma <float>          RBF kernel sigma (default: 100.0)
 ```
 
-### Weight Generator Examples
-
-```bash
-# Generate weight matrix with same parameters as Moran's I run
-python3 make_custom_w.py -i expression.tsv -o custom_weights -r 3 -s 0 -p 0
-
-# Test custom weights vs built-in calculation
-./morans_i_mkl -i expression.tsv -o builtin -r 3 -s 0 -p 0 -b 1 -g 1
-./morans_i_mkl -i expression.tsv -o custom -w custom_weights_dense.tsv --weight-format dense -b 1 -g 1
-
-# Verify identical results
-diff builtin_all_pairs_moran_i_raw.tsv custom_all_pairs_moran_i_raw.tsv
-```
-
-### Validation Workflow
-
-To ensure custom weight matrices produce identical results:
-
-1. **Generate custom weights** with exact same parameters:
-   ```bash
-   python3 make_custom_w.py -i data.tsv -o weights -r 5 -s 0 -p 0
-   ```
-
-2. **Run both methods** with matching parameters:
-   ```bash
-   ./morans_i_mkl -i data.tsv -o test_builtin -r 5 -s 0 -p 0 -b 1 -g 1
-   ./morans_i_mkl -i data.tsv -o test_custom -w weights_dense.tsv --weight-format dense -b 1 -g 1
-   ```
-
-3. **Compare results** (should be identical):
-   ```bash
-   diff test_builtin_all_pairs_moran_i_raw.tsv test_custom_all_pairs_moran_i_raw.tsv
-   ```
-
 ### Output Files
 
 The format and file names depend on the calculation mode:
@@ -263,9 +318,122 @@ The format and file names depend on the calculation mode:
 - **Pairwise All mode (-b 1, -g 1)**:
   - `<prefix>_all_pairs_moran_i_raw.tsv`: Raw lower triangular matrix of Moran's I values
   
-- **Permutation Test outputs (if enabled for pairwise all / toy example)**:
-  - `<prefix>_zscores_lower_tri.tsv`: Z-scores (if --perm-output-zscores)
-  - `<prefix>_pvalues_lower_tri.tsv`: P-values (if --perm-output-pvalues)
+- **Standard Permutation Test outputs (if enabled)**:
+  - `<prefix>_zscores_lower_tri.tsv`: Z-scores (if --perm-out-z)
+  - `<prefix>_pvalues_lower_tri.tsv`: P-values (if --perm-out-p)
+
+- **Residual Analysis outputs**:
+  - `<prefix>_residual_morans_i_raw.tsv`: Residual Moran's I matrix
+  - `<prefix>_regression_coefficients.tsv`: Cell type regression coefficients
+  
+- **Residual Permutation outputs (if enabled)**:
+  - `<prefix>_residual_zscores_lower_tri.tsv`: Residual Z-scores
+  - `<prefix>_residual_pvalues_lower_tri.tsv`: Residual P-values
+
+## Examples
+
+### Standard Moran's I Analysis
+
+1. Calculate single-gene Moran's I for Visium data:
+   ```bash
+   ./morans_i_mkl -i visium_data.tsv -o results_single -b 0 -p 0 -r 4
+   ```
+
+2. Calculate pairwise Moran's I between the first gene and all others:
+   ```bash
+   ./morans_i_mkl -i visium_data.tsv -o results_firstvsall -b 1 -g 0
+   ```
+
+3. Process single-cell data with spatial coordinates:
+   ```bash
+   ./morans_i_mkl -i sc_expr.tsv -o results_sc -p 2 -c sc_coords.tsv --id-col cell_id --x-col x_coord --y-col y_coord
+   ```
+
+### Residual Moran's I Analysis
+
+4. Basic residual analysis with deconvolution data (CSV format):
+   ```bash
+   ./morans_i_mkl -i expression.tsv -o results_residual \
+     --analysis-mode residual \
+     --celltype-file deconv_proportions.csv \
+     --celltype-format deconv
+   ```
+
+5. Residual analysis with Visium cell type data (cell types as rows, spots as columns):
+   ```bash
+   ./morans_i_mkl -i visium_expression.csv -o results_visium_residual \
+     --analysis-mode residual \
+     --celltype-file visium_celltypes.csv \
+     --celltype-format deconv
+   ```
+
+6. Residual analysis with single-cell annotations:
+   ```bash
+   ./morans_i_mkl -i expression.tsv -o results_residual \
+     --analysis-mode residual \
+     --celltype-file single_cell_annotations.tsv \
+     --celltype-format sc \
+     --celltype-id-col cell_ID \
+     --celltype-type-col cellType
+   ```
+
+7. Residual analysis with ridge regularization:
+   ```bash
+   ./morans_i_mkl -i expression.tsv -o results_residual \
+     --analysis-mode residual \
+     --celltype-file proportions.tsv \
+     --regularization 0.1 \
+     --include-intercept 1
+   ```
+
+8. Residual analysis with permutation testing:
+   ```bash
+   ./morans_i_mkl -i expression.tsv -o results_residual \
+     --analysis-mode residual \
+     --celltype-file proportions.tsv \
+     --run-perm --num-perm 1000 \
+     --perm-out-z --perm-out-p
+   ```
+
+### Custom Weight Matrix Analysis
+
+9. Generate and use custom weight matrices:
+   ```bash
+   # Generate custom weights
+   python3 make_custom_w.py -i expression_data.tsv -o custom_weights -r 5 -s 0 -p 0
+   
+   # Use dense format
+   ./morans_i_mkl -i expression_data.tsv -o results_custom -w custom_weights_dense.tsv --weight-format dense
+   
+   # Use sparse format
+   ./morans_i_mkl -i expression_data.tsv -o results_custom -w custom_weights_sparse.tsv --weight-format sparse_tsv
+   ```
+
+10. Use custom weights with normalization:
+    ```bash
+    ./morans_i_mkl -i expression_data.tsv -o results_custom -w weights.tsv --normalize-weights
+    ```
+
+### Advanced Examples
+
+11. Run with permutation testing for statistical significance:
+    ```bash
+    ./morans_i_mkl -i visium_data.tsv -o results_perm -b 1 -g 1 --run-perm --num-perm 1000 --perm-out-z --perm-out-p
+    ```
+
+12. Run the built-in toy example for testing:
+    ```bash
+    ./morans_i_mkl --run-toy-example -o toy_example --num-perm 100 --perm-seed 42
+    ```
+
+13. Combined residual analysis with custom weights:
+    ```bash
+    ./morans_i_mkl -i expression.tsv -o results_combined \
+      --analysis-mode residual \
+      --celltype-file celltypes.tsv \
+      -w custom_weights.tsv \
+      --run-perm --num-perm 500
+    ```
 
 ## Custom Weight Matrix File Formats
 
@@ -298,61 +466,6 @@ spot_A  spot_C  0.6
 spot_B  spot_D  0.6
 spot_C  spot_D  0.8
 ```
-
-## Examples
-
-### Traditional Platform-Based Analysis
-
-1. Calculate single-gene Moran's I for Visium data:
-   ```bash
-   ./morans_i_mkl -i visium_data.tsv -o results_single -b 0 -p 0 -r 4
-   ```
-
-2. Calculate pairwise Moran's I between the first gene and all others:
-   ```bash
-   ./morans_i_mkl -i visium_data.tsv -o results_firstvsall -b 1 -g 0
-   ```
-
-3. Process single-cell data with spatial coordinates:
-   ```bash
-   ./morans_i_mkl -i sc_expr.tsv -o results_sc -p 2 -c sc_coords.tsv --id-col cell_id --x-col x_coord --y-col y_coord
-   ```
-
-### Custom Weight Matrix Analysis
-
-4. Generate and use custom weight matrices:
-   ```bash
-   # Generate custom weights
-   python3 make_custom_w.py -i expression_data.tsv -o custom_weights -r 5 -s 0 -p 0
-   
-   # Use dense format
-   ./morans_i_mkl -i expression_data.tsv -o results_custom -w custom_weights_dense.tsv --weight-format dense
-   
-   # Use sparse format
-   ./morans_i_mkl -i expression_data.tsv -o results_custom -w custom_weights_sparse.tsv --weight-format sparse_tsv
-   ```
-
-5. Use custom weights with normalization:
-   ```bash
-   ./morans_i_mkl -i expression_data.tsv -o results_custom -w weights.tsv --normalize-weights
-   ```
-
-6. Custom weights with permutation testing:
-   ```bash
-   ./morans_i_mkl -i expression_data.tsv -o results_custom -w weights.tsv --run-perms --n-perms 1000
-   ```
-
-### Advanced Examples
-
-7. Run with permutation testing for statistical significance:
-   ```bash
-   ./morans_i_mkl -i visium_data.tsv -o results_perm -b 1 -g 1 --run-perms --n-perms 1000 --perm-output-zscores --perm-output-pvalues
-   ```
-
-8. Run the built-in toy example for testing:
-   ```bash
-   ./morans_i_mkl --run-toy-example -o toy_example --n-perms 100 --perm-seed 42
-   ```
 
 ## Creating Custom Weight Matrices
 
@@ -459,6 +572,27 @@ where:
 - W is the spatial weight matrix
 - S0 is the sum of all weights in W
 
+#### Residual Moran's I
+
+For residual analysis, the calculation proceeds as follows:
+
+1. **Cell type regression**: Fit linear model for each gene
+   ```
+   X = Z * β + ε
+   ```
+   where Z is the cell type matrix and β are coefficients
+
+2. **Residual computation**: Calculate residuals after removing cell type effects
+   ```
+   R = X - Z * β̂
+   ```
+
+3. **Residual Moran's I**: Apply standard Moran's I to residuals
+   ```
+   I_residual = (R_norm^T W R_norm) / S0
+   ```
+   where R_norm are the normalized residuals
+
 ### Spatial Weight Matrix
 
 #### Built-in Platform Support
@@ -491,9 +625,10 @@ When using custom weight matrices (-w option):
 Permutation testing is used to assess the statistical significance of observed Moran's I values. The process involves:
 
 1. Calculate observed Moran's I value(s)
-2. Randomly permute the gene expression values across spots (maintaining gene-wise Z-normalization)
-3. Recalculate Moran's I for each permutation
-4. Compute statistical measures:
+2. For standard analysis: Randomly permute the gene expression values across spots
+3. For residual analysis: Randomly permute the residuals across spots
+4. Recalculate Moran's I for each permutation
+5. Compute statistical measures:
    - Z-scores: (observed_I - mean(permuted_I)) / std(permuted_I)
    - P-values: proportion of permuted values with absolute value >= absolute observed value
 
@@ -506,6 +641,7 @@ Our implementation uses Intel MKL to optimize Moran's I calculation:
 - Dense matrix operations with cblas_dgemm()
 - OpenMP parallelization for multi-threading
 - Optimized vectorized math operations with Intel VML functions
+- Ridge regression using efficient matrix decompositions for residual analysis
 
 This approach enables efficient processing of large spatial transcriptomics datasets containing thousands of spots and genes.
 
@@ -514,13 +650,15 @@ This approach enables efficient processing of large spatial transcriptomics data
 - Increasing the maximum radius (`-r`) increases computational complexity (not applicable for custom weights)
 - For large datasets, adjust thread counts (`-t` and `-m`) to match your hardware
 - All-vs-all pairwise mode (`-b 1 -g 1`) is significantly more memory-intensive than other modes
-- Permutation testing (`--run-perms`) substantially increases computation time, especially with higher permutation counts
+- Permutation testing (`--run-perm`) substantially increases computation time, especially with higher permutation counts
+- Residual analysis adds computational overhead for regression and residual calculation
 - Custom weight matrices with high density (many non-zero elements) will be slower than sparse matrices
 - For very large datasets, consider:
   - Using single-gene mode (`-b 0`) or first-gene-vs-all mode (`-b 1 -g 0`)
   - Reducing permutation count for initial analyses
   - Running on a high-memory system for all-vs-all analyses
   - Pre-filtering spots or genes to reduce matrix dimensions
+  - Using regularization in residual analysis for numerical stability
 
 ## Error Codes
 

@@ -28,7 +28,7 @@ MKL_LIBS = -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core -liomp5 -lpthread -lm 
 # Final linking flags
 LIBS = $(LDFLAGS) $(MKL_LIBS)
 # Version information - Updated to match header file
-VERSION = 1.2.2
+VERSION = 1.3.0
 VERSION_FLAG = -DMORANS_I_MKL_VERSION=\"$(VERSION)\"
 # Source files
 SOURCES = main.c morans_i_mkl.c

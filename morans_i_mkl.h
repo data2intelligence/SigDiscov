@@ -3,7 +3,7 @@
  * This library provides efficient calculation of Moran's I spatial autocorrelation
  * statistics for gene expression data, optimized using Intel MKL.
  *
- * Version: 1.2.2 (Optimized custom weight matrix reading)
+ * Version: 1.3.0 (Added Residual Moran's I functionality)
  */
 
 #ifndef MORANS_I_MKL_H
@@ -21,7 +21,7 @@
 #include "mkl_vml.h"  /* For vdDiv and other VML functions */
 
 /* Library version */
-#define MORANS_I_MKL_VERSION "1.2.2"
+#define MORANS_I_MKL_VERSION "1.3.0"
 
 /* Constants */
 #define VISIUM 0                      /* Visium platform with hexagonal grid */
@@ -48,6 +48,14 @@
 #define WEIGHT_FORMAT_SPARSE_COO 2    /* Sparse COO format (row, col, value) */
 #define WEIGHT_FORMAT_SPARSE_TSV 3    /* Sparse TSV format (spot1, spot2, weight) */
 
+/* Analysis mode types */
+#define ANALYSIS_MODE_STANDARD 0      /* Standard Moran's I analysis */
+#define ANALYSIS_MODE_RESIDUAL 1      /* Residual Moran's I analysis (cell type corrected) */
+
+/* Cell type data format types */
+#define CELLTYPE_FORMAT_DECONVOLUTION 0  /* Deconvolution proportions (spots x cell_types) */
+#define CELLTYPE_FORMAT_SINGLE_CELL 1    /* Single-cell annotations (cells with coordinates) */
+
 /* Error codes */
 #define MORANS_I_SUCCESS 0
 #define MORANS_I_ERROR_MEMORY -1
@@ -55,15 +63,14 @@
 #define MORANS_I_ERROR_PARAMETER -3
 #define MORANS_I_ERROR_COMPUTATION -4
 
-/* Forward declaration for SpotNameHashTable to break potential circular dependency if needed,
-   though direct inclusion of struct definition is usually fine here.
-   If SpotNameHashTable itself used DenseMatrix/SparseMatrix, then forward declare those too.
-   For now, assuming direct definition is okay.
-*/
-// struct SpotNameHashTable_st; // Not strictly needed if defined before use
+/* Default values for residual analysis */
+#define DEFAULT_ANALYSIS_MODE ANALYSIS_MODE_STANDARD
+#define DEFAULT_CELLTYPE_FORMAT CELLTYPE_FORMAT_SINGLE_CELL
+#define DEFAULT_INCLUDE_INTERCEPT 1
+#define DEFAULT_REGULARIZATION_LAMBDA 0.0
+#define DEFAULT_NORMALIZE_RESIDUALS 1
 
-
-/* Hash Table for Spot Name Lookup (Moved from .c to .h) */
+/* Hash Table for Spot Name Lookup */
 typedef struct SpotNameHashNode_st {
     char* name;
     MKL_INT index;
@@ -75,7 +82,6 @@ typedef struct SpotNameHashTable_st {
     size_t num_buckets;
     size_t count;
 } SpotNameHashTable;
-
 
 /**
  * Dense matrix structure
@@ -113,6 +119,56 @@ typedef struct {
     MKL_INT total_spots; /* Total number of spots read initially */
     MKL_INT valid_spots; /* Number of spots deemed valid for analysis */
 } SpotCoordinates;
+
+/**
+ * Cell type composition matrix structure
+ * Used for residual Moran's I analysis to correct for cell type effects
+ */
+typedef struct {
+    double* values;          /* Cell type proportions/indicators (spots × cell_types) */
+    MKL_INT nrows;          /* Number of spots */
+    MKL_INT ncols;          /* Number of cell types */
+    char** rownames;        /* Spot names */
+    char** colnames;        /* Cell type names */
+    int is_binary;          /* 1 for single-cell annotations (binary), 0 for proportions */
+    int format_type;        /* CELLTYPE_FORMAT_DECONVOLUTION or CELLTYPE_FORMAT_SINGLE_CELL */
+} CellTypeMatrix;
+
+/**
+ * Residual analysis configuration
+ */
+typedef struct {
+    int analysis_mode;                    /* ANALYSIS_MODE_STANDARD or ANALYSIS_MODE_RESIDUAL */
+    char* celltype_file;                 /* Path to cell type data file */
+    int celltype_format;                 /* CELLTYPE_FORMAT_DECONVOLUTION or CELLTYPE_FORMAT_SINGLE_CELL */
+    
+    /* Column names for single-cell format */
+    char* celltype_id_col;               /* Cell ID column (default: "cell_ID") */
+    char* celltype_type_col;             /* Cell type column (default: "cellType") */ 
+    char* celltype_x_col;                /* X coordinate column (default: "sdimx") */
+    char* celltype_y_col;                /* Y coordinate column (default: "sdimy") */
+    
+    /* Column name for deconvolution format */
+    char* spot_id_col;                   /* Spot ID column for deconvolution format (default: "spot_id") */
+    
+    /* Regression parameters */
+    int include_intercept;               /* Include intercept in regression (default: 1) */
+    double regularization_lambda;        /* Ridge regularization parameter (default: 0.0) */
+    int normalize_residuals;             /* Normalize residuals (default: 1) */
+} ResidualConfig;
+
+/**
+ * Residual analysis results structure
+ */
+typedef struct {
+    DenseMatrix* regression_coefficients; /* B̂ matrix (cell_types × genes) */
+    DenseMatrix* residuals;              /* Residual matrix R (spots × genes) */
+    DenseMatrix* residual_morans_i;      /* Residual Moran's I results */
+    DenseMatrix* residual_mean_perm;     /* Mean of permuted residual Moran's I values */
+    DenseMatrix* residual_var_perm;      /* Variance of permuted residual Moran's I values */
+    DenseMatrix* residual_zscores;       /* Z-scores from residual permutation test */
+    DenseMatrix* residual_pvalues;       /* P-values from residual permutation test */
+} ResidualResults;
 
 /**
  * Permutation test parameters structure
@@ -163,7 +219,10 @@ typedef struct {
     unsigned int perm_seed;    /* Seed for RNG in permutations */
     int perm_output_zscores;   /* Boolean: 1 to output Z-scores from permutations */
     int perm_output_pvalues;   /* Boolean: 1 to output p-values from permutations */
-    char* output_prefix;       /* Prefix for output files */    
+    char* output_prefix;       /* Prefix for output files */
+    
+    // Residual analysis configuration
+    ResidualConfig residual_config;  /* Configuration for residual Moran's I analysis */
 } MoransIConfig;
 
 /* --- Function Prototypes --- */
@@ -181,13 +240,32 @@ void print_mkl_status(sparse_status_t status, const char* function_name);
 double get_time(void); // Prototype for get_time
 
 /* Custom Weight Matrix Functions */
-// The second argument of these three functions is now SpotNameHashTable*
-SparseMatrix* read_custom_weight_matrix(const char* filename, int format, char** spot_names_from_expr, MKL_INT n_spots); // This one still needs char** to build the map initially
+SparseMatrix* read_custom_weight_matrix(const char* filename, int format, char** spot_names_from_expr, MKL_INT n_spots);
 int detect_weight_matrix_format(const char* filename);
 SparseMatrix* read_dense_weight_matrix(const char* filename, SpotNameHashTable* spot_map, MKL_INT n_spots);
 SparseMatrix* read_sparse_weight_matrix_coo(const char* filename, SpotNameHashTable* spot_map, MKL_INT n_spots);
 SparseMatrix* read_sparse_weight_matrix_tsv(const char* filename, SpotNameHashTable* spot_map, MKL_INT n_spots);
 int validate_weight_matrix(const SparseMatrix* W, char** spot_names, MKL_INT n_spots);
+
+/* Cell Type Data Processing */
+CellTypeMatrix* read_celltype_deconvolution_file(const char* filename, const char* spot_id_col);
+CellTypeMatrix* read_celltype_singlecell_file(const char* filename, 
+                                             const char* cell_id_col,
+                                             const char* celltype_col,
+                                             const char* x_col,
+                                             const char* y_col);
+int validate_celltype_matrix(const CellTypeMatrix* Z, const DenseMatrix* X);
+int map_celltype_to_expression(const CellTypeMatrix* celltype_matrix, const DenseMatrix* expr_matrix,
+                               CellTypeMatrix** mapped_celltype_out);
+int detect_file_delimiter(const char* filename);
+
+/* Matrix Operations for Residual Analysis */
+DenseMatrix* create_centering_matrix(MKL_INT n);
+DenseMatrix* compute_residual_projection_matrix(const CellTypeMatrix* Z, double lambda);
+DenseMatrix* apply_residual_projection(const DenseMatrix* X, const DenseMatrix* M_res);
+DenseMatrix* center_matrix_columns(const DenseMatrix* matrix);
+DenseMatrix* normalize_matrix_rows(const DenseMatrix* matrix);
+DenseMatrix* compute_regression_coefficients(const CellTypeMatrix* Z, const DenseMatrix* X, double lambda);
 
 /* Spatial Data Processing */
 double decay(double d, double sigma);
@@ -216,9 +294,17 @@ double* calculate_morans_i_batch(const double* X_data_spots_x_genes, long long n
                                  const double* W_values, const long long* W_row_ptr, const long long* W_col_ind,
                                  long long W_nnz, int paired_genes);
 
+/* Residual Moran's I Core Calculation */
+ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTypeMatrix* Z, 
+                                           const SparseMatrix* W, const ResidualConfig* config);
+DenseMatrix* calculate_residual_morans_i_matrix(const DenseMatrix* R_normalized, const SparseMatrix* W);
+
 /* Permutation Testing */
 PermutationResults* run_permutation_test(const DenseMatrix* X_spots_x_genes, const SparseMatrix* W_spots_x_spots,
                                          const PermutationParams* params, int row_normalized);
+PermutationResults* run_residual_permutation_test(const DenseMatrix* X, const CellTypeMatrix* Z,
+                                                 const SparseMatrix* W, const PermutationParams* params,
+                                                 const ResidualConfig* config);
 
 /* Results Saving */
 int save_results(const DenseMatrix* result_matrix, const char* output_file); 
@@ -226,12 +312,16 @@ int save_single_gene_results(const DenseMatrix* X_calc_spots_x_genes, const Spar
 int save_first_gene_vs_all_results(const double* morans_values_array, const char** gene_names_array, MKL_INT n_genes, const char* output_file);
 int save_lower_triangular_matrix_raw(const DenseMatrix* square_matrix, const char* output_file);
 int save_permutation_results(const PermutationResults* perm_test_results,
-                             const char* output_file_prefix);     
+                             const char* output_file_prefix);
+int save_residual_results(const ResidualResults* results, const char* output_prefix);
+int save_regression_coefficients(const DenseMatrix* coefficients, const char* output_file);
 
 /* Memory Management */
 void free_dense_matrix(DenseMatrix* matrix);
 void free_sparse_matrix(SparseMatrix* matrix);
 void free_spot_coordinates(SpotCoordinates* coords);
 void free_permutation_results(PermutationResults* results);
+void free_celltype_matrix(CellTypeMatrix* matrix);
+void free_residual_results(ResidualResults* results);
 
 #endif /* MORANS_I_MKL_H */
