@@ -51,21 +51,18 @@ typedef struct {
 } cleanup_list_t;
 
 /* Forward declarations for helper functions */
-static void cleanup_list_init(cleanup_list_t* list);
-static void cleanup_list_free_all(cleanup_list_t* list);
-static void cleanup_list_destroy(cleanup_list_t* list);
-
 static int safe_multiply_size_t(size_t a, size_t b, size_t *result);
 static int validate_matrix_dimensions(MKL_INT nrows, MKL_INT ncols, const char* context);
 static char* trim_whitespace_inplace(char* str);
 
 /* VST file parsing helpers */
+static int detect_file_format(const char* filename);
 static int parse_vst_header(FILE* fp, char** line, size_t* line_buf_size,
-                           MKL_INT* n_spots_out, char*** colnames_out);
-static int count_vst_genes(FILE* fp, char** line, size_t* line_buf_size, 
-                          MKL_INT* n_genes_out);
+                           MKL_INT* n_spots_out, char*** colnames_out, int is_csv);
+static int count_vst_genes(FILE* fp, char** line, size_t* line_buf_size, MKL_INT* n_genes_out);
 static int read_vst_data_rows(FILE* fp, char** line, size_t* line_buf_size,
-                             DenseMatrix* matrix, MKL_INT n_genes_expected, MKL_INT n_spots_expected);
+                             DenseMatrix* matrix, MKL_INT n_genes_expected, 
+                             MKL_INT n_spots_expected, int is_csv);
 
 /* Permutation testing helpers */
 static int permutation_worker(const DenseMatrix* X_original,
@@ -223,36 +220,6 @@ const char* morans_i_mkl_version(void) {
 /* ===============================
  * UTILITY AND HELPER FUNCTIONS
  * =============================== */
-
-/* Resource management implementation */
-static void cleanup_list_init(cleanup_list_t* list) {
-    if (!list) return;
-    list->ptrs = NULL;
-    list->free_funcs = NULL;
-    list->count = 0;
-    list->capacity = 0;
-}
-
-static void cleanup_list_free_all(cleanup_list_t* list) {
-    if (!list) return;
-    
-    for (size_t i = 0; i < list->count; i++) {
-        if (list->ptrs[i] && list->free_funcs[i]) {
-            list->free_funcs[i](list->ptrs[i]);
-        }
-    }
-    list->count = 0;
-}
-
-static void cleanup_list_destroy(cleanup_list_t* list) {
-    if (!list) return;
-    cleanup_list_free_all(list);
-    free(list->ptrs);
-    free(list->free_funcs);
-    list->ptrs = NULL;
-    list->free_funcs = NULL;
-    list->capacity = 0;
-}
 
 /* Safe multiplication to prevent overflow */
 static int safe_multiply_size_t(size_t a, size_t b, size_t *result) {
@@ -4144,10 +4111,51 @@ SparseMatrix* read_custom_weight_matrix(const char* filename, int format,
 /* ===============================
  * VST FILE PARSING (REFACTORED)
  * =============================== */
+/* ========================================
+   PART 1: UPDATED FUNCTION DECLARATIONS
+   Replace the existing declarations around lines 63-68
+   ======================================== */
 
-/* Parse VST file header and extract column names */
+// Replace the old declarations with these:
+static int detect_file_format(const char* filename);
 static int parse_vst_header(FILE* fp, char** line, size_t* line_buf_size,
-                           MKL_INT* n_spots_out, char*** colnames_out) {
+                           MKL_INT* n_spots_out, char*** colnames_out, int is_csv);
+static int count_vst_genes(FILE* fp, char** line, size_t* line_buf_size, MKL_INT* n_genes_out);
+static int read_vst_data_rows(FILE* fp, char** line, size_t* line_buf_size,
+                             DenseMatrix* matrix, MKL_INT n_genes_expected, 
+                             MKL_INT n_spots_expected, int is_csv);
+
+/* ========================================
+   PART 2: COMPLETE FUNCTION IMPLEMENTATIONS
+   Replace your existing implementations with these:
+   ======================================== */
+
+/* Helper function to detect file format */
+static int detect_file_format(const char* filename) {
+    FILE* fp = fopen(filename, "r");
+    if (!fp) return -1;
+    
+    char buffer[1024];
+    if (!fgets(buffer, sizeof(buffer), fp)) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    
+    // Count commas and tabs in first line
+    int comma_count = 0, tab_count = 0;
+    for (char* p = buffer; *p; p++) {
+        if (*p == ',') comma_count++;
+        else if (*p == '\t') tab_count++;
+    }
+    
+    // If more commas than tabs, assume CSV
+    return (comma_count > tab_count) ? 0 : 1; // 0=CSV, 1=TSV
+}
+
+/* Parse VST file header and extract column names - UPDATED VERSION */
+static int parse_vst_header(FILE* fp, char** line, size_t* line_buf_size,
+                           MKL_INT* n_spots_out, char*** colnames_out, int is_csv) {
     if (!fp || !line || !line_buf_size || !n_spots_out || !colnames_out) {
         return MORANS_I_ERROR_PARAMETER;
     }
@@ -4166,90 +4174,108 @@ static int parse_vst_header(FILE* fp, char** line, size_t* line_buf_size,
         (*line)[--line_len] = '\0';
     }
     
-    // Count fields
+    // Use correct delimiter based on format
+    char* delimiter = is_csv ? "," : "\t";
+    
+    // Count total fields first
     char* header_copy = strdup(*line);
     if (!header_copy) {
         perror("strdup for header counting");
         return MORANS_I_ERROR_MEMORY;
     }
     
-    MKL_INT field_count = 0;
-    char* token = strtok(header_copy, "\t");
+    MKL_INT total_field_count = 0;
+    char* token = strtok(header_copy, delimiter);
     while (token != NULL) {
-        field_count++;
-        token = strtok(NULL, "\t");
+        total_field_count++;
+        token = strtok(NULL, delimiter);
     }
     free(header_copy);
     
-    if (field_count < 1) {
-        fprintf(stderr, "Error: Header has %lld fields. Expected at least 1.\n", (long long)field_count);
+    if (total_field_count < 1) {
+        fprintf(stderr, "Error: Header has %lld fields. Expected at least 1.\n", (long long)total_field_count);
         return MORANS_I_ERROR_FILE;
     }
     
-    *n_spots_out = field_count; // All header fields are spot IDs
+    printf("Detected %lld columns in %s format\n", (long long)total_field_count, 
+           is_csv ? "CSV" : "TSV");
     
-    // Allocate colnames array
-    *colnames_out = (char**)malloc((size_t)field_count * sizeof(char*));
-    if (!*colnames_out) {
-        perror("malloc for colnames");
+    // Allocate temporary array for all fields
+    char** temp_colnames = (char**)malloc((size_t)total_field_count * sizeof(char*));
+    if (!temp_colnames) {
+        perror("malloc for temp colnames");
         return MORANS_I_ERROR_MEMORY;
     }
     
     // Initialize all to NULL for safe cleanup
-    for (MKL_INT i = 0; i < field_count; i++) {
-        (*colnames_out)[i] = NULL;
+    for (MKL_INT i = 0; i < total_field_count; i++) {
+        temp_colnames[i] = NULL;
     }
     
-    // Parse column names
+    // Parse all column names, counting valid (non-empty) ones
     char* header_copy2 = strdup(*line);
     if (!header_copy2) {
         perror("strdup for header parsing");
-        // Cleanup
-        for (MKL_INT i = 0; i < field_count; i++) {
-            free((*colnames_out)[i]);
-        }
-        free(*colnames_out);
-        *colnames_out = NULL;
+        free(temp_colnames);
         return MORANS_I_ERROR_MEMORY;
     }
     
-    token = strtok(header_copy2, "\t");
+    token = strtok(header_copy2, delimiter);
     MKL_INT col_idx = 0;
-    while (token && col_idx < field_count) {
+    MKL_INT valid_cols = 0;
+    
+    while (token && col_idx < total_field_count) {
         char* trimmed = trim_whitespace_inplace(token);
+        
         if (strlen(trimmed) > 0) {
-            (*colnames_out)[col_idx] = strdup(trimmed);
-            if (!(*colnames_out)[col_idx]) {
+            // Valid non-empty column name
+            temp_colnames[valid_cols] = strdup(trimmed);
+            if (!temp_colnames[valid_cols]) {
                 perror("strdup for column name");
                 free(header_copy2);
                 // Cleanup already allocated names
-                for (MKL_INT i = 0; i < col_idx; i++) {
-                    free((*colnames_out)[i]);
+                for (MKL_INT i = 0; i < valid_cols; i++) {
+                    free(temp_colnames[i]);
                 }
-                free(*colnames_out);
-                *colnames_out = NULL;
+                free(temp_colnames);
                 return MORANS_I_ERROR_MEMORY;
             }
-        } else {
-            char default_name[32];
-            snprintf(default_name, sizeof(default_name), "Spot_%lld", (long long)col_idx + 1);
-            (*colnames_out)[col_idx] = strdup(default_name);
-            if (!(*colnames_out)[col_idx]) {
-                perror("strdup for default column name");
-                free(header_copy2);
-                for (MKL_INT i = 0; i < col_idx; i++) {
-                    free((*colnames_out)[i]);
-                }
-                free(*colnames_out);
-                *colnames_out = NULL;
-                return MORANS_I_ERROR_MEMORY;
-            }
+            valid_cols++;
         }
+        // Skip empty fields (like the first empty field in your CSV)
+        
         col_idx++;
-        token = strtok(NULL, "\t");
+        token = strtok(NULL, delimiter);
     }
     
     free(header_copy2);
+    
+    if (valid_cols == 0) {
+        fprintf(stderr, "Error: No valid column names found\n");
+        free(temp_colnames);
+        return MORANS_I_ERROR_FILE;
+    }
+    
+    // Allocate final array with correct size
+    *colnames_out = (char**)malloc((size_t)valid_cols * sizeof(char*));
+    if (!*colnames_out) {
+        perror("malloc for final colnames");
+        for (MKL_INT i = 0; i < valid_cols; i++) {
+            free(temp_colnames[i]);
+        }
+        free(temp_colnames);
+        return MORANS_I_ERROR_MEMORY;
+    }
+    
+    // Copy valid column names to final array
+    for (MKL_INT i = 0; i < valid_cols; i++) {
+        (*colnames_out)[i] = temp_colnames[i]; // Transfer ownership
+    }
+    free(temp_colnames);
+    
+    *n_spots_out = valid_cols;
+    
+    printf("Parsed %lld valid column names\n", (long long)*n_spots_out);
     DEBUG_PRINT("Parsed VST header: %lld columns", (long long)*n_spots_out);
     return MORANS_I_SUCCESS;
 }
@@ -4275,12 +4301,16 @@ static int count_vst_genes(FILE* fp, char** line, size_t* line_buf_size, MKL_INT
     return MORANS_I_SUCCESS;
 }
 
-/* Read VST data rows */
+/* Read VST data rows - UPDATED VERSION */
 static int read_vst_data_rows(FILE* fp, char** line, size_t* line_buf_size,
-                             DenseMatrix* matrix, MKL_INT n_genes_expected, MKL_INT n_spots_expected) {
+                             DenseMatrix* matrix, MKL_INT n_genes_expected, 
+                             MKL_INT n_spots_expected, int is_csv) {
     if (!fp || !line || !line_buf_size || !matrix || !matrix->values || !matrix->rownames) {
         return MORANS_I_ERROR_PARAMETER;
     }
+    
+    // Use correct delimiter based on format
+    char* delimiter = is_csv ? "," : "\t";
     
     MKL_INT gene_idx = 0;
     int file_lineno = 1; // Header was line 1
@@ -4312,47 +4342,55 @@ static int read_vst_data_rows(FILE* fp, char** line, size_t* line_buf_size,
             return MORANS_I_ERROR_MEMORY;
         }
         
-        char* token = strtok(data_row_copy, "\t");
+        char* token = strtok(data_row_copy, delimiter);
         if (!token) {
             fprintf(stderr, "Error: No gene name found on line %d\n", file_lineno);
             free(data_row_copy);
             return MORANS_I_ERROR_FILE;
         }
         
-        // Store gene name
-        matrix->rownames[gene_idx] = strdup(token);
+        // Store gene name (first token should be gene name)
+        char* gene_name = trim_whitespace_inplace(token);
+        matrix->rownames[gene_idx] = strdup(gene_name);
         if (!matrix->rownames[gene_idx]) {
             perror("strdup gene name");
             free(data_row_copy);
             return MORANS_I_ERROR_MEMORY;
         }
         
-        // Read expression values
-        for (MKL_INT spot_idx = 0; spot_idx < n_spots_expected; ++spot_idx) {
-            token = strtok(NULL, "\t");
-            if (!token) {
-                fprintf(stderr, "Error: File line %d, gene '%s': Expected %lld expression values, found only %lld.\n",
-                        file_lineno, matrix->rownames[gene_idx], (long long)n_spots_expected, (long long)spot_idx);
-                free(data_row_copy);
-                return MORANS_I_ERROR_FILE;
+        // Read expression values, skipping empty fields
+        MKL_INT values_read = 0;
+        token = strtok(NULL, delimiter);
+        
+        while (token && values_read < n_spots_expected) {
+            char* trimmed = trim_whitespace_inplace(token);
+            
+            // Skip empty values (like empty first field)
+            if (strlen(trimmed) == 0) {
+                token = strtok(NULL, delimiter);
+                continue;
             }
             
             char* endptr;
             errno = 0;
-            double val = strtod(token, &endptr);
-            if (errno == ERANGE || (*endptr != '\0' && !isspace((unsigned char)*endptr)) || endptr == token) {
-                fprintf(stderr, "Error: Invalid number '%s' at file line %d, gene '%s', spot column %lld.\n",
-                        token, file_lineno, matrix->rownames[gene_idx], (long long)spot_idx + 1);
+            double val = strtod(trimmed, &endptr);
+            if (errno == ERANGE || (*endptr != '\0' && !isspace((unsigned char)*endptr)) || endptr == trimmed) {
+                fprintf(stderr, "Error: Invalid number '%s' at file line %d, gene '%s', value %lld.\n",
+                        trimmed, file_lineno, matrix->rownames[gene_idx], (long long)values_read + 1);
                 free(data_row_copy);
                 return MORANS_I_ERROR_FILE;
             }
-            matrix->values[gene_idx * n_spots_expected + spot_idx] = val;
+            
+            matrix->values[gene_idx * n_spots_expected + values_read] = val;
+            values_read++;
+            token = strtok(NULL, delimiter);
         }
         
-        // Check for extra columns
-        if (strtok(NULL, "\t") != NULL) {
-            fprintf(stderr, "Warning: Line %d has more columns than expected (%lld spots). Extra data ignored.\n",
-                   file_lineno, (long long)n_spots_expected);
+        if (values_read != n_spots_expected) {
+            fprintf(stderr, "Error: File line %d, gene '%s': Expected %lld expression values, found %lld.\n",
+                    file_lineno, matrix->rownames[gene_idx], (long long)n_spots_expected, (long long)values_read);
+            free(data_row_copy);
+            return MORANS_I_ERROR_FILE;
         }
         
         free(data_row_copy);
@@ -4369,12 +4407,22 @@ static int read_vst_data_rows(FILE* fp, char** line, size_t* line_buf_size,
     return MORANS_I_SUCCESS;
 }
 
-/* Read data from VST file (refactored) */
+/* Enhanced VST file reader with CSV/TSV auto-detection - UPDATED VERSION */
 DenseMatrix* read_vst_file(const char* filename) {
     if (!filename) {
         fprintf(stderr, "Error: Null filename provided to read_vst_file\n");
         return NULL;
     }
+    
+    // Detect file format
+    int format = detect_file_format(filename);
+    if (format < 0) {
+        fprintf(stderr, "Error: Failed to detect file format for '%s'\n", filename);
+        return NULL;
+    }
+    
+    int is_csv = (format == 0);
+    printf("Detected %s format for file '%s'\n", is_csv ? "CSV" : "TSV", filename);
     
     FILE* fp = fopen(filename, "r");
     if (!fp) {
@@ -4386,31 +4434,31 @@ DenseMatrix* read_vst_file(const char* filename) {
     size_t line_buf_size = 0;
     DenseMatrix* matrix = NULL;
     char** colnames = NULL;
-    cleanup_list_t cleanup;
-    cleanup_list_init(&cleanup);
     
-    printf("Reading VST file '%s'...\n", filename);
+    printf("Reading expression file '%s'...\n", filename);
     
-    // Parse header
-    MKL_INT n_spots, n_genes;
-    if (parse_vst_header(fp, &line, &line_buf_size, &n_spots, &colnames) != MORANS_I_SUCCESS) {
+    // Parse header with format detection
+    MKL_INT n_spots;
+    int header_result = parse_vst_header(fp, &line, &line_buf_size, &n_spots, &colnames, is_csv);
+    if (header_result != MORANS_I_SUCCESS) {
         goto cleanup_and_exit;
     }
     
-    // Count genes
+    // Count genes by reading through file
+    long header_pos = ftell(fp);
+    MKL_INT n_genes;
     if (count_vst_genes(fp, &line, &line_buf_size, &n_genes) != MORANS_I_SUCCESS) {
         goto cleanup_and_exit;
     }
     
     if (n_genes == 0 || n_spots == 0) {
-        fprintf(stderr, "Error: No data found in VST file (genes=%lld, spots=%lld).\n", 
+        fprintf(stderr, "Error: No data found (genes=%lld, spots=%lld).\n", 
                 (long long)n_genes, (long long)n_spots);
         goto cleanup_and_exit;
     }
     
-    if (validate_matrix_dimensions(n_genes, n_spots, "VST file") != MORANS_I_SUCCESS) {
-        goto cleanup_and_exit;
-    }
+    printf("Matrix dimensions: %lld genes x %lld spots\n", 
+           (long long)n_genes, (long long)n_spots);
     
     // Allocate matrix
     matrix = (DenseMatrix*)malloc(sizeof(DenseMatrix));
@@ -4425,16 +4473,8 @@ DenseMatrix* read_vst_file(const char* filename) {
     matrix->colnames = NULL;
     matrix->values = NULL;
     
-    // Allocate components with overflow protection
-    size_t values_size;
-    if (safe_multiply_size_t(n_genes, n_spots, &values_size) != 0 ||
-        safe_multiply_size_t(values_size, sizeof(double), &values_size) != 0) {
-        fprintf(stderr, "Error: Matrix dimensions too large for VST file\n");
-        free(matrix);
-        matrix = NULL;
-        goto cleanup_and_exit;
-    }
-    
+    // Allocate components
+    size_t values_size = (size_t)n_genes * n_spots * sizeof(double);
     matrix->values = (double*)mkl_malloc(values_size, 64);
     matrix->rownames = (char**)calloc(n_genes, sizeof(char*));
     matrix->colnames = colnames; // Transfer ownership
@@ -4445,23 +4485,22 @@ DenseMatrix* read_vst_file(const char* filename) {
         if (matrix) {
             if (matrix->values) mkl_free(matrix->values);
             free(matrix->rownames);
-            // Don't free colnames here as it was already transferred
             free(matrix);
         }
         matrix = NULL;
         goto cleanup_and_exit;
     }
     
-    // Read data rows
-    rewind(fp);
-    getline(&line, &line_buf_size, fp); // Skip header
-    if (read_vst_data_rows(fp, &line, &line_buf_size, matrix, n_genes, n_spots) != MORANS_I_SUCCESS) {
+    // Read data rows with format detection
+    fseek(fp, header_pos, SEEK_SET);
+    int data_result = read_vst_data_rows(fp, &line, &line_buf_size, matrix, n_genes, n_spots, is_csv);
+    if (data_result != MORANS_I_SUCCESS) {
         free_dense_matrix(matrix);
         matrix = NULL;
         goto cleanup_and_exit;
     }
     
-    printf("Successfully loaded VST data: %lld genes x %lld spots from '%s'.\n",
+    printf("Successfully loaded expression data: %lld genes x %lld spots from '%s'.\n",
            (long long)matrix->nrows, (long long)matrix->ncols, filename);
 
 cleanup_and_exit:
@@ -4473,9 +4512,7 @@ cleanup_and_exit:
         free(colnames);
     }
     fclose(fp);
-    cleanup_list_destroy(&cleanup);
     
-    DEBUG_MATRIX_INFO(matrix, "loaded_vst");
     return matrix;
 }
 
@@ -6432,7 +6469,7 @@ int map_expression_to_coordinates(const DenseMatrix* expr_matrix, const SpotCoor
     return MORANS_I_SUCCESS;
 }
 
-/* Read coordinates from TSV file for single-cell data */
+/* Read coordinates from CSV/TSV file for single-cell data */
 SpotCoordinates* read_coordinates_file(const char* filename, const char* id_column_name,
                                      const char* x_column_name, const char* y_column_name,
                                      double coord_scale) {
@@ -6446,6 +6483,10 @@ SpotCoordinates* read_coordinates_file(const char* filename, const char* id_colu
         fprintf(stderr, "Error: Failed to open coordinates file '%s': %s\n", filename, strerror(errno)); 
         return NULL;
     }
+
+    // DETECT DELIMITER
+    char delimiter = detect_file_delimiter(filename);
+    printf("Reading coordinates from '%s' with delimiter '%c'\n", filename, delimiter);
 
     char *line = NULL; 
     size_t line_buf_size = 0; 
@@ -6475,16 +6516,28 @@ SpotCoordinates* read_coordinates_file(const char* filename, const char* id_colu
         return NULL;
     }
     
-    char* token_h = strtok(header_copy, "\t");
+    // Use strsep instead of strtok to preserve empty tokens
+    char delim_str[2] = {delimiter, '\0'};
+    char* header_ptr = header_copy;
+    char* token_h;
     int current_col_idx = 0;
-    while (token_h) {
+    
+    while ((token_h = strsep(&header_ptr, delim_str)) != NULL) {
         char* trimmed_token = trim_whitespace_inplace(token_h);
         
-        if (strcmp(trimmed_token, id_column_name) == 0) id_col_idx = current_col_idx;
-        if (strcmp(trimmed_token, x_column_name) == 0) x_col_idx = current_col_idx;
-        if (strcmp(trimmed_token, y_column_name) == 0) y_col_idx = current_col_idx;
+        // Only match non-empty column names (skip leading comma columns)
+        if (strlen(trimmed_token) > 0) {
+            if (strcmp(trimmed_token, id_column_name) == 0) {
+                id_col_idx = current_col_idx;
+            }
+            if (strcmp(trimmed_token, x_column_name) == 0) {
+                x_col_idx = current_col_idx;
+            }
+            if (strcmp(trimmed_token, y_column_name) == 0) {
+                y_col_idx = current_col_idx;
+            }
+        }
         
-        token_h = strtok(NULL, "\t"); 
         current_col_idx++;
         header_field_count++;
     }
@@ -6548,7 +6601,6 @@ SpotCoordinates* read_coordinates_file(const char* filename, const char* id_colu
 
     // Read data lines
     MKL_INT spot_fill_idx = 0; 
-    // Removed unused variable data_file_lineno
     
     while ((line_len = getline(&line, &line_buf_size, fp)) > 0 && spot_fill_idx < num_data_lines) {
         char* p_chk = line; 
@@ -6571,8 +6623,9 @@ SpotCoordinates* read_coordinates_file(const char* filename, const char* id_colu
         int actual_tokens = 0;
         char* current_ptr = data_line_copy;
         
+        // Use strsep to preserve empty tokens (consistent with header parsing)
         for(int k = 0; k < header_field_count; ++k) {
-            field_tokens[k] = strsep(&current_ptr, "\t");
+            field_tokens[k] = strsep(&current_ptr, delim_str);
             if(field_tokens[k] == NULL) break;
             actual_tokens++;
         }
@@ -6580,18 +6633,20 @@ SpotCoordinates* read_coordinates_file(const char* filename, const char* id_colu
         char* id_str = NULL; 
         double x_val = NAN, y_val = NAN;
         
-        if (id_col_idx < actual_tokens && field_tokens[id_col_idx] != NULL) {
-            id_str = field_tokens[id_col_idx];
+        if (id_col_idx >= 0 && id_col_idx < actual_tokens && field_tokens[id_col_idx] != NULL) {
+            id_str = trim_whitespace_inplace(field_tokens[id_col_idx]);
         }
-        if (x_col_idx < actual_tokens && field_tokens[x_col_idx] != NULL) { 
+        if (x_col_idx >= 0 && x_col_idx < actual_tokens && field_tokens[x_col_idx] != NULL) { 
+            char* x_token = trim_whitespace_inplace(field_tokens[x_col_idx]);
             char* end_x; 
-            x_val = strtod(field_tokens[x_col_idx], &end_x); 
-            if (end_x == field_tokens[x_col_idx]) x_val = NAN;
+            x_val = strtod(x_token, &end_x); 
+            if (end_x == x_token || *end_x != '\0') x_val = NAN;
         }
-        if (y_col_idx < actual_tokens && field_tokens[y_col_idx] != NULL) { 
+        if (y_col_idx >= 0 && y_col_idx < actual_tokens && field_tokens[y_col_idx] != NULL) { 
+            char* y_token = trim_whitespace_inplace(field_tokens[y_col_idx]);
             char* end_y; 
-            y_val = strtod(field_tokens[y_col_idx], &end_y); 
-            if (end_y == field_tokens[y_col_idx]) y_val = NAN;
+            y_val = strtod(y_token, &end_y); 
+            if (end_y == y_token || *end_y != '\0') y_val = NAN;
         }
 
         if (id_str && strlen(id_str) > 0 && isfinite(x_val) && isfinite(y_val)) {
