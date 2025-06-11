@@ -517,46 +517,73 @@ static int parse_celltype_header(const char* header_line, char delimiter,
 }
 
 /* Collect unique cell types from file */
+/*
+ * FINAL CORRECTED VERSION of collect_unique_celltypes
+ * This version is robust and does not modify the line buffer from getline.
+ */
 static char** collect_unique_celltypes(FILE* fp, char delimiter, int type_col_idx, 
                                       MKL_INT* n_celltypes_out, MKL_INT* n_cells_out) {
     if (!fp || type_col_idx < 0 || !n_celltypes_out || !n_cells_out) {
         return NULL;
     }
-    
-    long current_pos = ftell(fp);
+
+    long original_pos = ftell(fp);
+    if (fseek(fp, 0, SEEK_END) != 0) return NULL;
+    //long file_size = ftell(fp);
+    fseek(fp, original_pos, SEEK_SET); // Go back to where we were
+
     char* line = NULL;
     size_t line_buf_size = 0;
     ssize_t line_len;
-    
-    // First pass: collect all cell types
+
     char** temp_celltypes = NULL;
     MKL_INT temp_capacity = 100;
     MKL_INT temp_count = 0;
     MKL_INT cell_count = 0;
-    
+
     temp_celltypes = (char**)malloc(temp_capacity * sizeof(char*));
     if (!temp_celltypes) {
         perror("malloc temp_celltypes");
         return NULL;
     }
-    
-    char delim_str[2] = {delimiter, '\0'};
-    
+
+    char field_buffer[BUFFER_SIZE]; // Temporary buffer for the field
+
     while ((line_len = getline(&line, &line_buf_size, fp)) > 0) {
+        // Skip empty or whitespace-only lines
         char* p = line;
         while(isspace((unsigned char)*p)) p++;
-        if(*p == '\0') continue; // Skip empty lines
+        if(*p == '\0') continue;
         
-        char* line_copy = strdup(line);
-        if (!line_copy) continue;
+        // Find the correct field without using strtok
+        const char* start = line;
+        int current_col = 0;
         
-        char* token = strtok(line_copy, delim_str);
-        int col_idx = 0;
-        
-        while (token && col_idx <= type_col_idx) {
-            if (col_idx == type_col_idx) {
-                char* celltype = trim_whitespace_inplace(token);
+        // Find the start of the target column
+        while (current_col < type_col_idx && *start) {
+            if (*start == delimiter) {
+                current_col++;
+            }
+            start++;
+        }
+
+        if (current_col == type_col_idx) {
+            // Find the end of the field
+            const char* end = start;
+            while (*end && *end != delimiter && *end != '\n' && *end != '\r') {
+                end++;
+            }
+
+            // Copy the field into our buffer
+            size_t field_len = end - start;
+            if (field_len < BUFFER_SIZE) {
+                strncpy(field_buffer, start, field_len);
+                field_buffer[field_len] = '\0';
+
+                char* celltype = trim_whitespace_inplace(field_buffer);
                 if (strlen(celltype) > 0) {
+                    cell_count++;
+                    
                     // Check if this cell type is already in our list
                     int found = 0;
                     for (MKL_INT i = 0; i < temp_count; i++) {
@@ -571,48 +598,39 @@ static char** collect_unique_celltypes(FILE* fp, char delimiter, int type_col_id
                             temp_capacity *= 2;
                             char** new_temp = (char**)realloc(temp_celltypes, temp_capacity * sizeof(char*));
                             if (!new_temp) {
-                                for (MKL_INT i = 0; i < temp_count; i++) {
-                                    free(temp_celltypes[i]);
-                                }
+                                // Handle realloc failure
+                                for(MKL_INT i=0; i<temp_count; ++i) free(temp_celltypes[i]);
                                 free(temp_celltypes);
-                                free(line_copy);
-                                if (line) free(line);
+                                free(line);
+                                fseek(fp, original_pos, SEEK_SET);
                                 return NULL;
                             }
                             temp_celltypes = new_temp;
                         }
                         temp_celltypes[temp_count] = strdup(celltype);
                         if (!temp_celltypes[temp_count]) {
-                            perror("strdup celltype");
-                            for (MKL_INT i = 0; i < temp_count; i++) {
-                                free(temp_celltypes[i]);
-                            }
-                            free(temp_celltypes);
-                            free(line_copy);
-                            if (line) free(line);
-                            return NULL;
+                            // Handle strdup failure
+                             for(MKL_INT i=0; i<temp_count; ++i) free(temp_celltypes[i]);
+                             free(temp_celltypes);
+                             free(line);
+                             fseek(fp, original_pos, SEEK_SET);
+                             return NULL;
                         }
                         temp_count++;
                     }
-                    cell_count++;
                 }
-                break;
             }
-            token = strtok(NULL, delim_str);
-            col_idx++;
         }
-        free(line_copy);
     }
-    
-    if (line) free(line);
-    fseek(fp, current_pos, SEEK_SET);
-    
+
+    free(line);
+    fseek(fp, original_pos, SEEK_SET);
+
     *n_celltypes_out = temp_count;
     *n_cells_out = cell_count;
-    
-    printf("Found %lld unique cell types from %lld cells\n", 
-           (long long)temp_count, (long long)cell_count);
-    
+
+    printf("Found %lld unique cell types from %lld cells\n", (long long)temp_count, (long long)cell_count);
+
     return temp_celltypes;
 }
 
@@ -2001,13 +2019,17 @@ DenseMatrix* calculate_residual_morans_i_matrix(const DenseMatrix* R_normalized,
 
 /* Main residual Moran's I calculation function */
 ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTypeMatrix* Z, 
-                                           const SparseMatrix* W, const ResidualConfig* config) {
+                                           const SparseMatrix* W, const ResidualConfig* config,
+                                           int verbose) { // Add verbose parameter
     if (!X || !Z || !W || !config) {
         fprintf(stderr, "Error: NULL parameters in calculate_residual_morans_i\n");
         return NULL;
     }
     
-    printf("Starting residual Moran's I analysis...\n");
+    // Wrap the initial print in the verbose check
+    if (verbose) {
+        printf("Starting residual Moran's I analysis...\n");
+    }
     
     ResidualResults* results = (ResidualResults*)calloc(1, sizeof(ResidualResults));
     if (!results) {
@@ -2015,8 +2037,10 @@ ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTyp
         return NULL;
     }
     
-    // Step 1: Compute regression coefficients B̂ = (Z^T Z + λI)^(-1) Z^T X^T
-    printf("Step 1: Computing regression coefficients...\n");
+    // Step 1: Compute regression coefficients B̂
+    if (verbose) printf("Step 1: Computing regression coefficients...\n");
+    // We will need to thread this verbose flag down to sub-functions as well.
+    // Let's assume for now sub-functions also get a verbose flag.
     results->regression_coefficients = compute_regression_coefficients(Z, X, config->regularization_lambda);
     if (!results->regression_coefficients) {
         fprintf(stderr, "Error: Failed to compute regression coefficients\n");
@@ -2024,8 +2048,8 @@ ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTyp
         return NULL;
     }
     
-    // Step 2: Compute residual projection matrix M_res = I - Z(Z^T Z + λI)^(-1) Z^T
-    printf("Step 2: Computing residual projection matrix...\n");
+    // Step 2: Compute residual projection matrix M_res
+    if (verbose) printf("Step 2: Computing residual projection matrix...\n");
     DenseMatrix* M_res = compute_residual_projection_matrix(Z, config->regularization_lambda);
     if (!M_res) {
         fprintf(stderr, "Error: Failed to compute residual projection matrix\n");
@@ -2034,7 +2058,7 @@ ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTyp
     }
     
     // Step 3: Apply residual projection R = X * M_res
-    printf("Step 3: Applying residual projection...\n");
+    if (verbose) printf("Step 3: Applying residual projection...\n");
     DenseMatrix* R = apply_residual_projection(X, M_res);
     free_dense_matrix(M_res); // Free intermediate matrix
     if (!R) {
@@ -2044,7 +2068,7 @@ ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTyp
     }
     
     // Step 4: Center residuals R_rc = R * H_n
-    printf("Step 4: Centering residuals...\n");
+    if (verbose) printf("Step 4: Centering residuals...\n");
     DenseMatrix* R_centered = center_matrix_columns(R);
     free_dense_matrix(R); // Free intermediate matrix
     if (!R_centered) {
@@ -2059,7 +2083,7 @@ ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTyp
     // Step 5: Normalize residuals R_normalized = D * R_rc (if requested)
     DenseMatrix* R_normalized;
     if (config->normalize_residuals) {
-        printf("Step 5: Normalizing residuals...\n");
+        if (verbose) printf("Step 5: Normalizing residuals...\n");
         R_normalized = normalize_matrix_rows(R_centered);
         if (!R_normalized) {
             fprintf(stderr, "Error: Failed to normalize residuals\n");
@@ -2067,7 +2091,7 @@ ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTyp
             return NULL;
         }
     } else {
-        printf("Step 5: Skipping residual normalization (as requested)\n");
+        if (verbose) printf("Step 5: Skipping residual normalization (as requested)\n");
         // Use centered residuals directly
         R_normalized = (DenseMatrix*)malloc(sizeof(DenseMatrix));
         if (!R_normalized) {
@@ -2080,7 +2104,7 @@ ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTyp
     }
     
     // Step 6: Compute residual Moran's I I_R = (1/S0) R_normalized W R_normalized^T
-    printf("Step 6: Computing residual Moran's I...\n");
+    if (verbose) printf("Step 6: Computing residual Moran's I...\n");
     results->residual_morans_i = calculate_residual_morans_i_matrix(R_normalized, W);
     
     if (config->normalize_residuals) {
@@ -2095,7 +2119,9 @@ ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTyp
         return NULL;
     }
     
-    printf("Residual Moran's I analysis completed successfully.\n");
+    if (verbose) {
+        printf("Residual Moran's I analysis completed successfully.\n");
+    }
     return results;
 }
 
@@ -2171,7 +2197,7 @@ static int residual_permutation_worker(const DenseMatrix* X_original,
         
         // Calculate residual Moran's I for permuted data
         // This involves the full residual analysis pipeline
-        ResidualResults* perm_results = calculate_residual_morans_i(&X_perm, Z, W, config);
+        ResidualResults* perm_results = calculate_residual_morans_i(&X_perm, Z, W, config, 0); // Pass 0 for verbose
         if (!perm_results || !perm_results->residual_morans_i) {
             DEBUG_PRINT("Thread %d: Permutation %d failed", thread_id, perm);
             if (perm_results) free_residual_results(perm_results);
@@ -2239,7 +2265,7 @@ PermutationResults* run_residual_permutation_test(const DenseMatrix* X, const Ce
            n_perm, (long long)n_genes);
 
     // Calculate observed residual Moran's I for comparison
-    ResidualResults* observed_residual_results = calculate_residual_morans_i(X, Z, W, config);
+    ResidualResults* observed_residual_results = calculate_residual_morans_i(X, Z, W, config, 0);
     if (!observed_residual_results || !observed_residual_results->residual_morans_i) {
         fprintf(stderr, "Error: Failed to calculate observed residual Moran's I for permutation test\n");
         if (observed_residual_results) free_residual_results(observed_residual_results);
@@ -4619,8 +4645,8 @@ DenseMatrix* calculate_morans_i(const DenseMatrix* X, const SparseMatrix* W, int
     /* Calculate scaling factor based on row normalization */
     double scaling_factor;
     if (row_normalized) {
-        scaling_factor = 1.0;
-        printf("  Using row-normalized weights (scaling factor = 1.0)\n");
+        scaling_factor = 1.0 / (double)n_spots;  // Correct scaling
+        printf("  Using row-normalized weights (scaling factor = 1.0 / n_spots)\n");
     } else {
         double S0 = calculate_weight_sum(W);
         printf("  Sum of weights S0: %.6f\n", S0);
@@ -4751,7 +4777,7 @@ double calculate_single_gene_moran_i(const double* gene_data, const SparseMatrix
     /* Calculate scaling factor based on row normalization */
     double scaling_factor;
     if (row_normalized) {
-        scaling_factor = 1.0;
+        scaling_factor = 1.0 / (double)n_spots;  // Correct scaling
     } else {
         double S0 = calculate_weight_sum(W);
         if (fabs(S0) < DBL_EPSILON) {
@@ -4817,7 +4843,7 @@ double* calculate_first_gene_vs_all(const DenseMatrix* X, const SparseMatrix* W,
     /* Calculate scaling factor based on row normalization */
     double scaling_factor;
     if (row_normalized) {
-        scaling_factor = 1.0;
+        scaling_factor = 1.0 / (double)n_spots;  // Correct scaling
     } else {
         double S0 = S0_param;
         if (fabs(S0_param) < DBL_EPSILON) {
@@ -5082,8 +5108,8 @@ PermutationResults* run_permutation_test(const DenseMatrix* X_observed_spots_x_g
     /* Calculate scaling factor based on row normalization */
     double scaling_factor;
     if (row_normalized) {
-        scaling_factor = 1.0;
-        printf("  Permutation Test: Using row-normalized weights (scaling factor = 1.0)\n");
+        scaling_factor = 1.0 / (double)n_spots;  // Correct scaling
+        printf("  Permutation Test: Using row-normalized weights (scaling factor = 1.0 / n_spots)\n");
     } else {
         double S0 = calculate_weight_sum(W_spots_x_spots);
         if (fabs(S0) < DBL_EPSILON) {

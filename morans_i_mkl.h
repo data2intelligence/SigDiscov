@@ -296,7 +296,8 @@ double* calculate_morans_i_batch(const double* X_data_spots_x_genes, long long n
 
 /* Residual Moran's I Core Calculation */
 ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTypeMatrix* Z, 
-                                           const SparseMatrix* W, const ResidualConfig* config);
+                                           const SparseMatrix* W, const ResidualConfig* config,
+                                           int verbose);
 DenseMatrix* calculate_residual_morans_i_matrix(const DenseMatrix* R_normalized, const SparseMatrix* W);
 
 /* Permutation Testing */

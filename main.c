@@ -1279,7 +1279,7 @@ static int run_residual_analysis(const MoransIConfig* config, AnalysisResources*
 
     start_time = get_time();
     resources->residual_results = calculate_residual_morans_i(resources->X_calc, mapped_celltype, 
-                                                            resources->W_matrix, &config->residual_config);
+                                                            resources->W_matrix, &config->residual_config, 1);
     end_time = get_time();
     print_elapsed_time(start_time, end_time, "Residual Moran's I calculation");
 

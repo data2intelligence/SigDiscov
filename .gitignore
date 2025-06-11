@@ -3,6 +3,7 @@
 /datasets/
 /raw_data/
 /processed_data/
+/results/
 
 # Ignore common data file types
 *.csv
