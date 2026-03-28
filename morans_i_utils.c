@@ -59,9 +59,8 @@ SpotNameHashTable* spot_name_ht_create(size_t num_spots_hint) {
         return NULL;
     }
 
-    // Aim for load factor around 1.0, choose prime number of buckets.
-    // Ensure num_buckets is at least a small prime if hint is 0 or very small.
-    size_t buckets_n = (num_spots_hint > 16) ? num_spots_hint : 17; // Use 17 as a small prime default
+    // Aim for load factor ~0.5 for fewer collisions. Choose prime bucket count.
+    size_t buckets_n = (num_spots_hint > 16) ? num_spots_hint * 2 : 37;
     ht->num_buckets = get_next_prime(buckets_n);
 
     ht->buckets = (SpotNameHashNode**)calloc(ht->num_buckets, sizeof(SpotNameHashNode*));

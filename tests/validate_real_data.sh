@@ -59,43 +59,51 @@ echo "Line counts match: $actual_lines"
 
 python3 -c "
 import sys
+import numpy as np
 
 tolerance = 1e-6
 expected_file = '$EXPECTED'
 actual_file = '$ACTUAL'
 
+# Load as ragged text, parse each row as floats
+print('Loading expected output...')
+e_rows = []
+with open(expected_file) as f:
+    for line in f:
+        e_rows.append(np.array(line.strip().split('\t'), dtype=np.float64))
+
+print('Loading actual output...')
+a_rows = []
+with open(actual_file) as f:
+    for line in f:
+        a_rows.append(np.array(line.strip().split('\t'), dtype=np.float64))
+
+if len(e_rows) != len(a_rows):
+    print(f'FAIL: Row count mismatch: expected={len(e_rows)} actual={len(a_rows)}')
+    sys.exit(1)
+
+total_count = 0
 max_diff = 0.0
 diff_count = 0
-total_count = 0
 
-with open(expected_file) as ef, open(actual_file) as af:
-    for line_num, (e_line, a_line) in enumerate(zip(ef, af), 1):
-        e_vals = e_line.strip().split('\t')
-        a_vals = a_line.strip().split('\t')
+for line_num, (e_vals, a_vals) in enumerate(zip(e_rows, a_rows), 1):
+    if len(e_vals) != len(a_vals):
+        print(f'FAIL: Column count mismatch at line {line_num}: expected={len(e_vals)} actual={len(a_vals)}')
+        sys.exit(1)
+    diffs = np.abs(e_vals - a_vals)
+    row_max = diffs.max()
+    if row_max > max_diff:
+        max_diff = row_max
+    bad = diffs > tolerance
+    n_bad = bad.sum()
+    total_count += len(e_vals)
+    if n_bad > 0 and diff_count < 5:
+        idxs = np.where(bad)[0]
+        for idx in idxs[:5 - diff_count]:
+            print(f'  Diff at line {line_num}, col {idx+1}: expected={e_vals[idx]:.10f} actual={a_vals[idx]:.10f} diff={diffs[idx]:.2e}')
+    diff_count += n_bad
 
-        if len(e_vals) != len(a_vals):
-            print(f'FAIL: Column count mismatch at line {line_num}: expected={len(e_vals)} actual={len(a_vals)}')
-            sys.exit(1)
-
-        for col, (ev, av) in enumerate(zip(e_vals, a_vals)):
-            total_count += 1
-            try:
-                e_float = float(ev)
-                a_float = float(av)
-                diff = abs(e_float - a_float)
-                if diff > max_diff:
-                    max_diff = diff
-                if diff > tolerance:
-                    diff_count += 1
-                    if diff_count <= 5:
-                        print(f'  Diff at line {line_num}, col {col+1}: expected={e_float:.10f} actual={a_float:.10f} diff={diff:.2e}')
-            except ValueError:
-                if ev.strip() != av.strip():
-                    diff_count += 1
-                    if diff_count <= 5:
-                        print(f'  String mismatch at line {line_num}, col {col+1}: expected=\"{ev}\" actual=\"{av}\"')
-
-print(f'')
+print()
 print(f'Total values compared: {total_count}')
 print(f'Max absolute difference: {max_diff:.2e}')
 print(f'Values exceeding tolerance ({tolerance}): {diff_count}')

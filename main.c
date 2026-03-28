@@ -7,17 +7,17 @@
 #include <unistd.h>
 #include "morans_i_internal.h"
 
-/* Argument parsing helper macros */
-#define REQUIRE_ARG(flag) do { \
-    if (++i >= argc) { \
+/* Argument parsing helper macros -- _i, _argc, _argv are explicit to avoid implicit capture */
+#define REQUIRE_ARG(_i, _argc, flag) do { \
+    if (++(_i) >= (_argc)) { \
         fprintf(stderr, "Error: Missing value for %s\n", flag); \
         return MORANS_I_ERROR_PARAMETER; \
     } \
 } while(0)
 
-#define PARSE_STRING_ARG(flag, dest) do { \
-    REQUIRE_ARG(flag); \
-    strncpy(dest, argv[i], BUFFER_SIZE - 1); \
+#define PARSE_STRING_ARG(_i, _argc, _argv, flag, dest) do { \
+    REQUIRE_ARG(_i, _argc, flag); \
+    strncpy(dest, (_argv)[_i], BUFFER_SIZE - 1); \
     dest[BUFFER_SIZE - 1] = '\0'; \
 } while(0)
 
@@ -83,8 +83,7 @@ static int setup_builtin_spatial_weights(const MoransIConfig* config, const Comm
 static int setup_custom_spatial_weights(const MoransIConfig* config, AnalysisResources* resources);
 static int prepare_valid_spot_arrays(AnalysisResources* resources);
 static int map_spots_to_expression(AnalysisResources* resources);
-static int prepare_calculation_matrix_builtin(AnalysisResources* resources);
-static int prepare_calculation_matrix_custom(AnalysisResources* resources);
+static int prepare_calculation_matrix(AnalysisResources* resources, int is_builtin);
 static int load_celltype_data(const MoransIConfig* config, const CommandLineArgs* args, AnalysisResources* resources);
 static int run_moran_analysis(const MoransIConfig* config, AnalysisResources* resources, const char* output_prefix);
 static int run_residual_analysis(const MoransIConfig* config, AnalysisResources* resources, const char* output_prefix);
@@ -201,29 +200,29 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0) {
-            PARSE_STRING_ARG("-i", args->input_file);
+            PARSE_STRING_ARG(i, argc, argv, "-i", args->input_file);
 
         } else if (strcmp(argv[i], "-o") == 0) {
-            PARSE_STRING_ARG("-o", args->output_prefix);
+            PARSE_STRING_ARG(i, argc, argv, "-o", args->output_prefix);
 
         } else if (strcmp(argv[i], "--run-toy-example") == 0) {
             args->run_toy_example = 2;
 
         } else if (strcmp(argv[i], "-c") == 0) {
-            PARSE_STRING_ARG("-c", args->meta_file);
+            PARSE_STRING_ARG(i, argc, argv, "-c", args->meta_file);
             args->use_metadata_file = 1;
 
         } else if (strcmp(argv[i], "--id-col") == 0) {
-            PARSE_STRING_ARG("--id-col", args->id_column);
+            PARSE_STRING_ARG(i, argc, argv, "--id-col", args->id_column);
 
         } else if (strcmp(argv[i], "--x-col") == 0) {
-            PARSE_STRING_ARG("--x-col", args->x_column);
+            PARSE_STRING_ARG(i, argc, argv, "--x-col", args->x_column);
 
         } else if (strcmp(argv[i], "--y-col") == 0) {
-            PARSE_STRING_ARG("--y-col", args->y_column);
+            PARSE_STRING_ARG(i, argc, argv, "--y-col", args->y_column);
 
         } else if (strcmp(argv[i], "--scale") == 0) {
-            REQUIRE_ARG("--scale");
+            REQUIRE_ARG(i, argc, "--scale");
             config->coord_scale = load_double_value(argv[i], "--scale");
             if (isnan(config->coord_scale) || config->coord_scale <= 0) {
                 fprintf(stderr, "Error: --scale must be a positive number.\n");
@@ -231,21 +230,21 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             }
 
         } else if (strcmp(argv[i], "--sigma") == 0) {
-            REQUIRE_ARG("--sigma");
+            REQUIRE_ARG(i, argc, "--sigma");
             args->custom_sigma = load_double_value(argv[i], "--sigma");
             if (isnan(args->custom_sigma)) {
                 return MORANS_I_ERROR_PARAMETER;
             }
 
         } else if (strcmp(argv[i], "-r") == 0) {
-            REQUIRE_ARG("-r");
+            REQUIRE_ARG(i, argc, "-r");
             config->max_radius = load_positive_value(argv[i], "-r", 1, 1000);
             if (config->max_radius < 0) {
                 return MORANS_I_ERROR_PARAMETER;
             }
 
         } else if (strcmp(argv[i], "-w") == 0) {
-            REQUIRE_ARG("-w");
+            REQUIRE_ARG(i, argc, "-w");
             if (config->custom_weights_file) free(config->custom_weights_file);
             config->custom_weights_file = strdup(argv[i]);
             if (!config->custom_weights_file) {
@@ -255,7 +254,7 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             config->platform_mode = CUSTOM_WEIGHTS;
 
         } else if (strcmp(argv[i], "--weight-format") == 0) {
-            REQUIRE_ARG("--weight-format");
+            REQUIRE_ARG(i, argc, "--weight-format");
             config->weight_format = parse_weight_format(argv[i]);
 
         } else if (strcmp(argv[i], "--normalize-weights") == 0) {
@@ -273,42 +272,42 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             }
 
         } else if (strcmp(argv[i], "-p") == 0) {
-            REQUIRE_ARG("-p");
+            REQUIRE_ARG(i, argc, "-p");
             config->platform_mode = load_positive_value(argv[i], "-p", 0, 3);
             if (config->platform_mode < 0) {
                 return MORANS_I_ERROR_PARAMETER;
             }
 
         } else if (strcmp(argv[i], "-b") == 0) {
-            REQUIRE_ARG("-b");
+            REQUIRE_ARG(i, argc, "-b");
             config->calc_pairwise = load_positive_value(argv[i], "-b", 0, 1);
             if (config->calc_pairwise < 0) {
                 return MORANS_I_ERROR_PARAMETER;
             }
 
         } else if (strcmp(argv[i], "-g") == 0) {
-            REQUIRE_ARG("-g");
+            REQUIRE_ARG(i, argc, "-g");
             config->calc_all_vs_all = load_positive_value(argv[i], "-g", 0, 1);
             if (config->calc_all_vs_all < 0) {
                 return MORANS_I_ERROR_PARAMETER;
             }
 
         } else if (strcmp(argv[i], "-s") == 0) {
-            REQUIRE_ARG("-s");
+            REQUIRE_ARG(i, argc, "-s");
             config->include_same_spot = load_positive_value(argv[i], "-s", 0, 1);
             if (config->include_same_spot < 0) {
                 return MORANS_I_ERROR_PARAMETER;
             }
 
         } else if (strcmp(argv[i], "-t") == 0) {
-            REQUIRE_ARG("-t");
+            REQUIRE_ARG(i, argc, "-t");
             config->n_threads = load_positive_value(argv[i], "-t", 1, 1024);
             if (config->n_threads < 0) {
                 return MORANS_I_ERROR_PARAMETER;
             }
 
         } else if (strcmp(argv[i], "-m") == 0) {
-            REQUIRE_ARG("-m");
+            REQUIRE_ARG(i, argc, "-m");
             config->mkl_n_threads = load_positive_value(argv[i], "-m", 1, 1024);
             if (config->mkl_n_threads < 0) {
                 return MORANS_I_ERROR_PARAMETER;
@@ -319,7 +318,7 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             config->run_permutations = 1;
 
         } else if (strcmp(argv[i], "--num-perm") == 0) {
-            REQUIRE_ARG("--num-perm");
+            REQUIRE_ARG(i, argc, "--num-perm");
             config->num_permutations = load_positive_value(argv[i], "--num-perm", 1, 10000000);
             if (config->num_permutations < 0) {
                 return MORANS_I_ERROR_PARAMETER;
@@ -327,7 +326,7 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             config->run_permutations = 1;
 
         } else if (strcmp(argv[i], "--perm-seed") == 0) {
-            REQUIRE_ARG("--perm-seed");
+            REQUIRE_ARG(i, argc, "--perm-seed");
             char* endptr = NULL;
             errno = 0;
             long seed_val = strtol(argv[i], &endptr, 10);
@@ -361,14 +360,14 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
 
         /* Residual analysis options */
         } else if (strcmp(argv[i], "--analysis-mode") == 0) {
-            REQUIRE_ARG("--analysis-mode");
+            REQUIRE_ARG(i, argc, "--analysis-mode");
             config->residual_config.analysis_mode = parse_analysis_mode(argv[i]);
             if (config->residual_config.analysis_mode < 0) {
                 return MORANS_I_ERROR_PARAMETER;
             }
 
         } else if (strcmp(argv[i], "--celltype-file") == 0) {
-            REQUIRE_ARG("--celltype-file");
+            REQUIRE_ARG(i, argc, "--celltype-file");
             if (config->residual_config.celltype_file) free(config->residual_config.celltype_file);
             config->residual_config.celltype_file = strdup(argv[i]);
             if (!config->residual_config.celltype_file) {
@@ -378,14 +377,14 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             config->residual_config.analysis_mode = ANALYSIS_MODE_RESIDUAL;
 
         } else if (strcmp(argv[i], "--celltype-format") == 0) {
-            REQUIRE_ARG("--celltype-format");
+            REQUIRE_ARG(i, argc, "--celltype-format");
             config->residual_config.celltype_format = parse_celltype_format(argv[i]);
             if (config->residual_config.celltype_format < 0) {
                 return MORANS_I_ERROR_PARAMETER;
             }
 
         } else if (strcmp(argv[i], "--celltype-id-col") == 0) {
-            REQUIRE_ARG("--celltype-id-col");
+            REQUIRE_ARG(i, argc, "--celltype-id-col");
             if (config->residual_config.celltype_id_col) free(config->residual_config.celltype_id_col);
             config->residual_config.celltype_id_col = strdup(argv[i]);
             if (!config->residual_config.celltype_id_col) {
@@ -394,7 +393,7 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             }
 
         } else if (strcmp(argv[i], "--celltype-type-col") == 0) {
-            REQUIRE_ARG("--celltype-type-col");
+            REQUIRE_ARG(i, argc, "--celltype-type-col");
             if (config->residual_config.celltype_type_col) free(config->residual_config.celltype_type_col);
             config->residual_config.celltype_type_col = strdup(argv[i]);
             if (!config->residual_config.celltype_type_col) {
@@ -403,7 +402,7 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             }
 
         } else if (strcmp(argv[i], "--celltype-x-col") == 0) {
-            REQUIRE_ARG("--celltype-x-col");
+            REQUIRE_ARG(i, argc, "--celltype-x-col");
             if (config->residual_config.celltype_x_col) free(config->residual_config.celltype_x_col);
             config->residual_config.celltype_x_col = strdup(argv[i]);
             if (!config->residual_config.celltype_x_col) {
@@ -412,7 +411,7 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             }
 
         } else if (strcmp(argv[i], "--celltype-y-col") == 0) {
-            REQUIRE_ARG("--celltype-y-col");
+            REQUIRE_ARG(i, argc, "--celltype-y-col");
             if (config->residual_config.celltype_y_col) free(config->residual_config.celltype_y_col);
             config->residual_config.celltype_y_col = strdup(argv[i]);
             if (!config->residual_config.celltype_y_col) {
@@ -421,7 +420,7 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             }
 
         } else if (strcmp(argv[i], "--spot-id-col") == 0) {
-            REQUIRE_ARG("--spot-id-col");
+            REQUIRE_ARG(i, argc, "--spot-id-col");
             if (config->residual_config.spot_id_col) free(config->residual_config.spot_id_col);
             config->residual_config.spot_id_col = strdup(argv[i]);
             if (!config->residual_config.spot_id_col) {
@@ -439,7 +438,7 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             }
 
         } else if (strcmp(argv[i], "--regularization") == 0) {
-            REQUIRE_ARG("--regularization");
+            REQUIRE_ARG(i, argc, "--regularization");
             config->residual_config.regularization_lambda = load_double_value(argv[i], "--regularization");
             if (isnan(config->residual_config.regularization_lambda) ||
                 config->residual_config.regularization_lambda < 0) {
@@ -789,7 +788,7 @@ static int setup_builtin_spatial_weights(const MoransIConfig* config, const Comm
     }
 
     /* Prepare final calculation matrix */
-    if (prepare_calculation_matrix_builtin(resources) != MORANS_I_SUCCESS) {
+    if (prepare_calculation_matrix(resources, 1) != MORANS_I_SUCCESS) {
         return MORANS_I_ERROR_COMPUTATION;
     }
     
@@ -804,7 +803,7 @@ static int setup_custom_spatial_weights(const MoransIConfig* config, AnalysisRes
     start_time = get_time();
     
     /* Create X_calc by transposing znorm_matrix from genes x spots to spots x genes */
-    if (prepare_calculation_matrix_custom(resources) != MORANS_I_SUCCESS) {
+    if (prepare_calculation_matrix(resources, 0) != MORANS_I_SUCCESS) {
         return MORANS_I_ERROR_MEMORY;
     }
     
@@ -937,119 +936,99 @@ static int map_spots_to_expression(AnalysisResources* resources) {
     return MORANS_I_SUCCESS;
 }
 
-static int prepare_calculation_matrix_builtin(AnalysisResources* resources) {
-    double start_time, end_time;
-    
-    printf("Preparing final calculation matrix X_calc (Valid_Spots x Genes)...\n");
-    start_time = get_time();
-    
+/*
+ * Unified matrix preparation: transpose znorm (genes x spots) -> X_calc (spots x genes).
+ * Builtin path selects valid spots via index mapping; custom path uses all spots.
+ * Uses 64x64 cache-friendly tiling for the transpose.
+ */
+#define TILE_SIZE 64
+
+static int prepare_calculation_matrix(AnalysisResources* resources, int is_builtin) {
+    double start_time = get_time();
+
+    MKL_INT n_spots = is_builtin ? resources->num_valid_spots : resources->znorm_matrix->ncols;
+    MKL_INT n_genes = resources->znorm_matrix->nrows;
+
+    printf("Preparing calculation matrix X_calc (%lld spots x %lld genes)...\n",
+           (long long)n_spots, (long long)n_genes);
+
     resources->X_calc = (DenseMatrix*)calloc(1, sizeof(DenseMatrix));
-    if (!resources->X_calc) { 
-        perror("malloc X_calc struct"); 
-        return MORANS_I_ERROR_MEMORY; 
-    }
-    
-    resources->X_calc->nrows = resources->num_valid_spots; 
-    resources->X_calc->ncols = resources->znorm_matrix->nrows;
-    resources->X_calc->values = (double*)mkl_malloc((size_t)resources->X_calc->nrows * resources->X_calc->ncols * sizeof(double), 64);
-    resources->X_calc->rownames = (char**)calloc(resources->X_calc->nrows, sizeof(char*)); 
-    resources->X_calc->colnames = (char**)calloc(resources->X_calc->ncols, sizeof(char*)); 
-    
-    if (!resources->X_calc->values || !resources->X_calc->rownames || !resources->X_calc->colnames) {
-        perror("Memory allocation failed for X_calc components"); 
+    if (!resources->X_calc) {
+        perror("calloc X_calc struct");
         return MORANS_I_ERROR_MEMORY;
     }
 
-    /* Copy gene names */
-    for (MKL_INT g = 0; g < resources->X_calc->ncols; g++) { 
-        resources->X_calc->colnames[g] = strdup(resources->znorm_matrix->rownames[g]); 
-        if (!resources->X_calc->colnames[g]) {
-            perror("strdup X_calc gene name"); 
-            return MORANS_I_ERROR_MEMORY;
-        }
+    resources->X_calc->nrows = n_spots;
+    resources->X_calc->ncols = n_genes;
+    resources->X_calc->values = (double*)mkl_malloc((size_t)n_spots * n_genes * sizeof(double), 64);
+    resources->X_calc->rownames = (char**)calloc(n_spots, sizeof(char*));
+    resources->X_calc->colnames = (char**)calloc(n_genes, sizeof(char*));
+
+    if (!resources->X_calc->values || !resources->X_calc->rownames || !resources->X_calc->colnames) {
+        perror("Memory allocation failed for X_calc components");
+        return MORANS_I_ERROR_MEMORY;
     }
-    
-    /* Copy spot names */
-    for (MKL_INT i = 0; i < resources->X_calc->nrows; i++) { 
-        resources->X_calc->rownames[i] = strdup(resources->valid_spot_names[i]); 
-        if (!resources->X_calc->rownames[i]) {
-            perror("strdup X_calc spot name"); 
+
+    for (MKL_INT g = 0; g < n_genes; g++) {
+        resources->X_calc->colnames[g] = strdup(resources->znorm_matrix->rownames[g]);
+        if (!resources->X_calc->colnames[g]) {
+            perror("strdup X_calc gene name");
             return MORANS_I_ERROR_MEMORY;
         }
     }
 
-    /* Copy expression data for valid spots */
-    #pragma omp parallel for
-    for (MKL_INT i = 0; i < resources->X_calc->nrows; i++) { 
-        MKL_INT original_expr_col_idx = resources->valid_spot_indices[i]; 
-        for (MKL_INT j = 0; j < resources->X_calc->ncols; j++) { 
-            if (original_expr_col_idx != -1) {
-                resources->X_calc->values[i * resources->X_calc->ncols + j] = 
-                    resources->znorm_matrix->values[j * resources->znorm_matrix->ncols + original_expr_col_idx];
-            } else {
-                resources->X_calc->values[i * resources->X_calc->ncols + j] = 0.0; 
+    for (MKL_INT s = 0; s < n_spots; s++) {
+        const char* name = is_builtin
+            ? resources->valid_spot_names[s]
+            : resources->znorm_matrix->colnames[s];
+        resources->X_calc->rownames[s] = strdup(name);
+        if (!resources->X_calc->rownames[s]) {
+            perror("strdup X_calc spot name");
+            return MORANS_I_ERROR_MEMORY;
+        }
+    }
+
+    /* Tiled transpose: znorm[gene][src_col] -> X_calc[spot][gene] */
+    MKL_INT src_ncols = resources->znorm_matrix->ncols;
+    double* dst = resources->X_calc->values;
+    const double* src = resources->znorm_matrix->values;
+
+    if (is_builtin) {
+        const MKL_INT* idx = resources->valid_spot_indices;
+        #pragma omp parallel for schedule(dynamic)
+        for (MKL_INT si = 0; si < n_spots; si += TILE_SIZE) {
+            MKL_INT si_end = (si + TILE_SIZE < n_spots) ? si + TILE_SIZE : n_spots;
+            for (MKL_INT gi = 0; gi < n_genes; gi += TILE_SIZE) {
+                MKL_INT gi_end = (gi + TILE_SIZE < n_genes) ? gi + TILE_SIZE : n_genes;
+                for (MKL_INT s = si; s < si_end; s++) {
+                    MKL_INT col = idx[s];
+                    for (MKL_INT g = gi; g < gi_end; g++)
+                        dst[s * n_genes + g] = (col != -1) ? src[g * src_ncols + col] : 0.0;
+                }
+            }
+        }
+    } else {
+        #pragma omp parallel for schedule(dynamic)
+        for (MKL_INT si = 0; si < n_spots; si += TILE_SIZE) {
+            MKL_INT si_end = (si + TILE_SIZE < n_spots) ? si + TILE_SIZE : n_spots;
+            for (MKL_INT gi = 0; gi < n_genes; gi += TILE_SIZE) {
+                MKL_INT gi_end = (gi + TILE_SIZE < n_genes) ? gi + TILE_SIZE : n_genes;
+                for (MKL_INT s = si; s < si_end; s++)
+                    for (MKL_INT g = gi; g < gi_end; g++)
+                        dst[s * n_genes + g] = src[g * src_ncols + s];
             }
         }
     }
-    
-    end_time = get_time();
-    print_elapsed_time(start_time, end_time, "final X_calc matrix preparation");
 
-    /* Clean up intermediate data structures */
-    free_dense_matrix(resources->znorm_matrix);
-    resources->znorm_matrix = NULL;
-    free_spot_coordinates(resources->spot_coords);
-    resources->spot_coords = NULL;
-    
-    return MORANS_I_SUCCESS;
-}
+    print_elapsed_time(start_time, get_time(), "X_calc matrix preparation");
 
-static int prepare_calculation_matrix_custom(AnalysisResources* resources) {
-    /* Transpose the gene x spots matrix to spots x genes for X_calc */
-    resources->X_calc = (DenseMatrix*)calloc(1, sizeof(DenseMatrix));
-    if (!resources->X_calc) { 
-        perror("malloc X_calc struct"); 
-        return MORANS_I_ERROR_MEMORY; 
-    }
-    
-    resources->X_calc->nrows = resources->znorm_matrix->ncols; // spots
-    resources->X_calc->ncols = resources->znorm_matrix->nrows; // genes
-    resources->X_calc->values = (double*)mkl_malloc((size_t)resources->X_calc->nrows * resources->X_calc->ncols * sizeof(double), 64);
-    resources->X_calc->rownames = (char**)calloc(resources->X_calc->nrows, sizeof(char*)); // spot names
-    resources->X_calc->colnames = (char**)calloc(resources->X_calc->ncols, sizeof(char*)); // gene names
-    
-    if (!resources->X_calc->values || !resources->X_calc->rownames || !resources->X_calc->colnames) {
-        perror("Memory allocation failed for X_calc components"); 
-        return MORANS_I_ERROR_MEMORY;
+    if (is_builtin) {
+        free_dense_matrix(resources->znorm_matrix);
+        resources->znorm_matrix = NULL;
+        free_spot_coordinates(resources->spot_coords);
+        resources->spot_coords = NULL;
     }
 
-    /* Copy gene names (columns in X_calc) */
-    for (MKL_INT g = 0; g < resources->X_calc->ncols; g++) {
-        resources->X_calc->colnames[g] = strdup(resources->znorm_matrix->rownames[g]);
-        if (!resources->X_calc->colnames[g]) {
-            perror("strdup X_calc gene name"); 
-            return MORANS_I_ERROR_MEMORY;
-        }
-    }
-    
-    /* Copy spot names (rows in X_calc) */
-    for (MKL_INT s = 0; s < resources->X_calc->nrows; s++) {
-        resources->X_calc->rownames[s] = strdup(resources->znorm_matrix->colnames[s]);
-        if (!resources->X_calc->rownames[s]) {
-            perror("strdup X_calc spot name"); 
-            return MORANS_I_ERROR_MEMORY;
-        }
-    }
-    
-    /* Transpose data: znorm_matrix[gene][spot] -> X_calc[spot][gene] */
-    #pragma omp parallel for
-    for (MKL_INT s = 0; s < resources->X_calc->nrows; s++) {
-        for (MKL_INT g = 0; g < resources->X_calc->ncols; g++) {
-            resources->X_calc->values[s * resources->X_calc->ncols + g] = 
-                resources->znorm_matrix->values[g * resources->znorm_matrix->ncols + s];
-        }
-    }
-    
     return MORANS_I_SUCCESS;
 }
 
