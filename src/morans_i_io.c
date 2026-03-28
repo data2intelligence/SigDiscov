@@ -350,19 +350,16 @@ CellTypeMatrix* read_celltype_singlecell_file(const char* filename,
     }
 
     // Copy cell type names
-    for (MKL_INT i = 0; i < n_celltypes; i++) {
-        celltype_matrix->colnames[i] = strdup(unique_celltypes[i]);
-        if (!celltype_matrix->colnames[i]) {
-            perror("strdup cell type name");
-            free_celltype_matrix(celltype_matrix);
-            for (MKL_INT j = 0; j < n_celltypes; j++) {
-                free(unique_celltypes[j]);
-            }
-            free(unique_celltypes);
-            fclose(fp);
-            if (line) free(line);
-            return NULL;
+    if (copy_string_array(celltype_matrix->colnames, (const char**)unique_celltypes, n_celltypes) != MORANS_I_SUCCESS) {
+        perror("copy_string_array cell type names");
+        free_celltype_matrix(celltype_matrix);
+        for (MKL_INT j = 0; j < n_celltypes; j++) {
+            free(unique_celltypes[j]);
         }
+        free(unique_celltypes);
+        fclose(fp);
+        if (line) free(line);
+        return NULL;
     }
 
     // Read data and populate matrix
@@ -740,14 +737,11 @@ int map_celltype_to_expression(const CellTypeMatrix* celltype_matrix, const Dens
         }
 
         // Copy cell type names
-        for (MKL_INT j = 0; j < mapped->ncols; j++) {
-            mapped->colnames[j] = strdup(celltype_matrix->colnames[j]);
-            if (!mapped->colnames[j]) {
-                perror("strdup cell type name");
-                free_celltype_matrix(mapped);
-                spot_name_ht_free(cell_map);
-                return MORANS_I_ERROR_MEMORY;
-            }
+        if (copy_string_array(mapped->colnames, (const char**)celltype_matrix->colnames, mapped->ncols) != MORANS_I_SUCCESS) {
+            perror("copy_string_array cell type names");
+            free_celltype_matrix(mapped);
+            spot_name_ht_free(cell_map);
+            return MORANS_I_ERROR_MEMORY;
         }
 
         // Map cell type data to expression spots

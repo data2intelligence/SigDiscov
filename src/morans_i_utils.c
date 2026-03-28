@@ -417,6 +417,39 @@ PermutationResults* alloc_permutation_results(MKL_INT n_genes, const char** gene
     DenseMatrix* matrices[] = {results->mean_perm, results->var_perm, results->z_scores, results->p_values};
     int num_matrices = 2 + (params->z_score_output ? 1 : 0) + (params->p_value_output ? 1 : 0);
 
+    /* Build a source name array suitable for copy_string_array.
+     * If gene_names is NULL or contains NULL entries, use "UNKNOWN_GENE" fallback. */
+    char** fallback_names = NULL;
+    const char** names_src = gene_names;
+    int need_fallback = 0;
+    if (!gene_names) {
+        need_fallback = 1;
+    } else {
+        for (MKL_INT i = 0; i < n_genes; i++) {
+            if (!gene_names[i]) { need_fallback = 1; break; }
+        }
+    }
+    if (need_fallback) {
+        fallback_names = (char**)malloc((size_t)n_genes * sizeof(char*));
+        if (!fallback_names) {
+            perror("Failed to allocate fallback gene name array");
+            free_permutation_results(results);
+            return NULL;
+        }
+        for (MKL_INT i = 0; i < n_genes; i++) {
+            const char* src = (gene_names && gene_names[i]) ? gene_names[i] : "UNKNOWN_GENE";
+            fallback_names[i] = strdup(src);
+            if (!fallback_names[i]) {
+                perror("Failed to strdup gene name for fallback");
+                for (MKL_INT k = 0; k < i; k++) free(fallback_names[k]);
+                free(fallback_names);
+                free_permutation_results(results);
+                return NULL;
+            }
+        }
+        names_src = (const char**)fallback_names;
+    }
+
     for (int m = 0; m < num_matrices; m++) {
         if (!matrices[m]) continue;
 
@@ -428,20 +461,29 @@ PermutationResults* alloc_permutation_results(MKL_INT n_genes, const char** gene
 
         if (!matrices[m]->values || !matrices[m]->rownames || !matrices[m]->colnames) {
             perror("Failed to allocate result matrix components");
+            if (fallback_names) {
+                for (MKL_INT k = 0; k < n_genes; k++) free(fallback_names[k]);
+                free(fallback_names);
+            }
             free_permutation_results(results);
             return NULL;
         }
 
-        for (MKL_INT i = 0; i < n_genes; i++) {
-            const char* name = (gene_names && gene_names[i]) ? gene_names[i] : "UNKNOWN_GENE";
-            matrices[m]->rownames[i] = strdup(name);
-            matrices[m]->colnames[i] = strdup(name);
-            if (!matrices[m]->rownames[i] || !matrices[m]->colnames[i]) {
-                perror("Failed to duplicate gene names for permutation results");
-                free_permutation_results(results);
-                return NULL;
+        if (copy_string_array(matrices[m]->rownames, names_src, n_genes) != MORANS_I_SUCCESS ||
+            copy_string_array(matrices[m]->colnames, names_src, n_genes) != MORANS_I_SUCCESS) {
+            perror("Failed to duplicate gene names for permutation results");
+            if (fallback_names) {
+                for (MKL_INT k = 0; k < n_genes; k++) free(fallback_names[k]);
+                free(fallback_names);
             }
+            free_permutation_results(results);
+            return NULL;
         }
+    }
+
+    if (fallback_names) {
+        for (MKL_INT k = 0; k < n_genes; k++) free(fallback_names[k]);
+        free(fallback_names);
     }
 
     return results;

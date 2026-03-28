@@ -299,6 +299,7 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
                                           MKL_INT max_radius, int row_normalize);
 double calculate_weight_sum(const SparseMatrix* W);
 DenseMatrix* calculate_morans_i(const DenseMatrix* X_spots_x_genes, const SparseMatrix* W_spots_x_spots, int row_normalized);
+DenseMatrix* compute_pairwise_morans_i_scaled(const DenseMatrix* X, const SparseMatrix* W, double scaling_factor, const char* label);
 double calculate_single_gene_moran_i(const double* gene_data_vector, const SparseMatrix* W_spots_x_spots, MKL_INT n_spots, int row_normalized);
 double* calculate_first_gene_vs_all(const DenseMatrix* X_spots_x_genes, const SparseMatrix* W_spots_x_spots, double S0, int row_normalized);
 double* calculate_morans_i_batch(const double* X_data_spots_x_genes, long long n_genes, long long n_spots,

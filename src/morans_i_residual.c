@@ -667,165 +667,29 @@ DenseMatrix* calculate_residual_morans_i_matrix(const DenseMatrix* R_normalized,
         return NULL;
     }
 
-    MKL_INT n_spots = R_normalized->nrows;
     MKL_INT n_genes = R_normalized->ncols;
 
-    if (n_spots != W->nrows || n_spots != W->ncols) {
-        fprintf(stderr, "Error: Dimension mismatch between R_normalized (%lld spots x %lld genes) and W (%lldx%lld)\n",
-                (long long)n_spots, (long long)n_genes, (long long)W->nrows, (long long)W->ncols);
-        return NULL;
-    }
-
-    if (validate_matrix_dimensions(n_genes, n_genes, "Residual Moran's I result") != MORANS_I_SUCCESS) {
-        return NULL;
-    }
-
-    printf("Calculating Residual Moran's I for %lld genes using %lld spots...\n",
-           (long long)n_genes, (long long)n_spots);
-
-    DenseMatrix* result = (DenseMatrix*)malloc(sizeof(DenseMatrix));
-    if (!result) {
-        perror("Failed alloc result struct for Residual Moran's I");
-        return NULL;
-    }
-
-    result->nrows = n_genes;
-    result->ncols = n_genes;
-    result->rownames = NULL;
-    result->colnames = NULL;
-    result->values = NULL;
-
-    // Allocate with overflow protection
-    size_t result_size;
-    if (safe_multiply_size_t(n_genes, n_genes, &result_size) != 0 ||
-        safe_multiply_size_t(result_size, sizeof(double), &result_size) != 0) {
-        fprintf(stderr, "Error: Result matrix dimensions too large\n");
-        free(result);
-        return NULL;
-    }
-
-    result->values = (double*)mkl_malloc(result_size, 64);
-    result->rownames = (char**)calloc(n_genes, sizeof(char*));
-    result->colnames = (char**)calloc(n_genes, sizeof(char*));
-
-    if (!result->values || !result->rownames || !result->colnames) {
-        perror("Failed alloc result data for Residual Moran's I");
-        free_dense_matrix(result);
-        return NULL;
-    }
-
-    // Copy gene names
-    if (R_normalized->colnames) {
-        if (copy_string_array(result->rownames, (const char**)R_normalized->colnames, n_genes) != MORANS_I_SUCCESS ||
-            copy_string_array(result->colnames, (const char**)R_normalized->colnames, n_genes) != MORANS_I_SUCCESS) {
-            free_dense_matrix(result);
-            return NULL;
-        }
-    } else {
-        for (MKL_INT i = 0; i < n_genes; i++) {
-            char default_name_buf[32];
-            snprintf(default_name_buf, sizeof(default_name_buf), "Gene%lld", (long long)i);
-            result->rownames[i] = strdup(default_name_buf);
-            result->colnames[i] = strdup(default_name_buf);
-            if (!result->rownames[i] || !result->colnames[i]) {
-                perror("Failed to duplicate default gene names");
-                free_dense_matrix(result);
-                return NULL;
-            }
-        }
-    }
-
-    /* Calculate scaling factor */
+    /* Calculate scaling factor: always 1/S0 for residual */
     double S0 = calculate_weight_sum(W);
     printf("  Sum of weights S0: %.6f\n", S0);
 
     if (fabs(S0) < DBL_EPSILON) {
         fprintf(stderr, "Warning: Sum of weights S0 is near-zero (%.4e). Residual Moran's I results will be NaN/Inf or 0.\n", S0);
         if (S0 == 0.0) {
-            for(size_t i=0; i < (size_t)n_genes * n_genes; ++i) result->values[i] = NAN;
-            return result;
+            /* Allocate result via the shared function then fill with NaN */
+            DenseMatrix* nan_result = compute_pairwise_morans_i_scaled(R_normalized, W, 1.0, "residual");
+            if (nan_result) {
+                for (size_t i = 0; i < (size_t)n_genes * n_genes; ++i)
+                    nan_result->values[i] = NAN;
+            }
+            return nan_result;
         }
     }
 
     double scaling_factor = 1.0 / S0;
     printf("  Using 1/S0 = %.6e as scaling factor\n", scaling_factor);
 
-    sparse_matrix_t W_mkl;
-    if (create_sparse_handle(W, &W_mkl) != SPARSE_STATUS_SUCCESS) {
-        free_dense_matrix(result);
-        return NULL;
-    }
-
-    printf("  Step 1: Calculating Temp_WR = W * R_normalized ...\n");
-
-    size_t temp_size;
-    if (safe_multiply_size_t(n_spots, n_genes, &temp_size) != 0 ||
-        safe_multiply_size_t(temp_size, sizeof(double), &temp_size) != 0) {
-        fprintf(stderr, "Error: Temporary matrix dimensions too large\n");
-        mkl_sparse_destroy(W_mkl);
-        free_dense_matrix(result);
-        return NULL;
-    }
-
-    double* Temp_WR_values = (double*)mkl_malloc(temp_size, 64);
-    if (!Temp_WR_values) {
-        perror("Failed alloc Temp_WR_values");
-        mkl_sparse_destroy(W_mkl);
-        free_dense_matrix(result);
-        return NULL;
-    }
-
-    struct matrix_descr descrW;
-    descrW.type = SPARSE_MATRIX_TYPE_GENERAL;
-
-    double alpha_mm = 1.0, beta_mm = 0.0;
-
-    sparse_status_t status = mkl_sparse_d_mm(
-        SPARSE_OPERATION_NON_TRANSPOSE,
-        alpha_mm,
-        W_mkl,
-        descrW,
-        SPARSE_LAYOUT_ROW_MAJOR,
-        R_normalized->values,
-        n_genes,
-        n_genes,
-        beta_mm,
-        Temp_WR_values,
-        n_genes
-    );
-
-    if (status != SPARSE_STATUS_SUCCESS) {
-        print_mkl_status(status, "mkl_sparse_d_mm (W * R_normalized)");
-        mkl_free(Temp_WR_values);
-        mkl_sparse_destroy(W_mkl);
-        free_dense_matrix(result);
-        return NULL;
-    }
-
-    printf("  Step 2: Calculating Result = (R_normalized_T * Temp_WR) * scaling_factor ...\n");
-    cblas_dgemm(
-        CblasRowMajor,
-        CblasTrans,
-        CblasNoTrans,
-        n_genes,
-        n_genes,
-        n_spots,
-        scaling_factor,
-        R_normalized->values,
-        n_genes,
-        Temp_WR_values,
-        n_genes,
-        beta_mm,
-        result->values,
-        n_genes
-    );
-
-    mkl_free(Temp_WR_values);
-    mkl_sparse_destroy(W_mkl);
-
-    printf("Residual Moran's I matrix calculation complete and scaled.\n");
-    DEBUG_MATRIX_INFO(result, "residual_morans_i_result");
-    return result;
+    return compute_pairwise_morans_i_scaled(R_normalized, W, scaling_factor, "residual");
 }
 
 /* Main residual Moran's I calculation function */

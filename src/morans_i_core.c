@@ -174,14 +174,19 @@ DenseMatrix* z_normalize(const DenseMatrix* data_matrix) {
  * MORAN'S I CALCULATION FUNCTIONS
  * =============================== */
 
-/* Calculate pairwise Moran's I matrix: Result = (X_transpose * W * X) / S0 with row normalization support */
-DenseMatrix* calculate_morans_i(const DenseMatrix* X, const SparseMatrix* W, int row_normalized) {
+/* Shared inner function: compute pairwise Moran's I matrix with a pre-computed scaling factor.
+ * Result = (X^T * W * X) * scaling_factor
+ * The 'label' parameter is used for printf messages (e.g., "standard" or "residual"). */
+DenseMatrix* compute_pairwise_morans_i_scaled(const DenseMatrix* X, const SparseMatrix* W,
+                                               double scaling_factor, const char* label) {
     if (!X || !W || !X->values) {
-        fprintf(stderr, "Error: Invalid parameters provided to calculate_morans_i\n");
+        fprintf(stderr, "Error: Invalid parameters provided to compute_pairwise_morans_i_scaled (%s)\n",
+                label ? label : "unknown");
         return NULL;
     }
     if (W->nnz > 0 && !W->values) {
-        fprintf(stderr, "Error: W->nnz > 0 but W->values is NULL in calculate_morans_i\n");
+        fprintf(stderr, "Error: W->nnz > 0 but W->values is NULL in compute_pairwise_morans_i_scaled (%s)\n",
+                label ? label : "unknown");
         return NULL;
     }
 
@@ -189,17 +194,19 @@ DenseMatrix* calculate_morans_i(const DenseMatrix* X, const SparseMatrix* W, int
     MKL_INT n_genes = X->ncols;
 
     if (n_spots != W->nrows || n_spots != W->ncols) {
-        fprintf(stderr, "Error: Dimension mismatch between X (%lld spots x %lld genes) and W (%lldx%lld)\n",
-                (long long)n_spots, (long long)n_genes, (long long)W->nrows, (long long)W->ncols);
+        fprintf(stderr, "Error: Dimension mismatch between X (%lld spots x %lld genes) and W (%lldx%lld) in %s\n",
+                (long long)n_spots, (long long)n_genes, (long long)W->nrows, (long long)W->ncols,
+                label ? label : "unknown");
         return NULL;
     }
 
-    if (validate_matrix_dimensions(n_genes, n_genes, "Moran's I result") != MORANS_I_SUCCESS) {
+    if (validate_matrix_dimensions(n_genes, n_genes, label ? label : "Moran's I result") != MORANS_I_SUCCESS) {
         return NULL;
     }
 
     if (n_genes == 0) {
-        fprintf(stderr, "Warning: n_genes is 0 in calculate_morans_i. Returning empty result matrix.\n");
+        fprintf(stderr, "Warning: n_genes is 0 in compute_pairwise_morans_i_scaled (%s). Returning empty result matrix.\n",
+                label ? label : "unknown");
         DenseMatrix* res_empty = (DenseMatrix*)calloc(1, sizeof(DenseMatrix));
         if(!res_empty) {
             perror("calloc for empty moran's I result");
@@ -212,9 +219,8 @@ DenseMatrix* calculate_morans_i(const DenseMatrix* X, const SparseMatrix* W, int
         return res_empty;
     }
 
-    printf("Calculating Moran's I for %lld genes using %lld spots (Matrix approach: X_T * W * X)%s...\n",
-           (long long)n_genes, (long long)n_spots,
-           row_normalized ? " with row-normalized weights" : "");
+    printf("Calculating %s Moran's I for %lld genes using %lld spots (Matrix approach: X_T * W * X)...\n",
+           label ? label : "", (long long)n_genes, (long long)n_spots);
 
     DenseMatrix* result = (DenseMatrix*)malloc(sizeof(DenseMatrix));
     if (!result) {
@@ -266,27 +272,6 @@ DenseMatrix* calculate_morans_i(const DenseMatrix* X, const SparseMatrix* W, int
                 return NULL;
             }
         }
-    }
-
-    /* Calculate scaling factor based on row normalization */
-    double scaling_factor;
-    if (row_normalized) {
-        scaling_factor = 1.0 / (double)n_spots;  // Correct scaling
-        printf("  Using row-normalized weights (scaling factor = 1.0 / n_spots)\n");
-    } else {
-        double S0 = calculate_weight_sum(W);
-        printf("  Sum of weights S0: %.6f\n", S0);
-
-        if (fabs(S0) < DBL_EPSILON) {
-            fprintf(stderr, "Warning: Sum of weights S0 is near-zero (%.4e). Moran's I results will be NaN/Inf or 0.\n", S0);
-            if (S0 == 0.0) {
-                for(size_t i=0; i < (size_t)n_genes * n_genes; ++i) result->values[i] = NAN;
-                return result;
-            }
-        }
-
-        scaling_factor = 1.0 / S0;
-        printf("  Using 1/S0 = %.6e as scaling factor\n", scaling_factor);
     }
 
     sparse_matrix_t W_mkl;
@@ -362,10 +347,53 @@ DenseMatrix* calculate_morans_i(const DenseMatrix* X, const SparseMatrix* W, int
     mkl_free(Temp_WX_values);
     mkl_sparse_destroy(W_mkl);
 
-    printf("Moran's I matrix calculation complete%s.\n",
-           row_normalized ? " (row-normalized)" : " and scaled");
-    DEBUG_MATRIX_INFO(result, "morans_i_result");
+    printf("%s Moran's I matrix calculation complete.\n", label ? label : "");
+    DEBUG_MATRIX_INFO(result, label ? label : "morans_i_result");
     return result;
+}
+
+/* Calculate pairwise Moran's I matrix: Result = (X_transpose * W * X) / S0 with row normalization support */
+DenseMatrix* calculate_morans_i(const DenseMatrix* X, const SparseMatrix* W, int row_normalized) {
+    if (!X || !W || !X->values) {
+        fprintf(stderr, "Error: Invalid parameters provided to calculate_morans_i\n");
+        return NULL;
+    }
+    if (W->nnz > 0 && !W->values) {
+        fprintf(stderr, "Error: W->nnz > 0 but W->values is NULL in calculate_morans_i\n");
+        return NULL;
+    }
+
+    MKL_INT n_spots = X->nrows;
+    MKL_INT n_genes = X->ncols;
+
+    /* Calculate scaling factor based on row normalization */
+    double scaling_factor;
+    if (row_normalized) {
+        scaling_factor = 1.0 / (double)n_spots;  // Correct scaling
+        printf("  Using row-normalized weights (scaling factor = 1.0 / n_spots)\n");
+    } else {
+        double S0 = calculate_weight_sum(W);
+        printf("  Sum of weights S0: %.6f\n", S0);
+
+        if (fabs(S0) < DBL_EPSILON) {
+            fprintf(stderr, "Warning: Sum of weights S0 is near-zero (%.4e). Moran's I results will be NaN/Inf or 0.\n", S0);
+            if (S0 == 0.0) {
+                /* Must still allocate a valid result to return NaN values */
+                DenseMatrix* nan_result = compute_pairwise_morans_i_scaled(X, W, 1.0, "standard");
+                if (nan_result) {
+                    for (size_t i = 0; i < (size_t)n_genes * n_genes; ++i)
+                        nan_result->values[i] = NAN;
+                }
+                return nan_result;
+            }
+        }
+
+        scaling_factor = 1.0 / S0;
+        printf("  Using 1/S0 = %.6e as scaling factor\n", scaling_factor);
+    }
+
+    return compute_pairwise_morans_i_scaled(X, W, scaling_factor,
+                                            row_normalized ? "standard (row-normalized)" : "standard");
 }
 
 /* Calculate Moran's I for a single gene with row normalization support */
