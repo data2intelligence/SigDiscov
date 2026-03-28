@@ -37,6 +37,9 @@ tests/output/
 # Planning artifacts
 docs/superpowers/
 
+# Claude Code
+.claude/
+
 # Logs and temp files
 *.log
 *.tmp
