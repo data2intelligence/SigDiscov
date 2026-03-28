@@ -11,50 +11,52 @@ Optimized Moran's I spatial autocorrelation for spatial transcriptomics data. Us
 - **Permutation testing**: Z-scores and p-values for statistical significance
 - **Platform support**: Visium, ST, single-cell, and custom weight matrices
 - **Performance**: MKL sparse CSR operations, OpenMP threading, VML vectorization
+- **Cross-platform**: Docker images for Linux, macOS, and Windows
 
-## Quick Start
+## Quick Start (Docker)
 
-```bash
-# Build (Intel MKL)
-source /opt/intel/oneapi/setvars.sh
-make
-
-# Build (GCC + OpenBLAS)
-make CC=gcc USE_OPENBLAS=1
-
-# Run
-./morans_i_mkl -i expression.tsv -o results -r 3 -p 0 -b 1 -g 1
-
-# With permutation testing
-./morans_i_mkl -i expression.tsv -o results --run-perm --num-perm 1000
-
-# Residual analysis (cell type corrected)
-./morans_i_mkl -i expression.tsv -o results \
-  --analysis-mode residual \
-  --celltype-file celltypes.csv \
-  --celltype-format deconv
-
-# Built-in test
-./morans_i_mkl --run-toy-example -o toy_test
-```
-
-## Docker (easiest)
+No installation needed. Works on Linux, macOS (Intel + Apple Silicon), and Windows:
 
 ```bash
-# Run directly (works on Linux, macOS, Windows)
+# OpenBLAS version (all platforms)
 docker run --rm -v $(pwd):/data psychemistz/sigdiscov \
   -i /data/expression.tsv -o /data/results -r 3 -p 0 -b 1 -g 1
 
 # Intel MKL version (x86_64 only, best performance)
 docker run --rm -v $(pwd):/data psychemistz/sigdiscov:latest-mkl \
   -i /data/expression.tsv -o /data/results -r 3 -p 0 -b 1 -g 1
+
+# Residual analysis
+docker run --rm -v $(pwd):/data psychemistz/sigdiscov \
+  -i /data/expression.tsv -o /data/results \
+  --analysis-mode residual --celltype-file /data/celltypes.csv --celltype-format deconv
+
+# With permutation testing
+docker run --rm -v $(pwd):/data psychemistz/sigdiscov \
+  -i /data/expression.tsv -o /data/results --run-perm --num-perm 1000
+
+# Built-in test
+docker run --rm psychemistz/sigdiscov --run-toy-example -o /tmp/test
+```
+
+## Quick Start (Build from Source)
+
+```bash
+# Intel MKL (recommended for HPC)
+source /opt/intel/oneapi/setvars.sh
+make
+
+# GCC + OpenBLAS (portable)
+make CC=gcc USE_OPENBLAS=1
+
+# Run
+./morans_i_mkl -i expression.tsv -o results -r 3 -p 0 -b 1 -g 1
 ```
 
 ## Requirements (building from source)
 
 | Build | Requirements |
 |-------|-------------|
-| Docker (recommended) | Docker Desktop or Docker Engine |
 | Intel MKL (HPC) | Intel oneAPI Base Toolkit + MKL |
 | GCC + OpenBLAS (portable) | `libopenblas-dev`, `liblapacke-dev` |
 | Python tool (optional) | `pip install -r requirements.txt` |
@@ -90,6 +92,9 @@ See [`docs/`](docs/) for detailed documentation:
 ## Testing
 
 ```bash
+# Docker
+docker run --rm psychemistz/sigdiscov --run-toy-example -o /tmp/test
+
 # SLURM-managed HPC
 sbatch tests/run_tests_slurm.sh
 
