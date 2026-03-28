@@ -782,7 +782,7 @@ DenseMatrix* calculate_residual_morans_i_matrix(const DenseMatrix* R_normalized,
 
     double alpha_mm = 1.0, beta_mm = 0.0;
 
-    status = mkl_sparse_d_mm(
+    sparse_status_t status = mkl_sparse_d_mm(
         SPARSE_OPERATION_NON_TRANSPOSE,
         alpha_mm,
         W_mkl,
