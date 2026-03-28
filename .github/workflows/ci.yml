@@ -66,3 +66,6 @@ jobs:
 
       - name: Build with GCC and OpenBLAS
         run: make CC=gcc USE_OPENBLAS=1
+
+      - name: Smoke test
+        run: ./morans_i_mkl --run-toy-example -o /tmp/ci_toy -t 1

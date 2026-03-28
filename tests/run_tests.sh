@@ -25,7 +25,11 @@ PASS=0
 FAIL=0
 
 cleanup() {
-    rm -rf "$OUTPUT_DIR"
+    if [ "$FAIL" -eq 0 ]; then
+        rm -rf "$OUTPUT_DIR"
+    else
+        echo "Test output preserved in $OUTPUT_DIR for inspection"
+    fi
 }
 
 compare_file() {

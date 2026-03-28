@@ -83,6 +83,7 @@ static inline void mkl_free(void* ptr) {
 }
 
 static inline void* mkl_calloc(size_t num, size_t size, int alignment) {
+    if (size != 0 && num > SIZE_MAX / size) return NULL; /* overflow check */
     size_t total = num * size;
     void* ptr = mkl_malloc(total, alignment);
     if (ptr) memset(ptr, 0, total);

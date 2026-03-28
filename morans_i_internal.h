@@ -40,14 +40,6 @@
 /* Maximum reasonable dimensions to prevent memory issues */
 #define MAX_REASONABLE_DIM 10000000  /* 10M spots/genes */
 
-/* Resource Management Pattern */
-typedef struct {
-    void** ptrs;
-    void (**free_funcs)(void*);
-    size_t count;
-    size_t capacity;
-} cleanup_list_t;
-
 /* --- Shared helper function declarations --- */
 
 /**
