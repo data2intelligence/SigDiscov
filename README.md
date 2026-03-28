@@ -38,11 +38,24 @@ make CC=gcc USE_OPENBLAS=1
 ./morans_i_mkl --run-toy-example -o toy_test
 ```
 
-## Requirements
+## Docker (easiest)
+
+```bash
+# Run directly (works on Linux, macOS, Windows)
+docker run --rm -v $(pwd):/data psychemistz/sigdiscov \
+  -i /data/expression.tsv -o /data/results -r 3 -p 0 -b 1 -g 1
+
+# Intel MKL version (x86_64 only, best performance)
+docker run --rm -v $(pwd):/data psychemistz/sigdiscov:latest-mkl \
+  -i /data/expression.tsv -o /data/results -r 3 -p 0 -b 1 -g 1
+```
+
+## Requirements (building from source)
 
 | Build | Requirements |
 |-------|-------------|
-| Intel MKL (recommended) | Intel oneAPI Base Toolkit + MKL |
+| Docker (recommended) | Docker Desktop or Docker Engine |
+| Intel MKL (HPC) | Intel oneAPI Base Toolkit + MKL |
 | GCC + OpenBLAS (portable) | `libopenblas-dev`, `liblapacke-dev` |
 | Python tool (optional) | `pip install -r requirements.txt` |
 

@@ -1,0 +1,17 @@
+services:
+  # Intel MKL version (x86_64 only, best performance)
+  sigdiscov-mkl:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ./data:/data
+    platform: linux/amd64
+
+  # OpenBLAS version (multi-arch, works on ARM Macs)
+  sigdiscov:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.openblas
+    volumes:
+      - ./data:/data

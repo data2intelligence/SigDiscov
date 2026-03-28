@@ -1,0 +1,28 @@
+# GCC + OpenBLAS build (multi-arch: x86_64 + ARM64)
+FROM ubuntu:22.04 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc make libopenblas-dev liblapacke-dev libomp-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY src/ src/
+COPY Makefile .
+
+RUN make CC=gcc USE_OPENBLAS=1 -j$(nproc)
+
+# Runtime stage
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopenblas0 liblapacke libgomp1 python3 python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/morans_i_mkl /usr/local/bin/morans_i_mkl
+COPY tools/make_custom_w.py /usr/local/bin/make_custom_w.py
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
+
+WORKDIR /data
+ENTRYPOINT ["morans_i_mkl"]
+CMD ["--help"]

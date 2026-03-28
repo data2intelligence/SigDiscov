@@ -1,0 +1,14 @@
+.git
+.github
+.claude
+docs
+tests
+*.o
+*.d
+morans_i_mkl
+morans_i_mkl.c.bak
+*.csv
+*.tsv
+*.h5ad
+*.log
+*.tmp
