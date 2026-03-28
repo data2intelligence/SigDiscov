@@ -68,20 +68,6 @@ def read_vst_coordinates(vst_file):
     return df
 
 
-def decay_function(d_physical, sigma=100.0):
-    """RBF decay function -- matches the C code decay() exactly."""
-    if d_physical < 0.0:
-        d_physical = 0.0
-
-    if sigma <= ZERO_STD_THRESHOLD:
-        return 1.0 if abs(d_physical) < ZERO_STD_THRESHOLD else 0.0
-
-    if d_physical > 3.0 * sigma:
-        return 0.0
-
-    return math.exp(-(d_physical ** 2) / (2.0 * sigma ** 2))
-
-
 def generate_weight_matrix(vst_file, sigma=100.0, max_radius=5,
                            include_self=False, platform=0):
     """Generate weight matrix from VST file using platform-specific RBF kernel."""
@@ -101,6 +87,7 @@ def generate_weight_matrix(vst_file, sigma=100.0, max_radius=5,
 
     row_indices, col_indices, weight_values = [], [], []
     sigma_cutoff = 3.0 * sigma
+    two_sigma_sq = 2.0 * sigma ** 2
 
     for i in range(n_spots):
         if i % 500 == 0:
@@ -114,17 +101,29 @@ def generate_weight_matrix(vst_file, sigma=100.0, max_radius=5,
         if not include_self:
             valid_mask[i] = False
 
-        for j in np.where(valid_mask)[0]:
-            x_dist = 0.5 * col_diffs[j] * dist_unit
-            y_dist = row_diffs[j] * shift_y * dist_unit
-            d_physical = math.sqrt(x_dist ** 2 + y_dist ** 2)
+        valid_j = np.where(valid_mask)[0]
+        if len(valid_j) == 0:
+            continue
 
-            if d_physical <= sigma_cutoff:
-                weight = math.exp(-(d_physical ** 2) / (2.0 * sigma ** 2))
-                if weight > WEIGHT_THRESHOLD:
-                    row_indices.append(i)
-                    col_indices.append(j)
-                    weight_values.append(weight)
+        # Vectorized distance and weight computation
+        x_dists = 0.5 * col_diffs[valid_j] * dist_unit
+        y_dists = row_diffs[valid_j] * shift_y * dist_unit
+        d_physical = np.sqrt(x_dists ** 2 + y_dists ** 2)
+
+        within_cutoff = d_physical <= sigma_cutoff
+        d_physical = d_physical[within_cutoff]
+        valid_j = valid_j[within_cutoff]
+
+        weights = np.exp(-(d_physical ** 2) / two_sigma_sq)
+        above_threshold = weights > WEIGHT_THRESHOLD
+        valid_j = valid_j[above_threshold]
+        weights = weights[above_threshold]
+
+        n_new = len(valid_j)
+        if n_new > 0:
+            row_indices.extend([i] * n_new)
+            col_indices.extend(valid_j.tolist())
+            weight_values.extend(weights.tolist())
 
     weight_matrix = coo_matrix(
         (weight_values, (row_indices, col_indices)),

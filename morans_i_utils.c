@@ -282,66 +282,6 @@ double calculate_weight_sum(const SparseMatrix* W) {
     return S0;
 }
 
-/* Print help message */
-void print_help(const char* program_name) {
-    printf("\nCompute Pairwise or Single-Gene Moran's I for Spatial Transcriptomics Data\n\n");
-    printf("Usage: %s -i <input.tsv> -o <output_prefix> [OPTIONS]\n\n", program_name);
-    printf("Input Format:\n");
-    printf("  Tab-separated file (TSV).\n");
-    printf("  First row: Header with spot coordinates (e.g., '12x34') or cell IDs. First cell can be empty/gene ID header.\n");
-    printf("  Subsequent rows: Gene name followed by expression values for each spot/cell.\n");
-    printf("\nRequired Arguments:\n");
-    printf("  -i <file>\tInput data matrix file (Genes x Spots/Cells).\n");
-    printf("  -o <prefix>\tOutput file prefix for results (e.g., 'my_analysis_results').\n");
-    printf("\nOptions:\n");
-    printf("  -r <int>\tMaximum grid radius for neighbor search. Default: %d.\n", DEFAULT_MAX_RADIUS);
-    printf("  -p <int>\tPlatform type (%d: Visium, %d: Older ST, %d: Single Cell). Affects distance calculation. Default: %d.\n",
-           VISIUM, OLD, SINGLE_CELL, DEFAULT_PLATFORM_MODE);
-    printf("  -b <0|1>\tCalculation mode: 0 = Single-gene Moran's I, 1 = Pairwise Moran's I. Default: %d.\n",
-           DEFAULT_CALC_PAIRWISE);
-    printf("  -g <0|1>\tGene selection (only applies if -b 1): 0 = Compute Moran's I only between the *first* gene and all others, "
-           "1 = Compute for *all* gene pairs. Default: %d.\n", DEFAULT_CALC_ALL_VS_ALL);
-    printf("  -s <0|1>\tInclude self-comparison (spot i vs spot i)? 0 = No, 1 = Yes. Affects the w_ii term. Default: %d.\n",
-           DEFAULT_INCLUDE_SAME_SPOT);
-    printf("  --row-normalize <0|1>\tNormalize each row of weight matrix to sum to 1? 0 = No, 1 = Yes. Default: %d.\n",
-           DEFAULT_ROW_NORMALIZE_WEIGHTS);
-    printf("  -t <int>\tSet number of OpenMP threads. Default: %d (or OMP_NUM_THREADS environment variable).\n",
-           DEFAULT_NUM_THREADS);
-    printf("  -m <int>\tSet number of MKL threads. Default: Value of -t, or OpenMP default if -t is not set.\n");
-    printf("\nResidual Moran's I Options:\n");
-    printf("  --analysis-mode <standard|residual>\tAnalysis mode. Default: standard.\n");
-    printf("  --celltype-file <file>\t\tCell type composition/annotation file.\n");
-    printf("  --celltype-format <deconv|sc>\t\tFormat: deconvolution or single_cell. Default: single_cell.\n");
-    printf("  --celltype-id-col <name>\t\tCell ID column name. Default: cell_ID.\n");
-    printf("  --celltype-type-col <name>\t\tCell type column name. Default: cellType.\n");
-    printf("  --include-intercept <0|1>\t\tInclude intercept in regression. Default: 1.\n");
-    printf("  --regularization <float>\t\tRidge regularization parameter. Default: 0.0.\n");
-    printf("\nPermutation Test Options (apply if -b 1 and -g 1):\n");
-    printf("  --run-perm <0|1>\tRun permutation test? 0 = No, 1 = Yes. Default: 0.\n");
-    printf("  --num-perm <int>\tNumber of permutations. Default: %d.\n", DEFAULT_NUM_PERMUTATIONS);
-    printf("  --perm-seed <int>\tRandom seed for permutations. Default: time-based.\n");
-    printf("  --perm-out-z <0|1>\tOutput Z-scores from permutations? Default: 1.\n");
-    printf("  --perm-out-p <0|1>\tOutput P-values from permutations? Default: 1.\n");
-
-    printf("\nSingle-cell specific options:\n");
-    printf("  -c <file>\tCoordinates/metadata file with cell locations (TSV format). Required for single-cell data.\n");
-    printf("  --id-col <name>\tColumn name for cell IDs in metadata file. Default: 'cell_ID'.\n");
-    printf("  --x-col <name>\tColumn name for X coordinates in metadata file. Default: 'sdimx'.\n");
-    printf("  --y-col <name>\tColumn name for Y coordinates in metadata file. Default: 'sdimy'.\n");
-    printf("  --scale <float>\tScaling factor for coordinates to convert to integer grid. Default: %.1f.\n",
-           DEFAULT_COORD_SCALE_FACTOR);
-    printf("  --sigma <float>\tCustom sigma parameter for RBF kernel (physical units). If not provided or <=0, inferred from data for single-cell or platform default used.\n");
-    printf("\nOutput Format (files named based on <output_prefix>):\n");
-    printf("  If -b 0 (Single-gene): <output_prefix>_single_gene_moran_i.tsv (Gene, MoranI).\n");
-    printf("  If -b 1 and -g 1 (Pairwise All): <output_prefix>_all_pairs_moran_i.tsv (Symmetric matrix, or _raw.tsv for lower-tri).\n");
-    printf("    Permutation outputs (if --run-perm 1): <prefix>_zscores_lower_tri.tsv, <prefix>_pvalues_lower_tri.tsv\n");
-    printf("  If -b 1 and -g 0 (Pairwise First Gene): <output_prefix>_first_vs_all_moran_i.tsv (Gene, MoranI_vs_Gene0).\n");
-    printf("  Residual Analysis outputs: <prefix>_residual_morans_i_raw.tsv, <prefix>_regression_coefficients.tsv\n");
-    printf("\nExample:\n");
-    printf("  %s -i expression.tsv -o morans_i_run1 -r 3 -p 0 -b 1 -g 1 -t 8 --run-perm 1 --num-perm 500\n\n", program_name);
-    printf("Version: %s\n", morans_i_mkl_version());
-}
-
 /* ===============================
  * UTILITY AND ERROR HANDLING
  * =============================== */

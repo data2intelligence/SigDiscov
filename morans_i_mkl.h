@@ -236,7 +236,7 @@ typedef struct {
 MoransIConfig initialize_default_config(void);
 int initialize_morans_i(const MoransIConfig* config);
 const char* morans_i_mkl_version(void);
-void print_help(const char* program_name); // For library-level help, main.c has its own
+
 
 /* Utility Functions */
 int load_positive_value(const char* value_str, const char* param, unsigned int min, unsigned int max);

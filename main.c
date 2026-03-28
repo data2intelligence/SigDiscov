@@ -328,8 +328,11 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
 
         } else if (strcmp(argv[i], "--perm-seed") == 0) {
             REQUIRE_ARG("--perm-seed");
-            long seed_val = strtol(argv[i], NULL, 10);
-            if (errno == ERANGE || seed_val < 0 || (unsigned long)seed_val > UINT_MAX) {
+            char* endptr = NULL;
+            errno = 0;
+            long seed_val = strtol(argv[i], &endptr, 10);
+            if (errno == ERANGE || seed_val < 0 || (unsigned long)seed_val > UINT_MAX
+                || endptr == argv[i] || *endptr != '\0') {
                 fprintf(stderr, "Error: Invalid seed value for --perm-seed '%s'.\n", argv[i]);
                 return MORANS_I_ERROR_PARAMETER;
             }
@@ -940,7 +943,7 @@ static int prepare_calculation_matrix_builtin(AnalysisResources* resources) {
     printf("Preparing final calculation matrix X_calc (Valid_Spots x Genes)...\n");
     start_time = get_time();
     
-    resources->X_calc = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    resources->X_calc = (DenseMatrix*)calloc(1, sizeof(DenseMatrix));
     if (!resources->X_calc) { 
         perror("malloc X_calc struct"); 
         return MORANS_I_ERROR_MEMORY; 
@@ -1003,7 +1006,7 @@ static int prepare_calculation_matrix_builtin(AnalysisResources* resources) {
 
 static int prepare_calculation_matrix_custom(AnalysisResources* resources) {
     /* Transpose the gene x spots matrix to spots x genes for X_calc */
-    resources->X_calc = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    resources->X_calc = (DenseMatrix*)calloc(1, sizeof(DenseMatrix));
     if (!resources->X_calc) { 
         perror("malloc X_calc struct"); 
         return MORANS_I_ERROR_MEMORY; 
@@ -1207,12 +1210,8 @@ static int run_permutation_analysis(const MoransIConfig* config, AnalysisResourc
 
         double start_time, end_time;
         printf("--- Running Residual Permutation Test ---\n");
-        
-        PermutationParams perm_params; 
-        perm_params.n_permutations = config->num_permutations;
-        perm_params.seed = config->perm_seed; 
-        perm_params.z_score_output = config->perm_output_zscores;
-        perm_params.p_value_output = config->perm_output_pvalues;
+
+        PermutationParams perm_params = config_to_perm_params(config);
 
         start_time = get_time();
         PermutationResults* residual_perm_results = run_residual_permutation_test(
@@ -1270,12 +1269,8 @@ static int run_permutation_analysis(const MoransIConfig* config, AnalysisResourc
         
         double start_time, end_time;
         printf("--- Running Standard Permutation Test ---\n");
-        
-        PermutationParams perm_params; 
-        perm_params.n_permutations = config->num_permutations;
-        perm_params.seed = config->perm_seed; 
-        perm_params.z_score_output = config->perm_output_zscores;
-        perm_params.p_value_output = config->perm_output_pvalues;
+
+        PermutationParams perm_params = config_to_perm_params(config);
 
         start_time = get_time();
         resources->perm_results = run_permutation_test(resources->X_calc, resources->W_matrix, &perm_params, config->row_normalize_weights);

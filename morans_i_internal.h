@@ -100,6 +100,20 @@ MKL_INT spot_name_ht_find(const SpotNameHashTable* ht, const char* name);
  */
 void spot_name_ht_free(SpotNameHashTable* ht);
 
+/* --- Permutation parameter helpers --- */
+
+/**
+ * Initialize PermutationParams from MoransIConfig fields.
+ */
+static inline PermutationParams config_to_perm_params(const MoransIConfig* config) {
+    PermutationParams p;
+    p.n_permutations = config->num_permutations;
+    p.seed = config->perm_seed;
+    p.z_score_output = config->perm_output_zscores;
+    p.p_value_output = config->perm_output_pvalues;
+    return p;
+}
+
 /* --- Permutation result helpers --- */
 
 /**

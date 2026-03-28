@@ -411,12 +411,9 @@ int run_toy_example_2d(const char* output_prefix_toy, MoransIConfig* config) {
         }
 
         if (config->run_permutations) {
-            PermutationParams toy_perm_params;
-            toy_perm_params.n_permutations = (config->num_permutations > 0 && config->num_permutations < 5000) ?
-                                            config->num_permutations : 100;
-            toy_perm_params.seed = config->perm_seed;
-            toy_perm_params.z_score_output = config->perm_output_zscores;
-            toy_perm_params.p_value_output = config->perm_output_pvalues;
+            PermutationParams toy_perm_params = config_to_perm_params(config);
+            if (toy_perm_params.n_permutations <= 0 || toy_perm_params.n_permutations >= 5000)
+                toy_perm_params.n_permutations = 100;
 
             printf("Running permutation test for 2D toy example (%d permutations)...\n", toy_perm_params.n_permutations);
             toy_perm_results = run_permutation_test(toy_X_calc, toy_W, &toy_perm_params, config->row_normalize_weights);
