@@ -19,9 +19,14 @@
 │   └── openblas_compat.h   # MKL-to-OpenBLAS compatibility
 ├── tools/
 │   └── make_custom_w.py    # Weight matrix generator
-├── tests/                  # Test scripts
+├── docker/
+│   ├── Dockerfile          # Intel MKL image (x86_64)
+│   └── Dockerfile.openblas # OpenBLAS image (multi-arch)
+├── tests/                  # Test and benchmark scripts
 ├── docs/                   # Documentation
 ├── Makefile
+├── docker-compose.yml
+├── .dockerignore
 ├── README.md
 └── requirements.txt
 ```
@@ -77,13 +82,36 @@ Transpose to X_calc (spots x genes)
 save_results() --> Output TSV files
 ```
 
+## Docker Images
+
+| Image | Base | Arch | Size |
+|-------|------|------|------|
+| `psychemistz/sigdiscov:latest` | Ubuntu 22.04 + OpenBLAS | amd64, arm64 | ~200MB |
+| `psychemistz/sigdiscov:latest-mkl` | Intel oneAPI 2024.0.1 | amd64 | ~15GB |
+
+Built automatically on every push to main via `.github/workflows/docker.yml`.
+
+For HPC clusters using Singularity:
+```
+singularity pull sigdiscov.sif docker://psychemistz/sigdiscov:latest
+singularity exec --bind /data sigdiscov.sif morans_i_mkl [args]
+```
+
+### Performance (Biowulf, 19729 genes x 3813 spots, 8 threads)
+
+| Method | Time | Overhead |
+|--------|------|----------|
+| Native MKL | 64s | baseline |
+| Docker MKL (Singularity) | 64s | +0% |
+| Docker OpenBLAS (Singularity) | 73s | +14% |
+
 ## CI/CD
 
-GitHub Actions (`.github/workflows/ci.yml`):
-- **static-analysis**: cppcheck on all C sources in `src/`
-- **python-lint**: flake8 on `tools/make_custom_w.py`
-- **build**: GCC + OpenBLAS compilation + smoke test (toy example)
+GitHub Actions:
+- **CI** (`.github/workflows/ci.yml`): cppcheck, flake8, GCC+OpenBLAS build + smoke test
+- **Docker** (`.github/workflows/docker.yml`): Build and push multi-arch images to Docker Hub
 
 SLURM regression tests (`tests/`):
 - Toy example with fixed seed for reproducibility
 - Real-data validation against precomputed reference output
+- Docker/Singularity benchmark against native build
