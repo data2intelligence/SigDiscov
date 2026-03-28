@@ -114,7 +114,7 @@
   --run-perm --num-perm 1000
 
 # Custom weight matrix
-python3 make_custom_w.py -i expr.tsv -o weights -r 5 -p 0
+python3 tools/make_custom_w.py -i expr.tsv -o weights -r 5 -p 0
 ./morans_i_mkl -i expr.tsv -o out -w weights_dense.tsv --weight-format dense
 
 # Toy example with permutations

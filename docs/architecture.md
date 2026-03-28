@@ -1,26 +1,38 @@
 # Architecture
 
-## Source Modules
+## Project Layout
 
-| File | Lines | Responsibility |
-|------|-------|----------------|
-| `main.c` | ~1600 | CLI parsing, orchestration |
-| `toy_example.c` | ~450 | Built-in 5x5 grid toy example for testing |
-| `morans_i_utils.c` | ~540 | Hash table, config init, timing, input validation, permutation helpers |
-| `morans_i_io.c` | ~2960 | All file I/O: VST, weight matrix, cell type, coordinates, results |
-| `morans_i_core.c` | ~800 | Z-normalization, Moran's I calculation (all modes) |
-| `morans_i_spatial.c` | ~700 | RBF decay, distance matrix, weight matrix construction |
-| `morans_i_residual.c` | ~1200 | Regression, projection, residual Moran's I, residual permutations |
-| `morans_i_perm.c` | ~360 | Standard permutation testing |
-| `morans_i_memory.c` | ~130 | All `free_*` functions |
+```
+.
+├── src/                    # C source and headers
+│   ├── main.c              # CLI parsing, orchestration
+│   ├── toy_example.c       # Built-in 5x5 grid toy example
+│   ├── morans_i_utils.c    # Hash table, config, timing, validation
+│   ├── morans_i_io.c       # All file I/O
+│   ├── morans_i_core.c     # Z-normalization, Moran's I calculation
+│   ├── morans_i_spatial.c  # RBF decay, distance, weight matrix
+│   ├── morans_i_residual.c # Regression, residual Moran's I
+│   ├── morans_i_perm.c     # Standard permutation testing
+│   ├── morans_i_memory.c   # All free_* functions
+│   ├── morans_i_mkl.h      # Public API header
+│   ├── morans_i_internal.h # Internal shared helpers
+│   └── openblas_compat.h   # MKL-to-OpenBLAS compatibility
+├── tools/
+│   └── make_custom_w.py    # Weight matrix generator
+├── tests/                  # Test scripts
+├── docs/                   # Documentation
+├── Makefile
+├── README.md
+└── requirements.txt
+```
 
 ## Headers
 
 | File | Purpose |
 |------|---------|
-| `morans_i_mkl.h` | Public API: types, function prototypes, constants |
-| `morans_i_internal.h` | Internal: shared helpers, hash table API, sparse handle, RNG |
-| `openblas_compat.h` | MKL-to-OpenBLAS compatibility layer (conditional) |
+| `src/morans_i_mkl.h` | Public API: types, function prototypes, constants |
+| `src/morans_i_internal.h` | Internal: shared helpers, hash table API, sparse handle, RNG |
+| `src/openblas_compat.h` | MKL-to-OpenBLAS compatibility layer (conditional) |
 
 ## Build System
 
@@ -32,10 +44,7 @@ make test                   # Submit SLURM test job
 make clean                  # Remove artifacts
 ```
 
-The Makefile detects build mode via `USE_OPENBLAS`. When defined:
-- Compiler switches to GCC with `-fopenmp`
-- `morans_i_mkl.h` includes `openblas_compat.h` instead of MKL headers
-- Links `-lopenblas -llapacke` instead of MKL libraries
+The Makefile uses `VPATH = src` so source files live in `src/` while object files and the binary are built in the project root. `USE_OPENBLAS` switches compiler, headers, and link libraries.
 
 ## Data Flow
 
@@ -71,10 +80,10 @@ save_results() --> Output TSV files
 ## CI/CD
 
 GitHub Actions (`.github/workflows/ci.yml`):
-- **static-analysis**: cppcheck on all C sources
-- **python-lint**: flake8 on `make_custom_w.py`
+- **static-analysis**: cppcheck on all C sources in `src/`
+- **python-lint**: flake8 on `tools/make_custom_w.py`
 - **build**: GCC + OpenBLAS compilation + smoke test (toy example)
 
 SLURM regression tests (`tests/`):
 - Toy example with fixed seed for reproducibility
-- Value sanity checks (positive autocorrelation for gradients, negative for checkerboard)
+- Real-data validation against precomputed reference output

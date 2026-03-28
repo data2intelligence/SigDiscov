@@ -19,6 +19,10 @@ VERSION_FLAG = -DMORANS_I_MKL_VERSION=\"$(VERSION)\"
 # Target executable name
 TARGET = morans_i_mkl
 
+# Source layout
+SRCDIR = src
+VPATH  = $(SRCDIR)
+
 # Source files (modular structure)
 SOURCES = main.c \
           toy_example.c \
@@ -30,7 +34,7 @@ SOURCES = main.c \
           morans_i_perm.c \
           morans_i_memory.c
 
-HEADERS = morans_i_mkl.h morans_i_internal.h openblas_compat.h
+HEADERS = $(SRCDIR)/morans_i_mkl.h $(SRCDIR)/morans_i_internal.h $(SRCDIR)/openblas_compat.h
 
 OBJECTS = $(SOURCES:.c=.o)
 
@@ -47,7 +51,7 @@ ifdef USE_OPENBLAS
 
     # OpenBLAS includes and libs
     OPENBLAS_ROOT ?= /usr
-    INCLUDES = -I$(OPENBLAS_ROOT)/include
+    INCLUDES = -I$(SRCDIR) -I$(OPENBLAS_ROOT)/include
     LDFLAGS = -fopenmp
     LIBS_LINK = -lopenblas -llapacke -lpthread -lm -ldl
     LIBS = $(LDFLAGS) -L$(OPENBLAS_ROOT)/lib $(LIBS_LINK)
@@ -69,7 +73,7 @@ else
         $(error MKL headers not found. Halting. Try: make CC=gcc USE_OPENBLAS=1)
     endif
 
-    INCLUDES = -I$(MKLROOT)/include
+    INCLUDES = -I$(SRCDIR) -I$(MKLROOT)/include
     LDFLAGS = -qopenmp -L$(MKLROOT)/lib/intel64
     MKL_LIBS = -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core -liomp5 -lpthread -lm -ldl
     LIBS = $(LDFLAGS) $(MKL_LIBS)
@@ -89,7 +93,7 @@ $(TARGET): $(OBJECTS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
 	@echo "Build complete: $(TARGET) v$(VERSION) ($(BUILD_INFO))"
 
-# Rule to compile object files
+# Rule to compile object files (VPATH finds .c in src/)
 %.o: %.c $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(VERSION_FLAG) $(INCLUDES) -c $< -o $@
 

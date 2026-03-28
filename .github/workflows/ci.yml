@@ -31,10 +31,10 @@ jobs:
             --suppress=unreadVariable \
             --error-exitcode=1 \
             --inline-suppr \
-            -I . \
-            main.c toy_example.c morans_i_utils.c morans_i_io.c morans_i_core.c \
-            morans_i_spatial.c morans_i_residual.c morans_i_perm.c \
-            morans_i_memory.c
+            -I src \
+            src/main.c src/toy_example.c src/morans_i_utils.c src/morans_i_io.c \
+            src/morans_i_core.c src/morans_i_spatial.c src/morans_i_residual.c \
+            src/morans_i_perm.c src/morans_i_memory.c
 
   python-lint:
     runs-on: ubuntu-latest
@@ -51,7 +51,7 @@ jobs:
 
       - name: Lint Python files
         run: |
-          flake8 make_custom_w.py \
+          flake8 tools/make_custom_w.py \
             --max-line-length=160 \
             --extend-ignore=W291,W292,W293,E302,E305,E231,F541 \
             --count --show-source --statistics

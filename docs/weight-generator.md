@@ -5,7 +5,7 @@ Python tool that generates custom weight matrices using the same algorithm as th
 ## Usage
 
 ```bash
-python3 make_custom_w.py -i <input.tsv> -o <output_prefix> [OPTIONS]
+python3 tools/make_custom_w.py -i <input.tsv> -o <output_prefix> [OPTIONS]
 ```
 
 ## Options
@@ -29,7 +29,7 @@ Generates two files:
 
 ```bash
 # Generate custom weights
-python3 make_custom_w.py -i data.tsv -o weights -r 3 -p 0
+python3 tools/make_custom_w.py -i data.tsv -o weights -r 3 -p 0
 
 # Run with custom weights
 ./morans_i_mkl -i data.tsv -o test_custom -w weights_dense.tsv --weight-format dense -b 1 -g 1
