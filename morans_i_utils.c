@@ -421,3 +421,119 @@ double load_double_value(const char* value_str, const char* param) {
 
     return value;
 }
+
+/* ===============================
+ * PERMUTATION RESULT HELPERS
+ * =============================== */
+
+PermutationResults* alloc_permutation_results(MKL_INT n_genes, const char** gene_names,
+                                              const PermutationParams* params) {
+    PermutationResults* results = (PermutationResults*)calloc(1, sizeof(PermutationResults));
+    if (!results) {
+        perror("Failed to allocate PermutationResults structure");
+        return NULL;
+    }
+
+    size_t matrix_elements = (size_t)n_genes * n_genes;
+    size_t matrix_bytes;
+    if (safe_multiply_size_t(matrix_elements, sizeof(double), &matrix_bytes) != 0) {
+        fprintf(stderr, "Error: Matrix size too large for permutation results\n");
+        free(results);
+        return NULL;
+    }
+
+    results->mean_perm = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    results->var_perm = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (params->z_score_output)
+        results->z_scores = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+    if (params->p_value_output)
+        results->p_values = (DenseMatrix*)malloc(sizeof(DenseMatrix));
+
+    if (!results->mean_perm || !results->var_perm ||
+        (params->z_score_output && !results->z_scores) ||
+        (params->p_value_output && !results->p_values)) {
+        perror("Failed to allocate result matrix structures");
+        free_permutation_results(results);
+        return NULL;
+    }
+
+    DenseMatrix* matrices[] = {results->mean_perm, results->var_perm, results->z_scores, results->p_values};
+    int num_matrices = 2 + (params->z_score_output ? 1 : 0) + (params->p_value_output ? 1 : 0);
+
+    for (int m = 0; m < num_matrices; m++) {
+        if (!matrices[m]) continue;
+
+        matrices[m]->nrows = n_genes;
+        matrices[m]->ncols = n_genes;
+        matrices[m]->values = (double*)mkl_calloc(matrix_elements, sizeof(double), 64);
+        matrices[m]->rownames = (char**)calloc(n_genes, sizeof(char*));
+        matrices[m]->colnames = (char**)calloc(n_genes, sizeof(char*));
+
+        if (!matrices[m]->values || !matrices[m]->rownames || !matrices[m]->colnames) {
+            perror("Failed to allocate result matrix components");
+            free_permutation_results(results);
+            return NULL;
+        }
+
+        for (MKL_INT i = 0; i < n_genes; i++) {
+            const char* name = (gene_names && gene_names[i]) ? gene_names[i] : "UNKNOWN_GENE";
+            matrices[m]->rownames[i] = strdup(name);
+            matrices[m]->colnames[i] = strdup(name);
+            if (!matrices[m]->rownames[i] || !matrices[m]->colnames[i]) {
+                perror("Failed to duplicate gene names for permutation results");
+                free_permutation_results(results);
+                return NULL;
+            }
+        }
+    }
+
+    return results;
+}
+
+void finalize_permutation_statistics(PermutationResults* results,
+                                     const DenseMatrix* observed_results,
+                                     const PermutationParams* params,
+                                     MKL_INT n_genes, int n_perm) {
+    double inv_n_perm = 1.0 / (double)n_perm;
+    for (MKL_INT r = 0; r < n_genes; r++) {
+        for (MKL_INT c = 0; c < n_genes; c++) {
+            MKL_INT idx = r * n_genes + c;
+
+            double sum_val = results->mean_perm->values[idx];
+            double sum_sq_val = results->var_perm->values[idx];
+
+            double mean_perm = sum_val * inv_n_perm;
+            double var_perm = (sum_sq_val * inv_n_perm) - (mean_perm * mean_perm);
+
+            if (var_perm < 0.0 && var_perm > -ZERO_STD_THRESHOLD) {
+                var_perm = 0.0;
+            } else if (var_perm < 0.0) {
+                fprintf(stderr, "Warning: Negative variance (%.4e) for gene pair (%lld,%lld)\n",
+                        var_perm, (long long)r, (long long)c);
+                var_perm = 0.0;
+            }
+
+            results->mean_perm->values[idx] = mean_perm;
+            results->var_perm->values[idx] = var_perm;
+
+            if (params->p_value_output && results->p_values) {
+                results->p_values->values[idx] = (results->p_values->values[idx] + 1.0) / (double)(n_perm + 1);
+            }
+
+            if (params->z_score_output && results->z_scores) {
+                double std_dev = sqrt(var_perm);
+                double observed_val = observed_results->values[idx];
+
+                if (std_dev < ZERO_STD_THRESHOLD) {
+                    if (fabs(observed_val - mean_perm) < ZERO_STD_THRESHOLD) {
+                        results->z_scores->values[idx] = 0.0;
+                    } else {
+                        results->z_scores->values[idx] = (observed_val > mean_perm) ? INFINITY : -INFINITY;
+                    }
+                } else {
+                    results->z_scores->values[idx] = (observed_val - mean_perm) / std_dev;
+                }
+            }
+        }
+    }
+}

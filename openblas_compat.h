@@ -191,12 +191,40 @@ static inline sparse_status_t mkl_sparse_d_mv(
             y[i] = alpha * sum + beta * y[i];
         }
     } else {
-        /* Transpose: y[col] += alpha * val * x[row] */
-        for (MKL_INT i = 0; i < A->ncols; i++) y[i] *= beta;
-        for (MKL_INT i = 0; i < nrows; i++) {
-            for (MKL_INT j = A->rows_start[i]; j < A->rows_end[i]; j++) {
-                y[A->col_indx[j]] += alpha * A->values[j] * x[i];
+        /* Transpose: y[col] += alpha * val * x[row] -- thread-local accumulation */
+        int nthreads = 1;
+        #pragma omp parallel
+        { nthreads = omp_get_num_threads(); }
+
+        double* y_local = (double*)calloc((size_t)nthreads * A->ncols, sizeof(double));
+        if (!y_local) {
+            /* fallback: serial */
+            for (MKL_INT i = 0; i < A->ncols; i++) y[i] *= beta;
+            for (MKL_INT i = 0; i < nrows; i++) {
+                for (MKL_INT j = A->rows_start[i]; j < A->rows_end[i]; j++) {
+                    y[A->col_indx[j]] += alpha * A->values[j] * x[i];
+                }
             }
+        } else {
+            #pragma omp parallel
+            {
+                int tid = omp_get_thread_num();
+                double* my_y = y_local + (size_t)tid * A->ncols;
+                #pragma omp for
+                for (MKL_INT i = 0; i < nrows; i++) {
+                    for (MKL_INT j = A->rows_start[i]; j < A->rows_end[i]; j++) {
+                        my_y[A->col_indx[j]] += alpha * A->values[j] * x[i];
+                    }
+                }
+            }
+            for (MKL_INT c = 0; c < A->ncols; c++) {
+                double sum = beta * y[c];
+                for (int t = 0; t < nthreads; t++) {
+                    sum += y_local[(size_t)t * A->ncols + c];
+                }
+                y[c] = sum;
+            }
+            free(y_local);
         }
     }
     return SPARSE_STATUS_SUCCESS;
@@ -235,20 +263,51 @@ static inline sparse_status_t mkl_sparse_d_mm(
             }
         }
     } else {
-        /* Transpose multiply */
-        for (MKL_INT i = 0; i < A->ncols; i++) {
-            for (MKL_INT k = 0; k < columns; k++) {
-                C[i * ldc + k] *= beta;
-            }
-        }
-        for (MKL_INT i = 0; i < nrows; i++) {
-            for (MKL_INT j = A->rows_start[i]; j < A->rows_end[i]; j++) {
-                MKL_INT col = A->col_indx[j];
-                double val = alpha * A->values[j];
-                for (MKL_INT k = 0; k < columns; k++) {
-                    C[col * ldc + k] += val * B[i * ldb + k];
+        /* Transpose multiply -- thread-local accumulation */
+        int nthreads = 1;
+        #pragma omp parallel
+        { nthreads = omp_get_num_threads(); }
+
+        size_t C_elems = (size_t)A->ncols * columns;
+        double* C_local = (double*)calloc((size_t)nthreads * C_elems, sizeof(double));
+        if (!C_local) {
+            /* fallback: serial */
+            for (MKL_INT i = 0; i < A->ncols; i++)
+                for (MKL_INT k = 0; k < columns; k++)
+                    C[i * ldc + k] *= beta;
+            for (MKL_INT i = 0; i < nrows; i++) {
+                for (MKL_INT j = A->rows_start[i]; j < A->rows_end[i]; j++) {
+                    MKL_INT col = A->col_indx[j];
+                    double val = alpha * A->values[j];
+                    for (MKL_INT k = 0; k < columns; k++)
+                        C[col * ldc + k] += val * B[i * ldb + k];
                 }
             }
+        } else {
+            #pragma omp parallel
+            {
+                int tid = omp_get_thread_num();
+                double* my_C = C_local + (size_t)tid * C_elems;
+                #pragma omp for
+                for (MKL_INT i = 0; i < nrows; i++) {
+                    for (MKL_INT j = A->rows_start[i]; j < A->rows_end[i]; j++) {
+                        MKL_INT col = A->col_indx[j];
+                        double val = alpha * A->values[j];
+                        for (MKL_INT k = 0; k < columns; k++)
+                            my_C[col * columns + k] += val * B[i * ldb + k];
+                    }
+                }
+            }
+            #pragma omp parallel for
+            for (MKL_INT c = 0; c < A->ncols; c++) {
+                for (MKL_INT k = 0; k < columns; k++) {
+                    double sum = beta * C[c * ldc + k];
+                    for (int t = 0; t < nthreads; t++)
+                        sum += C_local[(size_t)t * C_elems + c * columns + k];
+                    C[c * ldc + k] = sum;
+                }
+            }
+            free(C_local);
         }
     }
     return SPARSE_STATUS_SUCCESS;
@@ -260,6 +319,7 @@ static inline sparse_status_t mkl_sparse_d_mm(
 
 /* Element-wise division: r[i] = a[i] / b[i] */
 static inline void vdDiv(MKL_INT n, const double *a, const double *b, double *r) {
+    #pragma omp parallel for
     for (MKL_INT i = 0; i < n; i++) {
         r[i] = a[i] / b[i];
     }

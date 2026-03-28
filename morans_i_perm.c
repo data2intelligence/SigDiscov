@@ -57,18 +57,11 @@ static int permutation_worker(const DenseMatrix* X_original,
 
     // Create sparse matrix handle
     sparse_matrix_t W_mkl;
-    sparse_status_t status = mkl_sparse_d_create_csr(&W_mkl, SPARSE_INDEX_BASE_ZERO,
-                                                     W->nrows, W->ncols, W->row_ptr,
-                                                     W->row_ptr + 1, W->col_ind, W->values);
-    if (status != SPARSE_STATUS_SUCCESS) {
+    if (create_sparse_handle(W, &W_mkl) != SPARSE_STATUS_SUCCESS) {
         DEBUG_PRINT("Thread %d: Failed to create sparse matrix", thread_id);
         mkl_free(X_perm.values); mkl_free(gene_buffer); mkl_free(indices_buffer);
         mkl_free(temp_WX); mkl_free(I_perm_values);
         return -1;
-    }
-
-    if (W->nnz > 0) {
-        mkl_sparse_optimize(W_mkl);
     }
 
     struct matrix_descr descr;
@@ -89,7 +82,7 @@ static int permutation_worker(const DenseMatrix* X_original,
             // Fisher-Yates shuffle
             if (n_spots > 1) {
                 for (MKL_INT i = n_spots - 1; i > 0; i--) {
-                    MKL_INT k = rand_r(&local_seed) % (i + 1);
+                    MKL_INT k = rand_range_unbiased(&local_seed, i + 1);
                     MKL_INT temp_idx = indices_buffer[i];
                     indices_buffer[i] = indices_buffer[k];
                     indices_buffer[k] = temp_idx;
@@ -202,76 +195,15 @@ PermutationResults* run_permutation_test(const DenseMatrix* X_observed_spots_x_g
         return NULL;
     }
 
-    // Allocate results structure
-    PermutationResults* results = (PermutationResults*)calloc(1, sizeof(PermutationResults));
+    // Allocate and initialize results structure
+    PermutationResults* results = alloc_permutation_results(
+        n_genes, (const char**)X_observed_spots_x_genes->colnames, params);
     if (!results) {
-        perror("Failed to allocate PermutationResults structure");
         free_dense_matrix(observed_results);
         return NULL;
     }
 
     size_t matrix_elements = (size_t)n_genes * n_genes;
-    size_t matrix_bytes;
-    if (safe_multiply_size_t(matrix_elements, sizeof(double), &matrix_bytes) != 0) {
-        fprintf(stderr, "Error: Matrix size too large for permutation results\n");
-        free(results);
-        free_dense_matrix(observed_results);
-        return NULL;
-    }
-
-    // Allocate result matrices
-    results->mean_perm = (DenseMatrix*)malloc(sizeof(DenseMatrix));
-    results->var_perm = (DenseMatrix*)malloc(sizeof(DenseMatrix));
-    if (params->z_score_output) {
-        results->z_scores = (DenseMatrix*)malloc(sizeof(DenseMatrix));
-    }
-    if (params->p_value_output) {
-        results->p_values = (DenseMatrix*)malloc(sizeof(DenseMatrix));
-    }
-
-    if (!results->mean_perm || !results->var_perm ||
-        (params->z_score_output && !results->z_scores) ||
-        (params->p_value_output && !results->p_values)) {
-        perror("Failed to allocate result matrix structures");
-        free_permutation_results(results);
-        free_dense_matrix(observed_results);
-        return NULL;
-    }
-
-    // Initialize result matrices
-    DenseMatrix* matrices[] = {results->mean_perm, results->var_perm, results->z_scores, results->p_values};
-    int num_matrices = 2 + (params->z_score_output ? 1 : 0) + (params->p_value_output ? 1 : 0);
-
-    for (int m = 0; m < num_matrices; m++) {
-        if (!matrices[m]) continue;
-
-        matrices[m]->nrows = n_genes;
-        matrices[m]->ncols = n_genes;
-        matrices[m]->values = (double*)mkl_calloc(matrix_elements, sizeof(double), 64);
-        matrices[m]->rownames = (char**)calloc(n_genes, sizeof(char*));
-        matrices[m]->colnames = (char**)calloc(n_genes, sizeof(char*));
-
-        if (!matrices[m]->values || !matrices[m]->rownames || !matrices[m]->colnames) {
-            perror("Failed to allocate result matrix components");
-            free_permutation_results(results);
-            free_dense_matrix(observed_results);
-            return NULL;
-        }
-
-        // Copy gene names
-        for (MKL_INT i = 0; i < n_genes; i++) {
-            const char* gene_name = (X_observed_spots_x_genes->colnames[i]) ?
-                                   X_observed_spots_x_genes->colnames[i] : "UNKNOWN_GENE";
-            matrices[m]->rownames[i] = strdup(gene_name);
-            matrices[m]->colnames[i] = strdup(gene_name);
-            if (!matrices[m]->rownames[i] || !matrices[m]->colnames[i]) {
-                perror("Failed to duplicate gene names for permutation results");
-                free_permutation_results(results);
-                free_dense_matrix(observed_results);
-                return NULL;
-            }
-        }
-    }
 
     // Run permutations using multiple threads
     int num_threads = omp_get_max_threads();
@@ -356,48 +288,7 @@ PermutationResults* run_permutation_test(const DenseMatrix* X_observed_spots_x_g
     }
 
     // Finalize statistics
-    double inv_n_perm = 1.0 / (double)n_perm;
-    for (MKL_INT r = 0; r < n_genes; r++) {
-        for (MKL_INT c = 0; c < n_genes; c++) {
-            MKL_INT idx = r * n_genes + c;
-
-            double sum_val = results->mean_perm->values[idx];
-            double sum_sq_val = results->var_perm->values[idx];
-
-            double mean_perm = sum_val * inv_n_perm;
-            double var_perm = (sum_sq_val * inv_n_perm) - (mean_perm * mean_perm);
-
-            if (var_perm < 0.0 && var_perm > -ZERO_STD_THRESHOLD) {
-                var_perm = 0.0;
-            } else if (var_perm < 0.0) {
-                fprintf(stderr, "Warning: Negative variance (%.4e) for gene pair (%lld,%lld)\n",
-                        var_perm, (long long)r, (long long)c);
-                var_perm = 0.0;
-            }
-
-            results->mean_perm->values[idx] = mean_perm;
-            results->var_perm->values[idx] = var_perm;
-
-            if (params->p_value_output && results->p_values) {
-                results->p_values->values[idx] = (results->p_values->values[idx] + 1.0) / (double)(n_perm + 1);
-            }
-
-            if (params->z_score_output && results->z_scores) {
-                double std_dev = sqrt(var_perm);
-                double observed_val = observed_results->values[idx];
-
-                if (std_dev < ZERO_STD_THRESHOLD) {
-                    if (fabs(observed_val - mean_perm) < ZERO_STD_THRESHOLD) {
-                        results->z_scores->values[idx] = 0.0;
-                    } else {
-                        results->z_scores->values[idx] = (observed_val > mean_perm) ? INFINITY : -INFINITY;
-                    }
-                } else {
-                    results->z_scores->values[idx] = (observed_val - mean_perm) / std_dev;
-                }
-            }
-        }
-    }
+    finalize_permutation_statistics(results, observed_results, params, n_genes, n_perm);
 
     free_dense_matrix(observed_results);
     printf("Permutation test complete.\n");

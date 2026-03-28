@@ -100,4 +100,61 @@ MKL_INT spot_name_ht_find(const SpotNameHashTable* ht, const char* name);
  */
 void spot_name_ht_free(SpotNameHashTable* ht);
 
+/* --- Permutation result helpers --- */
+
+/**
+ * Allocate and initialize a PermutationResults with gene-named matrices.
+ * Returns NULL on failure (all allocations cleaned up).
+ */
+PermutationResults* alloc_permutation_results(MKL_INT n_genes, const char** gene_names,
+                                              const PermutationParams* params);
+
+/**
+ * Finalize permutation statistics: compute mean, variance, z-scores, p-values
+ * from accumulated sums in results->mean_perm and results->var_perm.
+ */
+void finalize_permutation_statistics(PermutationResults* results,
+                                     const DenseMatrix* observed_results,
+                                     const PermutationParams* params,
+                                     MKL_INT n_genes, int n_perm);
+
+/* --- Random number helpers --- */
+
+/**
+ * Unbiased random integer in [0, upper_bound) using rejection sampling.
+ * Eliminates modulo bias from rand_r().
+ */
+static inline MKL_INT rand_range_unbiased(unsigned int* seed, MKL_INT upper_bound) {
+    if (upper_bound <= 1) return 0;
+    unsigned int threshold = (unsigned int)(-upper_bound) % (unsigned int)upper_bound;
+    unsigned int r;
+    do {
+        r = rand_r(seed);
+    } while (r < threshold);
+    return (MKL_INT)(r % (unsigned int)upper_bound);
+}
+
+/* --- MKL Sparse Handle helper --- */
+
+/**
+ * Create an MKL sparse CSR handle from a SparseMatrix and optionally optimize.
+ * Returns SPARSE_STATUS_SUCCESS on success. Caller must mkl_sparse_destroy() the handle.
+ */
+static inline sparse_status_t create_sparse_handle(const SparseMatrix* W, sparse_matrix_t* W_mkl) {
+    sparse_status_t status = mkl_sparse_d_create_csr(
+        W_mkl, SPARSE_INDEX_BASE_ZERO, W->nrows, W->ncols,
+        W->row_ptr, W->row_ptr + 1, W->col_ind, W->values);
+    if (status != SPARSE_STATUS_SUCCESS) {
+        print_mkl_status(status, "mkl_sparse_d_create_csr");
+        return status;
+    }
+    if (W->nnz > 0) {
+        sparse_status_t opt_status = mkl_sparse_optimize(*W_mkl);
+        if (opt_status != SPARSE_STATUS_SUCCESS) {
+            print_mkl_status(opt_status, "mkl_sparse_optimize");
+        }
+    }
+    return SPARSE_STATUS_SUCCESS;
+}
+
 #endif /* MORANS_I_INTERNAL_H */

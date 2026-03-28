@@ -300,21 +300,9 @@ DenseMatrix* calculate_morans_i(const DenseMatrix* X, const SparseMatrix* W, int
     }
 
     sparse_matrix_t W_mkl;
-    sparse_status_t status = mkl_sparse_d_create_csr(
-        &W_mkl, SPARSE_INDEX_BASE_ZERO, W->nrows, W->ncols,
-        W->row_ptr, W->row_ptr + 1, W->col_ind, W->values);
-
-    if (status != SPARSE_STATUS_SUCCESS) {
-        print_mkl_status(status, "mkl_sparse_d_create_csr (W)");
+    if (create_sparse_handle(W, &W_mkl) != SPARSE_STATUS_SUCCESS) {
         free_dense_matrix(result);
         return NULL;
-    }
-
-    if (W->nnz > 0) {
-        status = mkl_sparse_optimize(W_mkl);
-        if (status != SPARSE_STATUS_SUCCESS) {
-            print_mkl_status(status, "mkl_sparse_optimize (W)");
-        }
     }
 
     printf("  Step 1: Calculating Temp_WX = W * X ...\n");
@@ -430,23 +418,13 @@ double calculate_single_gene_moran_i(const double* gene_data, const SparseMatrix
     }
 
     sparse_matrix_t W_mkl;
-    sparse_status_t status = mkl_sparse_d_create_csr(&W_mkl, SPARSE_INDEX_BASE_ZERO,
-                                                     W->nrows, W->ncols, W->row_ptr,
-                                                     W->row_ptr + 1, W->col_ind, W->values);
-    if (status != SPARSE_STATUS_SUCCESS) {
-        print_mkl_status(status, "mkl_sparse_d_create_csr (W for single_gene_moran_i)");
+    if (create_sparse_handle(W, &W_mkl) != SPARSE_STATUS_SUCCESS) {
         mkl_free(Wz);
         return NAN;
     }
 
-    if (W->nnz > 0) {
-        status = mkl_sparse_optimize(W_mkl);
-        if (status != SPARSE_STATUS_SUCCESS) {
-            print_mkl_status(status, "mkl_sparse_optimize (W for single_gene_moran_i)");
-        }
-    }
-
     struct matrix_descr descrW;
+    sparse_status_t status;
     descrW.type = SPARSE_MATRIX_TYPE_GENERAL;
     status = mkl_sparse_d_mv(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, W_mkl, descrW, gene_data, 0.0, Wz);
     mkl_sparse_destroy(W_mkl);
@@ -529,23 +507,13 @@ double* calculate_first_gene_vs_all(const DenseMatrix* X, const SparseMatrix* W,
     }
 
     sparse_matrix_t W_mkl;
-    sparse_status_t status = mkl_sparse_d_create_csr(&W_mkl, SPARSE_INDEX_BASE_ZERO,
-                                                     W->nrows, W->ncols, W->row_ptr,
-                                                     W->row_ptr + 1, W->col_ind, W->values);
-    if (status != SPARSE_STATUS_SUCCESS) {
-        print_mkl_status(status, "mkl_sparse_d_create_csr (W for first_gene_vs_all)");
+    if (create_sparse_handle(W, &W_mkl) != SPARSE_STATUS_SUCCESS) {
         mkl_free(W_z0); mkl_free(z0_data); mkl_free(moran_I_results);
         return NULL;
     }
 
-    if (W->nnz > 0) {
-        status = mkl_sparse_optimize(W_mkl);
-        if (status != SPARSE_STATUS_SUCCESS) {
-            print_mkl_status(status, "mkl_sparse_optimize (W for first_gene_vs_all)");
-        }
-    }
-
     struct matrix_descr descrW;
+    sparse_status_t status;
     descrW.type = SPARSE_MATRIX_TYPE_GENERAL;
     status = mkl_sparse_d_mv(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, W_mkl, descrW, z0_data, 0.0, W_z0);
     mkl_sparse_destroy(W_mkl);
