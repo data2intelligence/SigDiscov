@@ -7,13 +7,7 @@
  * the Moran's I spatial autocorrelation library.
  */
 
-#include <errno.h>
 #include <unistd.h>
-#include <limits.h>
-#include <stdint.h>
-#include <regex.h>
-#include <ctype.h>
-#include <float.h>
 #include "morans_i_internal.h"
 
 /* ===============================

@@ -16,6 +16,9 @@
 #include <ctype.h>    /* for isspace() used by trim_whitespace_inplace */
 #include <stdint.h>   /* for SIZE_MAX used by safe_multiply_size_t */
 #include <limits.h>
+#include <float.h>    /* for DBL_EPSILON, DBL_MAX */
+#include <regex.h>    /* for regex_t, regcomp, regexec */
+#include <errno.h>    /* for errno, strerror */
 
 /* Define M_PI if not provided by math.h */
 #ifndef M_PI

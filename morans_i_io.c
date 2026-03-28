@@ -6,9 +6,6 @@
  * Split from morans_i_mkl.c v1.3.0
  */
 
-#include <errno.h>
-#include <regex.h>
-#include <float.h>
 #include <unistd.h>
 #include "morans_i_internal.h"
 
