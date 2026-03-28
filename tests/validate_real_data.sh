@@ -6,15 +6,16 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=100G
 #SBATCH --time=12:00:00
-#SBATCH --output=/vf/users/parks34/projects/0sigdiscov/pkg_dev/data2intelligence/SigDiscov/tests/output/validate_%j.log
+#SBATCH --output=tests/output/validate_%j.log
 
 set -euo pipefail
 
-PROJECT_DIR="/vf/users/parks34/projects/0sigdiscov/pkg_dev/data2intelligence/SigDiscov"
+# Configurable via environment variables
+PROJECT_DIR="${SIGDISCOV_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$PROJECT_DIR"
 
-INPUT="/data/parks34/projects/0sigdiscov/archive/moran_i/datasets/visium/vst/1_vst.tsv"
-EXPECTED="/data/parks34/projects/0sigdiscov/archive/moran_i/datasets/1_spatial_sig_vst_inhouse_s0_r3.tsv"
+INPUT="${SIGDISCOV_INPUT:-/data/parks34/projects/0sigdiscov/archive/moran_i/datasets/visium/vst/1_vst.tsv}"
+EXPECTED="${SIGDISCOV_EXPECTED:-/data/parks34/projects/0sigdiscov/archive/moran_i/datasets/1_spatial_sig_vst_inhouse_s0_r3.tsv}"
 OUTPUT_DIR="${PROJECT_DIR}/tests/output"
 OUTPUT_PREFIX="${OUTPUT_DIR}/validate_1_vst"
 

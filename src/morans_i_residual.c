@@ -715,16 +715,14 @@ DenseMatrix* calculate_residual_morans_i_matrix(const DenseMatrix* R_normalized,
     }
 
     // Copy gene names
-    for (MKL_INT i = 0; i < n_genes; i++) {
-        if (R_normalized->colnames && R_normalized->colnames[i]) {
-            result->rownames[i] = strdup(R_normalized->colnames[i]);
-            result->colnames[i] = strdup(R_normalized->colnames[i]);
-            if (!result->rownames[i] || !result->colnames[i]) {
-                perror("Failed to duplicate gene names for Residual Moran's I result");
-                free_dense_matrix(result);
-                return NULL;
-            }
-        } else {
+    if (R_normalized->colnames) {
+        if (copy_string_array(result->rownames, (const char**)R_normalized->colnames, n_genes) != MORANS_I_SUCCESS ||
+            copy_string_array(result->colnames, (const char**)R_normalized->colnames, n_genes) != MORANS_I_SUCCESS) {
+            free_dense_matrix(result);
+            return NULL;
+        }
+    } else {
+        for (MKL_INT i = 0; i < n_genes; i++) {
             char default_name_buf[32];
             snprintf(default_name_buf, sizeof(default_name_buf), "Gene%lld", (long long)i);
             result->rownames[i] = strdup(default_name_buf);
@@ -943,18 +941,20 @@ ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTyp
  * =============================== */
 
 /* Residual permutation worker function */
-static int residual_permutation_worker(const DenseMatrix* X_original,
-                                      const CellTypeMatrix* Z,
-                                      const SparseMatrix* W,
-                                      const ResidualConfig* config,
-                                      const PermutationParams* params,
+static int residual_permutation_worker(const ResidualPermWorkerContext* ctx,
                                       int thread_id,
                                       int start_perm,
                                       int end_perm,
                                       double* local_mean_sum,
                                       double* local_var_sum_sq,
-                                      double* local_p_counts,
-                                      const DenseMatrix* observed_results) {
+                                      double* local_p_counts) {
+
+    const DenseMatrix* X_original = ctx->X_original;
+    const CellTypeMatrix* Z = ctx->Z;
+    const SparseMatrix* W = ctx->W;
+    const ResidualConfig* config = ctx->config;
+    const PermutationParams* params = ctx->params;
+    const DenseMatrix* observed_results = ctx->observed_results;
 
     MKL_INT n_spots = X_original->nrows;
     MKL_INT n_genes = X_original->ncols;
@@ -1105,6 +1105,14 @@ PermutationResults* run_residual_permutation_test(const DenseMatrix* X, const Ce
     printf("Starting residual permutation loop (%d permutations) using %d OpenMP threads...\n",
            n_perm, num_threads);
 
+    ResidualPermWorkerContext ctx;
+    ctx.X_original = X;
+    ctx.Z = Z;
+    ctx.W = W;
+    ctx.config = config;
+    ctx.params = params;
+    ctx.observed_results = observed_results;
+
     volatile int error_occurred = 0;
     double loop_start_time = get_time();
 
@@ -1135,10 +1143,10 @@ PermutationResults* run_residual_permutation_test(const DenseMatrix* X, const Ce
             }
         } else if (!error_occurred) {
             // Run permutations for this thread
-            int worker_result = residual_permutation_worker(X, Z, W, config, params, thread_id,
+            int worker_result = residual_permutation_worker(&ctx, thread_id,
                                                           start_perm, end_perm,
                                                           local_mean_sum, local_var_sum_sq,
-                                                          local_p_counts, observed_results);
+                                                          local_p_counts);
 
             if (worker_result != 0) {
                 #pragma omp critical

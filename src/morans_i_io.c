@@ -47,21 +47,30 @@ int detect_file_delimiter(const char* filename) {
     return (comma_count > tab_count) ? ',' : '\t';
 }
 
+/* Structs for parse_celltype_header parameter encapsulation */
+typedef struct {
+    const char* id_col;
+    const char* type_col;
+    const char* x_col;
+    const char* y_col;
+} CelltypeColumnSpec;
+
+typedef struct {
+    int id_col_idx;
+    int type_col_idx;
+    int x_col_idx;
+    int y_col_idx;
+} CelltypeColumnIndices;
+
 /* Parse cell type header to find column indices */
 static int parse_celltype_header(const char* header_line, char delimiter,
-                                const char* expected_id_col,
-                                const char* expected_type_col,
-                                const char* expected_x_col,
-                                const char* expected_y_col,
-                                int* id_col_idx,
-                                int* type_col_idx,
-                                int* x_col_idx,
-                                int* y_col_idx) {
-    if (!header_line || !expected_id_col || !expected_type_col) {
+                                const CelltypeColumnSpec* spec,
+                                CelltypeColumnIndices* indices) {
+    if (!header_line || !spec || !indices || !spec->id_col || !spec->type_col) {
         return MORANS_I_ERROR_PARAMETER;
     }
 
-    *id_col_idx = *type_col_idx = *x_col_idx = *y_col_idx = -1;
+    indices->id_col_idx = indices->type_col_idx = indices->x_col_idx = indices->y_col_idx = -1;
 
     char* header_copy = strdup(header_line);
     if (!header_copy) {
@@ -83,14 +92,14 @@ static int parse_celltype_header(const char* header_line, char delimiter,
             continue;
         }
 
-        if (strcmp(trimmed, expected_id_col) == 0) {
-            *id_col_idx = col_idx;
-        } else if (strcmp(trimmed, expected_type_col) == 0) {
-            *type_col_idx = col_idx;
-        } else if (expected_x_col && strcmp(trimmed, expected_x_col) == 0) {
-            *x_col_idx = col_idx;
-        } else if (expected_y_col && strcmp(trimmed, expected_y_col) == 0) {
-            *y_col_idx = col_idx;
+        if (strcmp(trimmed, spec->id_col) == 0) {
+            indices->id_col_idx = col_idx;
+        } else if (strcmp(trimmed, spec->type_col) == 0) {
+            indices->type_col_idx = col_idx;
+        } else if (spec->x_col && strcmp(trimmed, spec->x_col) == 0) {
+            indices->x_col_idx = col_idx;
+        } else if (spec->y_col && strcmp(trimmed, spec->y_col) == 0) {
+            indices->y_col_idx = col_idx;
         }
 
         token = strtok(NULL, delim_str);
@@ -100,7 +109,8 @@ static int parse_celltype_header(const char* header_line, char delimiter,
     free(header_copy);
 
     DEBUG_PRINT("Column indices: ID=%d, Type=%d, X=%d, Y=%d",
-                *id_col_idx, *type_col_idx, *x_col_idx, *y_col_idx);
+                indices->id_col_idx, indices->type_col_idx,
+                indices->x_col_idx, indices->y_col_idx);
 
     return MORANS_I_SUCCESS;
 }
@@ -253,14 +263,24 @@ CellTypeMatrix* read_celltype_singlecell_file(const char* filename,
         return NULL;
     }
 
-    int id_col_idx, type_col_idx, x_col_idx, y_col_idx;
-    if (parse_celltype_header(line, delimiter, cell_id_col, celltype_col, x_col, y_col,
-                             &id_col_idx, &type_col_idx, &x_col_idx, &y_col_idx) != MORANS_I_SUCCESS) {
+    CelltypeColumnSpec col_spec;
+    col_spec.id_col = cell_id_col;
+    col_spec.type_col = celltype_col;
+    col_spec.x_col = x_col;
+    col_spec.y_col = y_col;
+
+    CelltypeColumnIndices col_indices;
+    if (parse_celltype_header(line, delimiter, &col_spec, &col_indices) != MORANS_I_SUCCESS) {
         fprintf(stderr, "Error: Failed to parse cell type file header\n");
         fclose(fp);
         if (line) free(line);
         return NULL;
     }
+
+    int id_col_idx = col_indices.id_col_idx;
+    int type_col_idx = col_indices.type_col_idx;
+    int x_col_idx = col_indices.x_col_idx;
+    int y_col_idx = col_indices.y_col_idx;
 
     if (id_col_idx < 0 || type_col_idx < 0) {
         fprintf(stderr, "Error: Required columns not found: %s=%s, %s=%s\n",

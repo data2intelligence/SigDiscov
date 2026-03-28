@@ -7,15 +7,16 @@
 #SBATCH --mem=100G
 #SBATCH --gres=lscratch:50
 #SBATCH --time=02:00:00
-#SBATCH --output=/vf/users/parks34/projects/0sigdiscov/pkg_dev/data2intelligence/SigDiscov/tests/output/benchmark_%j.log
+#SBATCH --output=tests/output/benchmark_%j.log
 
 set -euo pipefail
 
-PROJECT_DIR="/vf/users/parks34/projects/0sigdiscov/pkg_dev/data2intelligence/SigDiscov"
+# Configurable via environment variables
+PROJECT_DIR="${SIGDISCOV_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$PROJECT_DIR"
 
-INPUT="/data/parks34/projects/0sigdiscov/archive/moran_i/datasets/visium/vst/1_vst.tsv"
-EXPECTED="/data/parks34/projects/0sigdiscov/archive/moran_i/datasets/1_spatial_sig_vst_inhouse_s0_r3.tsv"
+INPUT="${SIGDISCOV_INPUT:-/data/parks34/projects/0sigdiscov/archive/moran_i/datasets/visium/vst/1_vst.tsv}"
+EXPECTED="${SIGDISCOV_EXPECTED:-/data/parks34/projects/0sigdiscov/archive/moran_i/datasets/1_spatial_sig_vst_inhouse_s0_r3.tsv}"
 OUTPUT_DIR="${PROJECT_DIR}/tests/output"
 mkdir -p "$OUTPUT_DIR"
 

@@ -101,6 +101,16 @@ MKL_INT spot_name_ht_find(const SpotNameHashTable* ht, const char* name);
  */
 void spot_name_ht_free(SpotNameHashTable* ht);
 
+/* --- String array copy helper --- */
+
+/**
+ * Copy an array of strings via strdup.
+ * Returns MORANS_I_SUCCESS on success, MORANS_I_ERROR_MEMORY on failure.
+ * On failure, already-copied entries in dest[0..i-1] are left as-is
+ * (caller is expected to free dest via free_dense_matrix or similar).
+ */
+int copy_string_array(char** dest, const char** src, MKL_INT count);
+
 /* --- Permutation parameter helpers --- */
 
 /**
@@ -114,6 +124,33 @@ static inline PermutationParams config_to_perm_params(const MoransIConfig* confi
     p.p_value_output = config->perm_output_pvalues;
     return p;
 }
+
+/* --- Permutation worker context structs --- */
+
+/**
+ * Context struct that groups the read-only inputs for permutation_worker(),
+ * reducing the number of function parameters.
+ */
+typedef struct {
+    const DenseMatrix* X_original;
+    const SparseMatrix* W;
+    const PermutationParams* params;
+    double scaling_factor;
+    const DenseMatrix* observed_results;
+} PermWorkerContext;
+
+/**
+ * Context struct for residual_permutation_worker(), grouping the
+ * read-only inputs specific to residual permutation testing.
+ */
+typedef struct {
+    const DenseMatrix* X_original;
+    const CellTypeMatrix* Z;
+    const SparseMatrix* W;
+    const ResidualConfig* config;
+    const PermutationParams* params;
+    const DenseMatrix* observed_results;
+} ResidualPermWorkerContext;
 
 /* --- Permutation result helpers --- */
 

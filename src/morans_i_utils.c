@@ -139,6 +139,21 @@ void spot_name_ht_free(SpotNameHashTable* ht) {
 }
 
 /* ===============================
+ * STRING ARRAY COPY HELPER
+ * =============================== */
+
+int copy_string_array(char** dest, const char** src, MKL_INT count) {
+    for (MKL_INT i = 0; i < count; i++) {
+        dest[i] = strdup(src[i]);
+        if (!dest[i]) {
+            perror("copy_string_array: strdup failed");
+            return MORANS_I_ERROR_MEMORY;
+        }
+    }
+    return MORANS_I_SUCCESS;
+}
+
+/* ===============================
  * UTILITY AND HELPER FUNCTIONS
  * =============================== */
 

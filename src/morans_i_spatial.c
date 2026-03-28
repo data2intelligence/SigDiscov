@@ -14,47 +14,26 @@
  * SPATIAL WEIGHT MATRIX FUNCTIONS
  * =============================== */
 
-/* Build spatial weight matrix W (Sparse CSR) with optional row normalization */
-SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const MKL_INT* spot_col_valid,
-                                         MKL_INT n_spots_valid, const DenseMatrix* distance_matrix,
-                                         MKL_INT max_radius, int row_normalize) {
+/* Forward declaration for merge_thread_coo (used inside parallel_compute_coo) */
+static void merge_thread_coo(const MKL_INT* local_I, const MKL_INT* local_J, const double* local_V,
+                             MKL_INT local_nnz,
+                             MKL_INT** global_I, MKL_INT** global_J, double** global_V,
+                             MKL_INT* global_nnz, MKL_INT* current_capacity,
+                             MKL_INT n_spots_valid, volatile int* critical_error_flag);
 
-    if (!spot_row_valid || !spot_col_valid || !distance_matrix || !distance_matrix->values) {
-        fprintf(stderr, "Error: Invalid parameters provided to build_spatial_weight_matrix\n");
-        return NULL;
-    }
-
-    if (validate_matrix_dimensions(n_spots_valid, n_spots_valid, "weight matrix") != MORANS_I_SUCCESS) {
-        return NULL;
-    }
-
-    if (n_spots_valid == 0) {
-        printf("Warning: n_spots_valid is 0 in build_spatial_weight_matrix. Returning empty W.\n");
-        SparseMatrix* W_empty = (SparseMatrix*)calloc(1, sizeof(SparseMatrix));
-        if(!W_empty) {
-            perror("calloc for empty W");
-            return NULL;
-        }
-        W_empty->nrows = 0;
-        W_empty->ncols = 0;
-        W_empty->nnz = 0;
-        W_empty->row_ptr = (MKL_INT*)mkl_calloc(1, sizeof(MKL_INT), 64); // n_spots_valid + 1 = 1
-        W_empty->col_ind = NULL;
-        W_empty->values = NULL;
-        if (!W_empty->row_ptr) {
-            perror("mkl_calloc for empty W->row_ptr");
-            free(W_empty);
-            return NULL;
-        }
-        return W_empty;
-    }
-
-    printf("Building sparse spatial weight matrix W (%lld x %lld)%s...\n",
-           (long long)n_spots_valid, (long long)n_spots_valid,
-           row_normalize ? " with row normalization" : "");
-
-    MKL_INT estimated_neighbors_per_spot = (MKL_INT)(M_PI * max_radius * max_radius * 1.5);
-    if (estimated_neighbors_per_spot <= 0) estimated_neighbors_per_spot = 27; // Default from STUtility (max_radius=5 -> ~117, this is lower)
+/*
+ * parallel_compute_coo() -- OpenMP parallel section that computes COO triplets
+ * from spot coordinates and a distance matrix.
+ *
+ * On success, *out_I, *out_J, *out_V hold the COO arrays and *out_nnz their count.
+ * Caller must free(*out_I), free(*out_J), free(*out_V) on success.
+ * Returns 0 on success, -1 on error (arrays freed internally on error).
+ */
+static int parallel_compute_coo(const MKL_INT* spot_row_valid, const MKL_INT* spot_col_valid,
+                                MKL_INT n_spots_valid, const DenseMatrix* distance_matrix,
+                                MKL_INT estimated_neighbors_per_spot,
+                                MKL_INT** out_I, MKL_INT** out_J, double** out_V,
+                                MKL_INT* out_nnz) {
 
     size_t initial_capacity_size_t;
     if (safe_multiply_size_t(n_spots_valid, estimated_neighbors_per_spot, &initial_capacity_size_t) != 0) {
@@ -81,7 +60,7 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
     if (!temp_I || !temp_J || !temp_V) {
         perror("Failed to allocate initial COO arrays");
         free(temp_I); free(temp_J); free(temp_V);
-        return NULL;
+        return -1;
     }
 
     volatile int critical_error_flag = 0; // Flag for critical errors like memory allocation
@@ -161,71 +140,10 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
 
         // Merge thread-local results into global COO arrays (critical section)
         if (!critical_error_flag && !thread_alloc_error && local_nnz_tl > 0) {
-            #pragma omp critical
-            {
-                if (!critical_error_flag) { // Re-check global error flag inside critical section
-                    if (nnz_count + local_nnz_tl > current_capacity) { // Resize global buffer if needed
-                        MKL_INT needed_capacity = nnz_count + local_nnz_tl;
-                        MKL_INT new_global_capacity = current_capacity;
-                        while(new_global_capacity < needed_capacity && new_global_capacity > 0) { // Prevent overflow with new_global_capacity > 0
-                            new_global_capacity = (MKL_INT)(new_global_capacity * 1.5) + 1;
-                            if (new_global_capacity <= current_capacity) { // Overflow or no increase
-                                new_global_capacity = needed_capacity > current_capacity ? needed_capacity : current_capacity + 1; // Try to reach at least needed
-                                if (new_global_capacity <= current_capacity) { // Still stuck, indicates potential overflow
-                                    critical_error_flag = 1; break;
-                                }
-                            }
-                        }
-                        if(critical_error_flag) {
-                             fprintf(stderr, "Error: Global COO buffer resize failed due to capacity calculation issue.\n");
-                        }
-
-                        size_t max_dense_nnz;
-                        if (safe_multiply_size_t(n_spots_valid, n_spots_valid, &max_dense_nnz) == 0 &&
-                            new_global_capacity > (MKL_INT)max_dense_nnz) {
-                            new_global_capacity = (MKL_INT)max_dense_nnz;
-                        }
-
-                        if (needed_capacity > new_global_capacity && n_spots_valid > 0) { // Check if still insufficient
-                            fprintf(stderr, "Error: Cannot resize global COO buffer large enough (%lld needed, max %lld).\n",
-                                   (long long)needed_capacity, (long long)new_global_capacity);
-                            critical_error_flag = 1;
-                        } else if (n_spots_valid > 0 && !critical_error_flag) {
-                            printf("  Resizing global COO buffer from %lld to %lld\n",
-                                   (long long)current_capacity, (long long)new_global_capacity);
-                            MKL_INT* temp_gi_new = (MKL_INT*)realloc(temp_I, (size_t)new_global_capacity * sizeof(MKL_INT));
-                            MKL_INT* temp_gj_new = (MKL_INT*)realloc(temp_J, (size_t)new_global_capacity * sizeof(MKL_INT));
-                            double*  temp_gv_new = (double*)realloc(temp_V, (size_t)new_global_capacity * sizeof(double));
-
-                            if (!temp_gi_new || !temp_gj_new || !temp_gv_new) {
-                                fprintf(stderr, "Error: Failed to realloc global COO buffers.\n");
-                                critical_error_flag = 1;
-                                // Keep old pointers if realloc failed, to free them later
-                                temp_I = temp_gi_new ? temp_gi_new : temp_I;
-                                temp_J = temp_gj_new ? temp_gj_new : temp_J;
-                                temp_V = temp_gv_new ? temp_gv_new : temp_V;
-                            } else {
-                                temp_I = temp_gi_new;
-                                temp_J = temp_gj_new;
-                                temp_V = temp_gv_new;
-                                current_capacity = new_global_capacity;
-                            }
-                        }
-                    }
-
-                    // Copy local data to global arrays if no critical error and space is sufficient
-                    if (!critical_error_flag && (nnz_count + local_nnz_tl <= current_capacity)) {
-                        memcpy(temp_I + nnz_count, local_I_tl, (size_t)local_nnz_tl * sizeof(MKL_INT));
-                        memcpy(temp_J + nnz_count, local_J_tl, (size_t)local_nnz_tl * sizeof(MKL_INT));
-                        memcpy(temp_V + nnz_count, local_V_tl, (size_t)local_nnz_tl * sizeof(double));
-                        nnz_count += local_nnz_tl;
-                    } else if (!critical_error_flag) { // Should not happen if resize logic is correct
-                        fprintf(stderr, "Warning: Could not merge thread %d results due to insufficient space after resize attempt.\n", omp_get_thread_num());
-                        critical_error_flag = 1; // Treat as critical if merge fails
-                    }
-                } // End of if (!critical_error_flag) inside critical section
-            } // End of omp critical
-        } // End of if (!critical_error_flag && !thread_alloc_error && local_nnz_tl > 0)
+            merge_thread_coo(local_I_tl, local_J_tl, local_V_tl, local_nnz_tl,
+                             &temp_I, &temp_J, &temp_V, &nnz_count, &current_capacity,
+                             n_spots_valid, &critical_error_flag);
+        }
 
         // Free thread-local buffers
         if(local_I_tl) free(local_I_tl);
@@ -236,13 +154,102 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
     if (critical_error_flag) {
         fprintf(stderr, "Error: A critical error occurred during parallel COO matrix construction.\n");
         free(temp_I); free(temp_J); free(temp_V);
-        return NULL;
+        return -1;
     }
 
-    printf("  Generated %lld non-zero entries (COO format).\n", (long long)nnz_count);
-    if (nnz_count == 0 && n_spots_valid > 0) {
-        printf("Warning: No non-zero weights found. Moran's I will likely be zero or undefined.\n");
-    }
+    *out_I = temp_I;
+    *out_J = temp_J;
+    *out_V = temp_V;
+    *out_nnz = nnz_count;
+    return 0;
+}
+
+/*
+ * merge_thread_coo() -- Merge thread-local COO triplets into the global arrays.
+ * Must be called inside an OpenMP critical section.
+ *
+ * On error, sets *critical_error_flag to 1.
+ */
+static void merge_thread_coo(const MKL_INT* local_I, const MKL_INT* local_J, const double* local_V,
+                             MKL_INT local_nnz,
+                             MKL_INT** global_I, MKL_INT** global_J, double** global_V,
+                             MKL_INT* global_nnz, MKL_INT* current_capacity,
+                             MKL_INT n_spots_valid, volatile int* critical_error_flag) {
+    #pragma omp critical
+    {
+        if (!(*critical_error_flag)) { // Re-check global error flag inside critical section
+            if (*global_nnz + local_nnz > *current_capacity) { // Resize global buffer if needed
+                MKL_INT needed_capacity = *global_nnz + local_nnz;
+                MKL_INT new_global_capacity = *current_capacity;
+                while(new_global_capacity < needed_capacity && new_global_capacity > 0) { // Prevent overflow with new_global_capacity > 0
+                    new_global_capacity = (MKL_INT)(new_global_capacity * 1.5) + 1;
+                    if (new_global_capacity <= *current_capacity) { // Overflow or no increase
+                        new_global_capacity = needed_capacity > *current_capacity ? needed_capacity : *current_capacity + 1; // Try to reach at least needed
+                        if (new_global_capacity <= *current_capacity) { // Still stuck, indicates potential overflow
+                            *critical_error_flag = 1; break;
+                        }
+                    }
+                }
+                if(*critical_error_flag) {
+                     fprintf(stderr, "Error: Global COO buffer resize failed due to capacity calculation issue.\n");
+                }
+
+                size_t max_dense_nnz;
+                if (safe_multiply_size_t(n_spots_valid, n_spots_valid, &max_dense_nnz) == 0 &&
+                    new_global_capacity > (MKL_INT)max_dense_nnz) {
+                    new_global_capacity = (MKL_INT)max_dense_nnz;
+                }
+
+                if (needed_capacity > new_global_capacity && n_spots_valid > 0) { // Check if still insufficient
+                    fprintf(stderr, "Error: Cannot resize global COO buffer large enough (%lld needed, max %lld).\n",
+                           (long long)needed_capacity, (long long)new_global_capacity);
+                    *critical_error_flag = 1;
+                } else if (n_spots_valid > 0 && !(*critical_error_flag)) {
+                    printf("  Resizing global COO buffer from %lld to %lld\n",
+                           (long long)*current_capacity, (long long)new_global_capacity);
+                    MKL_INT* temp_gi_new = (MKL_INT*)realloc(*global_I, (size_t)new_global_capacity * sizeof(MKL_INT));
+                    MKL_INT* temp_gj_new = (MKL_INT*)realloc(*global_J, (size_t)new_global_capacity * sizeof(MKL_INT));
+                    double*  temp_gv_new = (double*)realloc(*global_V, (size_t)new_global_capacity * sizeof(double));
+
+                    if (!temp_gi_new || !temp_gj_new || !temp_gv_new) {
+                        fprintf(stderr, "Error: Failed to realloc global COO buffers.\n");
+                        *critical_error_flag = 1;
+                        // Keep old pointers if realloc failed, to free them later
+                        *global_I = temp_gi_new ? temp_gi_new : *global_I;
+                        *global_J = temp_gj_new ? temp_gj_new : *global_J;
+                        *global_V = temp_gv_new ? temp_gv_new : *global_V;
+                    } else {
+                        *global_I = temp_gi_new;
+                        *global_J = temp_gj_new;
+                        *global_V = temp_gv_new;
+                        *current_capacity = new_global_capacity;
+                    }
+                }
+            }
+
+            // Copy local data to global arrays if no critical error and space is sufficient
+            if (!(*critical_error_flag) && (*global_nnz + local_nnz <= *current_capacity)) {
+                memcpy(*global_I + *global_nnz, local_I, (size_t)local_nnz * sizeof(MKL_INT));
+                memcpy(*global_J + *global_nnz, local_J, (size_t)local_nnz * sizeof(MKL_INT));
+                memcpy(*global_V + *global_nnz, local_V, (size_t)local_nnz * sizeof(double));
+                *global_nnz += local_nnz;
+            } else if (!(*critical_error_flag)) { // Should not happen if resize logic is correct
+                fprintf(stderr, "Warning: Could not merge thread %d results due to insufficient space after resize attempt.\n", omp_get_thread_num());
+                *critical_error_flag = 1; // Treat as critical if merge fails
+            }
+        } // End of if (!*critical_error_flag) inside critical section
+    } // End of omp critical
+}
+
+/*
+ * coo_to_csr() -- Convert COO triplets to a SparseMatrix in CSR format.
+ *
+ * On success, returns a newly allocated SparseMatrix. The COO arrays
+ * (temp_I, temp_J, temp_V) are freed by this function regardless of outcome.
+ * Returns NULL on allocation failure.
+ */
+static SparseMatrix* coo_to_csr(MKL_INT* temp_I, MKL_INT* temp_J, double* temp_V,
+                                MKL_INT nnz_count, MKL_INT n_spots_valid) {
 
     SparseMatrix* W = (SparseMatrix*)malloc(sizeof(SparseMatrix));
     if (!W) {
@@ -308,33 +315,112 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
     }
 
     free(temp_I); free(temp_J); free(temp_V);
+    return W;
+}
 
-    // Row normalization if requested
-    if (row_normalize && W->nnz > 0) {
-        printf("  Performing row normalization...\n");
-        MKL_INT normalized_rows = 0;
+/*
+ * apply_row_normalization() -- Normalize each row of a CSR sparse matrix
+ * so that the row sums to 1.
+ */
+static void apply_row_normalization(SparseMatrix* W) {
+    if (!W || W->nnz <= 0) return;
 
-        #pragma omp parallel for reduction(+:normalized_rows)
-        for (MKL_INT i = 0; i < n_spots_valid; i++) {
-            MKL_INT row_start = W->row_ptr[i];
-            MKL_INT row_end = W->row_ptr[i + 1];
+    MKL_INT n_spots_valid = W->nrows;
 
-            if (row_end > row_start) { // If row is not empty
-                double row_sum = 0.0;
+    printf("  Performing row normalization...\n");
+    MKL_INT normalized_rows = 0;
+
+    #pragma omp parallel for reduction(+:normalized_rows)
+    for (MKL_INT i = 0; i < n_spots_valid; i++) {
+        MKL_INT row_start = W->row_ptr[i];
+        MKL_INT row_end = W->row_ptr[i + 1];
+
+        if (row_end > row_start) { // If row is not empty
+            double row_sum = 0.0;
+            for (MKL_INT k = row_start; k < row_end; k++) {
+                row_sum += W->values[k];
+            }
+
+            if (row_sum > ZERO_STD_THRESHOLD) { // Avoid division by zero or tiny numbers
                 for (MKL_INT k = row_start; k < row_end; k++) {
-                    row_sum += W->values[k];
+                    W->values[k] /= row_sum;
                 }
-
-                if (row_sum > ZERO_STD_THRESHOLD) { // Avoid division by zero or tiny numbers
-                    for (MKL_INT k = row_start; k < row_end; k++) {
-                        W->values[k] /= row_sum;
-                    }
-                    normalized_rows++;
-                }
+                normalized_rows++;
             }
         }
+    }
 
-        printf("  Row normalization complete: %lld rows normalized.\n", (long long)normalized_rows);
+    printf("  Row normalization complete: %lld rows normalized.\n", (long long)normalized_rows);
+}
+
+/* Build spatial weight matrix W (Sparse CSR) with optional row normalization */
+SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const MKL_INT* spot_col_valid,
+                                         MKL_INT n_spots_valid, const DenseMatrix* distance_matrix,
+                                         MKL_INT max_radius, int row_normalize) {
+
+    if (!spot_row_valid || !spot_col_valid || !distance_matrix || !distance_matrix->values) {
+        fprintf(stderr, "Error: Invalid parameters provided to build_spatial_weight_matrix\n");
+        return NULL;
+    }
+
+    if (validate_matrix_dimensions(n_spots_valid, n_spots_valid, "weight matrix") != MORANS_I_SUCCESS) {
+        return NULL;
+    }
+
+    if (n_spots_valid == 0) {
+        printf("Warning: n_spots_valid is 0 in build_spatial_weight_matrix. Returning empty W.\n");
+        SparseMatrix* W_empty = (SparseMatrix*)calloc(1, sizeof(SparseMatrix));
+        if(!W_empty) {
+            perror("calloc for empty W");
+            return NULL;
+        }
+        W_empty->nrows = 0;
+        W_empty->ncols = 0;
+        W_empty->nnz = 0;
+        W_empty->row_ptr = (MKL_INT*)mkl_calloc(1, sizeof(MKL_INT), 64); // n_spots_valid + 1 = 1
+        W_empty->col_ind = NULL;
+        W_empty->values = NULL;
+        if (!W_empty->row_ptr) {
+            perror("mkl_calloc for empty W->row_ptr");
+            free(W_empty);
+            return NULL;
+        }
+        return W_empty;
+    }
+
+    printf("Building sparse spatial weight matrix W (%lld x %lld)%s...\n",
+           (long long)n_spots_valid, (long long)n_spots_valid,
+           row_normalize ? " with row normalization" : "");
+
+    MKL_INT estimated_neighbors_per_spot = (MKL_INT)(M_PI * max_radius * max_radius * 1.5);
+    if (estimated_neighbors_per_spot <= 0) estimated_neighbors_per_spot = 27; // Default from STUtility (max_radius=5 -> ~117, this is lower)
+
+    /* Step 1: Parallel COO computation */
+    MKL_INT* temp_I = NULL;
+    MKL_INT* temp_J = NULL;
+    double* temp_V = NULL;
+    MKL_INT nnz_count = 0;
+
+    if (parallel_compute_coo(spot_row_valid, spot_col_valid, n_spots_valid, distance_matrix,
+                             estimated_neighbors_per_spot,
+                             &temp_I, &temp_J, &temp_V, &nnz_count) != 0) {
+        return NULL;
+    }
+
+    printf("  Generated %lld non-zero entries (COO format).\n", (long long)nnz_count);
+    if (nnz_count == 0 && n_spots_valid > 0) {
+        printf("Warning: No non-zero weights found. Moran's I will likely be zero or undefined.\n");
+    }
+
+    /* Step 2: Convert COO to CSR (frees temp_I, temp_J, temp_V) */
+    SparseMatrix* W = coo_to_csr(temp_I, temp_J, temp_V, nnz_count, n_spots_valid);
+    if (!W) {
+        return NULL;
+    }
+
+    /* Step 3: Optional row normalization */
+    if (row_normalize) {
+        apply_row_normalization(W);
     }
 
     printf("Sparse weight matrix W built successfully (CSR format, %lld NNZ).\n", (long long)W->nnz);

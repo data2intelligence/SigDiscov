@@ -69,25 +69,17 @@ DenseMatrix* z_normalize(const DenseMatrix* data_matrix) {
     }
 
     // Copy names safely
-    for (MKL_INT i = 0; i < n_genes; i++) {
-        if (data_matrix->rownames && data_matrix->rownames[i]) {
-            normalized->rownames[i] = strdup(data_matrix->rownames[i]);
-            if (!normalized->rownames[i]) {
-                perror("Failed to duplicate row name (gene)");
-                free_dense_matrix(normalized);
-                return NULL;
-            }
+    if (data_matrix->rownames) {
+        if (copy_string_array(normalized->rownames, (const char**)data_matrix->rownames, n_genes) != MORANS_I_SUCCESS) {
+            free_dense_matrix(normalized);
+            return NULL;
         }
     }
 
-    for (MKL_INT j = 0; j < n_spots; j++) {
-        if (data_matrix->colnames && data_matrix->colnames[j]) {
-            normalized->colnames[j] = strdup(data_matrix->colnames[j]);
-            if (!normalized->colnames[j]) {
-                perror("Failed to duplicate column name (spot)");
-                free_dense_matrix(normalized);
-                return NULL;
-            }
+    if (data_matrix->colnames) {
+        if (copy_string_array(normalized->colnames, (const char**)data_matrix->colnames, n_spots) != MORANS_I_SUCCESS) {
+            free_dense_matrix(normalized);
+            return NULL;
         }
     }
 
@@ -256,16 +248,14 @@ DenseMatrix* calculate_morans_i(const DenseMatrix* X, const SparseMatrix* W, int
     }
 
     // Copy gene names
-    for (MKL_INT i = 0; i < n_genes; i++) {
-        if (X->colnames && X->colnames[i]) {
-            result->rownames[i] = strdup(X->colnames[i]);
-            result->colnames[i] = strdup(X->colnames[i]);
-            if (!result->rownames[i] || !result->colnames[i]) {
-                perror("Failed to duplicate gene names for Moran's I result");
-                free_dense_matrix(result);
-                return NULL;
-            }
-        } else {
+    if (X->colnames) {
+        if (copy_string_array(result->rownames, (const char**)X->colnames, n_genes) != MORANS_I_SUCCESS ||
+            copy_string_array(result->colnames, (const char**)X->colnames, n_genes) != MORANS_I_SUCCESS) {
+            free_dense_matrix(result);
+            return NULL;
+        }
+    } else {
+        for (MKL_INT i = 0; i < n_genes; i++) {
             char default_name_buf[32];
             snprintf(default_name_buf, sizeof(default_name_buf), "Gene%lld", (long long)i);
             result->rownames[i] = strdup(default_name_buf);

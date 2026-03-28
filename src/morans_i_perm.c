@@ -15,17 +15,19 @@
  * =============================== */
 
 /* Permutation worker function */
-static int permutation_worker(const DenseMatrix* X_original,
-                             const SparseMatrix* W,
-                             const PermutationParams* params,
+static int permutation_worker(const PermWorkerContext* ctx,
                              int thread_id,
                              int start_perm,
                              int end_perm,
-                             double scaling_factor,
                              double* local_mean_sum,
                              double* local_var_sum_sq,
-                             double* local_p_counts,
-                             const DenseMatrix* observed_results) {
+                             double* local_p_counts) {
+
+    const DenseMatrix* X_original = ctx->X_original;
+    const SparseMatrix* W = ctx->W;
+    const PermutationParams* params = ctx->params;
+    double scaling_factor = ctx->scaling_factor;
+    const DenseMatrix* observed_results = ctx->observed_results;
 
     MKL_INT n_spots = X_original->nrows;
     MKL_INT n_genes = X_original->ncols;
@@ -214,6 +216,13 @@ PermutationResults* run_permutation_test(const DenseMatrix* X_observed_spots_x_g
     printf("Starting permutation loop (%d permutations) using %d OpenMP threads...\n",
            n_perm, num_threads);
 
+    PermWorkerContext ctx;
+    ctx.X_original = X_observed_spots_x_genes;
+    ctx.W = W_spots_x_spots;
+    ctx.params = params;
+    ctx.scaling_factor = scaling_factor;
+    ctx.observed_results = observed_results;
+
     volatile int error_occurred = 0;
     double loop_start_time = get_time();
 
@@ -244,10 +253,9 @@ PermutationResults* run_permutation_test(const DenseMatrix* X_observed_spots_x_g
             }
         } else if (!error_occurred) {
             // Run permutations for this thread
-            int worker_result = permutation_worker(X_observed_spots_x_genes, W_spots_x_spots,
-                                                  params, thread_id, start_perm, end_perm,
-                                                  scaling_factor, local_mean_sum, local_var_sum_sq,
-                                                  local_p_counts, observed_results);
+            int worker_result = permutation_worker(&ctx, thread_id, start_perm, end_perm,
+                                                  local_mean_sum, local_var_sum_sq,
+                                                  local_p_counts);
 
             if (worker_result != 0) {
                 #pragma omp critical
