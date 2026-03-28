@@ -9,6 +9,7 @@
  * Split from morans_i_mkl.c for modularity.
  */
 
+#include <float.h>
 #include "morans_i_internal.h"
 
 /* ===============================
