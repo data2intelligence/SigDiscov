@@ -87,19 +87,36 @@ A Python script that generates custom weight matrices using the exact same algor
 
 ## Requirements
 
-- Intel oneAPI Base Toolkit (for the Intel LLVM-based compiler)
+### Option 1: Intel oneAPI (recommended for HPC)
+- Intel oneAPI Base Toolkit (for the Intel LLVM-based compiler `icx`)
 - Intel oneAPI Math Kernel Library (MKL)
+
+### Option 2: GCC + OpenBLAS (portable)
+- GCC with OpenMP support
+- OpenBLAS development libraries (`libopenblas-dev` on Debian/Ubuntu)
+
+### Common
 - C99-compatible compiler with OpenMP support
-- Python 3.6+ with numpy, pandas, scipy (for weight matrix generator)
+- Python 3.6+ with numpy, pandas, scipy (for weight matrix generator only)
 
 ## Installation
 
-### Prerequisites
+### Prerequisites (Intel MKL, recommended)
 
 1. Install Intel oneAPI Base Toolkit and MKL from [Intel's website](https://www.intel.com/content/www/us/en/developer/tools/oneapi/toolkits.html)
 2. Source the Intel oneAPI environment:
    ```bash
    source /opt/intel/oneapi/setvars.sh
+   ```
+
+### Prerequisites (GCC + OpenBLAS, portable)
+
+1. Install OpenBLAS:
+   ```bash
+   # Debian/Ubuntu
+   sudo apt-get install libopenblas-dev
+   # CentOS/RHEL
+   sudo yum install openblas-devel
    ```
 
 ### Building from Source
@@ -112,7 +129,11 @@ A Python script that generates custom weight matrices using the exact same algor
 
 2. Build with the provided Makefile:
    ```bash
+   # Intel MKL (default, recommended)
    make
+
+   # GCC + OpenBLAS (portable fallback)
+   make CC=gcc USE_OPENBLAS=1
    ```
 
 3. Optionally install system-wide:
@@ -120,11 +141,24 @@ A Python script that generates custom weight matrices using the exact same algor
    make install PREFIX=/usr/local
    ```
 
+### Running Tests
+
+```bash
+# On SLURM-managed HPC:
+sbatch tests/run_tests_slurm.sh
+
+# Direct execution (after building):
+./tests/run_tests.sh ./morans_i_mkl
+
+# Generate expected test outputs (first time only):
+./tests/run_tests.sh --generate-expected ./morans_i_mkl
+```
+
 ### Python Dependencies
 
 For the weight matrix generator tool:
 ```bash
-pip install numpy pandas scipy
+pip install -r requirements.txt
 ```
 
 ### Makefile Options

@@ -16,9 +16,14 @@
 #include <time.h>  /* For timing functions, time() */
 #include <string.h>  /* For string manipulation functions */
 #include <omp.h>     /* For OpenMP parallelization */
+
+#ifdef USE_OPENBLAS
+#include "openblas_compat.h"
+#else
 #include "mkl.h"
 #include "mkl_spblas.h"
 #include "mkl_vml.h"  /* For vdDiv and other VML functions */
+#endif
 
 /* Library version */
 #define MORANS_I_MKL_VERSION "1.3.0"

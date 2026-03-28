@@ -25,6 +25,18 @@
 *.jpg
 *.jpeg
 
+# Build artifacts
+*.o
+*.d
+morans_i_mkl
+*.bak
+
+# Test outputs
+tests/output/
+
+# Planning artifacts
+docs/superpowers/
+
 # Logs and temp files
 *.log
 *.tmp
