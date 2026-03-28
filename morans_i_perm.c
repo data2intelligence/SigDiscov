@@ -66,6 +66,7 @@ static int permutation_worker(const DenseMatrix* X_original,
 
     struct matrix_descr descr;
     descr.type = SPARSE_MATRIX_TYPE_GENERAL;
+    sparse_status_t status;
 
     unsigned int local_seed = params->seed + thread_id + 1;
 
