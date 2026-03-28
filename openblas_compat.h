@@ -24,7 +24,8 @@
  * Type mappings
  * ============================================================ */
 
-typedef int64_t MKL_INT;
+/* Use int to match OpenBLAS/LAPACKE lapack_int (32-bit) */
+typedef int MKL_INT;
 
 /* Sparse BLAS status codes */
 typedef int sparse_status_t;

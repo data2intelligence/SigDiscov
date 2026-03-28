@@ -48,7 +48,7 @@ ifdef USE_OPENBLAS
     OPENBLAS_ROOT ?= /usr
     INCLUDES = -I$(OPENBLAS_ROOT)/include
     LDFLAGS = -fopenmp
-    LIBS_LINK = -lopenblas -lpthread -lm -ldl
+    LIBS_LINK = -lopenblas -llapacke -lpthread -lm -ldl
     LIBS = $(LDFLAGS) -L$(OPENBLAS_ROOT)/lib $(LIBS_LINK)
 
     BUILD_INFO = GCC + OpenBLAS

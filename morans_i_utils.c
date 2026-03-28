@@ -10,6 +10,11 @@
 #include <unistd.h>
 #include "morans_i_internal.h"
 
+/* Library version information */
+const char* morans_i_mkl_version(void) {
+    return "1.3.0";
+}
+
 /* ===============================
  * HASH TABLE IMPLEMENTATIONS
  * =============================== */
