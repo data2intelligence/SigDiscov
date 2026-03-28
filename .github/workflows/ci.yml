@@ -51,6 +51,8 @@ jobs:
 
       - name: Lint Python files
         run: |
+          # Suppressions: W29x=whitespace, E302/E305=blank lines,
+          # E231=space after comma, F541=f-string without placeholders
           flake8 tools/make_custom_w.py \
             --max-line-length=160 \
             --extend-ignore=W291,W292,W293,E302,E305,E231,F541 \

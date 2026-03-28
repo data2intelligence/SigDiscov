@@ -20,7 +20,7 @@ OUTPUT_PREFIX="${OUTPUT_DIR}/validate_1_vst"
 
 mkdir -p "$OUTPUT_DIR"
 
-module load intel/2024.0.1.46
+module load intel/2024.0.1.46 || { echo "ERROR: Intel module not available"; exit 1; }
 
 echo "=== Building ==="
 make clean && make

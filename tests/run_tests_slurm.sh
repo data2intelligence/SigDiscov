@@ -21,7 +21,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 # Load Intel oneAPI
-module load intel/2024.0.1.46
+module load intel/2024.0.1.46 || { echo "ERROR: Intel module not available"; exit 1; }
 
 # Build
 echo "=== Building ==="

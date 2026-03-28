@@ -42,6 +42,12 @@
 #define DEFAULT_CALC_ALL_VS_ALL 1     /* Default: calculate all genes vs all genes */
 #define DEFAULT_INCLUDE_SAME_SPOT 0   /* Default: exclude self-connections */
 #define DEFAULT_COORD_SCALE_FACTOR 100.0  /* Default coordinate scaling factor for single-cell grid conversion */
+#define SIGMA_VISIUM 100.0               /* RBF sigma for Visium platform (um) */
+#define SIGMA_OLD_ST 200.0               /* RBF sigma for older ST platforms (um) */
+#define DIST_UNIT_VISIUM 100.0           /* Physical distance between adjacent Visium spots (um) */
+#define DIST_UNIT_OLD_ST 200.0           /* Physical distance between adjacent old ST spots (um) */
+#define DIST_UNIT_SINGLE_CELL 100.0      /* Default distance unit for single-cell data (um) */
+#define DEFAULT_FALLBACK_SIGMA 50.0      /* Fallback sigma when inference fails */
 #define DEFAULT_NUM_THREADS 4         /* Default number of OpenMP threads if not set by OMP_NUM_THREADS or -t */
 #define DEFAULT_MKL_NUM_THREADS 0     /* Default MKL threads (0: use OpenMP setting from config.n_threads or MKL internal default) */
 #define DEFAULT_NUM_PERMUTATIONS 1000 /* Default number of permutations if enabled */

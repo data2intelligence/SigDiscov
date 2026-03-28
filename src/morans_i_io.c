@@ -6,7 +6,6 @@
  * Split from morans_i_mkl.c v1.3.0
  */
 
-#include <unistd.h>
 #include "morans_i_internal.h"
 
 /* ===============================
@@ -118,9 +117,6 @@ static char** collect_unique_celltypes(FILE* fp, char delimiter, int type_col_id
     }
 
     long original_pos = ftell(fp);
-    if (fseek(fp, 0, SEEK_END) != 0) return NULL;
-    //long file_size = ftell(fp);
-    fseek(fp, original_pos, SEEK_SET); // Go back to where we were
 
     char* line = NULL;
     size_t line_buf_size = 0;

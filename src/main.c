@@ -4,7 +4,6 @@
  * Enhanced: Added residual analysis, better error handling, and code organization
  */
 
-#include <unistd.h>
 #include "morans_i_internal.h"
 
 /* Argument parsing helper macros -- _i, _argc, _argv are explicit to avoid implicit capture */

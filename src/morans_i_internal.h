@@ -19,6 +19,7 @@
 #include <float.h>    /* for DBL_EPSILON, DBL_MAX */
 #include <regex.h>    /* for regex_t, regcomp, regexec */
 #include <errno.h>    /* for errno, strerror */
+#include <unistd.h>   /* for access() */
 
 /* Define M_PI if not provided by math.h */
 #ifndef M_PI

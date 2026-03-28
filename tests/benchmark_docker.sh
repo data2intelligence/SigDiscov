@@ -37,7 +37,7 @@ echo ""
 # 1. Native MKL build
 # -----------------------------------------------
 echo "=== Test 1: Native Intel MKL build ==="
-module load intel/2024.0.1.46
+module load intel/2024.0.1.46 || { echo "ERROR: Intel module not available"; exit 1; }
 make clean && make -j8
 echo ""
 
@@ -54,7 +54,7 @@ echo ""
 # 2. Docker/Singularity OpenBLAS image
 # -----------------------------------------------
 echo "=== Test 2: Docker (OpenBLAS) via Singularity ==="
-module load singularity/4.3.7
+module load singularity/4.3.7 || { echo "ERROR: Singularity module not available"; exit 1; }
 
 SIF_OPENBLAS="/lscratch/${SLURM_JOB_ID}/sigdiscov_openblas.sif"
 echo "Pulling OpenBLAS image to lscratch..."

@@ -7,7 +7,6 @@
  * the Moran's I spatial autocorrelation library.
  */
 
-#include <unistd.h>
 #include "morans_i_internal.h"
 
 /* Library version information */
