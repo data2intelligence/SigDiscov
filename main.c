@@ -4,32 +4,22 @@
  * Enhanced: Added residual analysis, better error handling, and code organization
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-#include <float.h> 
-#include <ctype.h>
-#include <omp.h>
-#include <errno.h>
-#include <unistd.h>  
-#include <time.h>    
-#include <limits.h> 
-#include "morans_i_mkl.h" 
+#include <unistd.h>
+#include "morans_i_internal.h"
 
-/* For strdup support if not readily available */
-#if defined(__STRICT_ANSI__) && !defined(strdup) && !defined(_GNU_SOURCE) && \
-    (!defined(_XOPEN_SOURCE) || _XOPEN_SOURCE < 500) && \
-    (!defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 200809L)
-static char* my_strdup(const char* s) {
-    if (s == NULL) return NULL;
-    size_t len = strlen(s) + 1;
-    char* new_str = (char*)malloc(len);
-    if (new_str == NULL) { perror("my_strdup: malloc failed"); return NULL; }
-    return (char*)memcpy(new_str, s, len);
-}
-#define strdup my_strdup
-#endif
+/* Argument parsing helper macros */
+#define REQUIRE_ARG(flag) do { \
+    if (++i >= argc) { \
+        fprintf(stderr, "Error: Missing value for %s\n", flag); \
+        return MORANS_I_ERROR_PARAMETER; \
+    } \
+} while(0)
+
+#define PARSE_STRING_ARG(flag, dest) do { \
+    REQUIRE_ARG(flag); \
+    strncpy(dest, argv[i], BUFFER_SIZE - 1); \
+    dest[BUFFER_SIZE - 1] = '\0'; \
+} while(0)
 
 /* Resource Management Structure */
 typedef struct {
@@ -65,14 +55,6 @@ typedef struct {
     double custom_sigma;
     int use_metadata_file;
     int run_toy_example;
-    
-    /* Residual analysis specific arguments */
-    char celltype_file[BUFFER_SIZE];
-    char celltype_id_col[BUFFER_SIZE];
-    char celltype_type_col[BUFFER_SIZE];
-    char celltype_x_col[BUFFER_SIZE];
-    char celltype_y_col[BUFFER_SIZE];
-    char spot_id_col[BUFFER_SIZE];
 } CommandLineArgs;
 
 /* Forward declarations for all functions */
@@ -82,8 +64,8 @@ int parse_analysis_mode(const char* mode_str);
 int parse_celltype_format(const char* format_str);
 char** extract_spot_names_from_expression(const DenseMatrix* expr_matrix, MKL_INT* n_spots_out);
 
-/* Toy example functions */
-static inline MKL_INT grid_to_1d_idx(MKL_INT r, MKL_INT c, MKL_INT num_grid_cols);
+/* Toy example functions (defined in toy_example.c) */
+MKL_INT grid_to_1d_idx(MKL_INT r, MKL_INT c, MKL_INT num_grid_cols);
 DenseMatrix* create_theoretical_toy_moran_i_matrix_2d(MKL_INT n_genes, char** gene_names);
 SparseMatrix* create_toy_W_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_cols);
 DenseMatrix* create_toy_X_calc_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_cols, MKL_INT n_genes);
@@ -199,11 +181,6 @@ static void initialize_command_args(CommandLineArgs* args) {
     strcpy(args->id_column, "cell_ID");
     strcpy(args->x_column, "sdimx");
     strcpy(args->y_column, "sdimy");
-    strcpy(args->celltype_id_col, "cell_ID");
-    strcpy(args->celltype_type_col, "cellType");
-    strcpy(args->celltype_x_col, "sdimx");
-    strcpy(args->celltype_y_col, "sdimy");
-    strcpy(args->spot_id_col, "spot_id");
     args->custom_sigma = 0.0;
     args->use_metadata_file = 0;
     args->run_toy_example = 0;
@@ -224,212 +201,141 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for -i\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->input_file, argv[i], BUFFER_SIZE - 1); 
-            args->input_file[BUFFER_SIZE - 1] = '\0';
-            
+            PARSE_STRING_ARG("-i", args->input_file);
+
         } else if (strcmp(argv[i], "-o") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for -o\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->output_prefix, argv[i], BUFFER_SIZE - 1); 
-            args->output_prefix[BUFFER_SIZE - 1] = '\0';
-            
+            PARSE_STRING_ARG("-o", args->output_prefix);
+
         } else if (strcmp(argv[i], "--run-toy-example") == 0) {
             args->run_toy_example = 2;
-            
+
         } else if (strcmp(argv[i], "-c") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for -c\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->meta_file, argv[i], BUFFER_SIZE - 1); 
-            args->meta_file[BUFFER_SIZE - 1] = '\0';
+            PARSE_STRING_ARG("-c", args->meta_file);
             args->use_metadata_file = 1;
-            
+
         } else if (strcmp(argv[i], "--id-col") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --id-col\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->id_column, argv[i], BUFFER_SIZE - 1); 
-            args->id_column[BUFFER_SIZE - 1] = '\0';
-            
+            PARSE_STRING_ARG("--id-col", args->id_column);
+
         } else if (strcmp(argv[i], "--x-col") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --x-col\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->x_column, argv[i], BUFFER_SIZE - 1); 
-            args->x_column[BUFFER_SIZE - 1] = '\0';
-            
+            PARSE_STRING_ARG("--x-col", args->x_column);
+
         } else if (strcmp(argv[i], "--y-col") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --y-col\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->y_column, argv[i], BUFFER_SIZE - 1); 
-            args->y_column[BUFFER_SIZE - 1] = '\0';
-            
+            PARSE_STRING_ARG("--y-col", args->y_column);
+
         } else if (strcmp(argv[i], "--scale") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --scale\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("--scale");
             config->coord_scale = load_double_value(argv[i], "--scale");
-            if (isnan(config->coord_scale) || config->coord_scale <= 0) { 
-                fprintf(stderr, "Error: --scale must be a positive number.\n"); 
+            if (isnan(config->coord_scale) || config->coord_scale <= 0) {
+                fprintf(stderr, "Error: --scale must be a positive number.\n");
                 return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         } else if (strcmp(argv[i], "--sigma") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --sigma\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("--sigma");
             args->custom_sigma = load_double_value(argv[i], "--sigma");
-            if (isnan(args->custom_sigma)) { 
-                return MORANS_I_ERROR_PARAMETER; 
+            if (isnan(args->custom_sigma)) {
+                return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         } else if (strcmp(argv[i], "-r") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for -r\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("-r");
             config->max_radius = load_positive_value(argv[i], "-r", 1, 1000);
-            if (config->max_radius < 0) { 
-                return MORANS_I_ERROR_PARAMETER; 
+            if (config->max_radius < 0) {
+                return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         } else if (strcmp(argv[i], "-w") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for -w\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("-w");
             if (config->custom_weights_file) free(config->custom_weights_file);
             config->custom_weights_file = strdup(argv[i]);
-            if (!config->custom_weights_file) { 
-                perror("strdup custom_weights_file"); 
-                return MORANS_I_ERROR_MEMORY; 
+            if (!config->custom_weights_file) {
+                perror("strdup custom_weights_file");
+                return MORANS_I_ERROR_MEMORY;
             }
             config->platform_mode = CUSTOM_WEIGHTS;
-            
+
         } else if (strcmp(argv[i], "--weight-format") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --weight-format\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("--weight-format");
             config->weight_format = parse_weight_format(argv[i]);
-            
+
         } else if (strcmp(argv[i], "--normalize-weights") == 0) {
             config->normalize_weights = 1;
-            
+
         } else if (strcmp(argv[i], "--row-normalize") == 0) {
             if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 || strcmp(argv[i + 1], "1") == 0)) {
-                // Has explicit value
                 i++;
                 config->row_normalize_weights = load_positive_value(argv[i], "--row-normalize", 0, 1);
                 if (config->row_normalize_weights < 0) {
                     return MORANS_I_ERROR_PARAMETER;
                 }
             } else {
-                // No explicit value, default to 1 (enable)
                 config->row_normalize_weights = 1;
             }
-            
+
         } else if (strcmp(argv[i], "-p") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for -p\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("-p");
             config->platform_mode = load_positive_value(argv[i], "-p", 0, 3);
-            if (config->platform_mode < 0) { 
-                return MORANS_I_ERROR_PARAMETER; 
+            if (config->platform_mode < 0) {
+                return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         } else if (strcmp(argv[i], "-b") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for -b\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("-b");
             config->calc_pairwise = load_positive_value(argv[i], "-b", 0, 1);
-            if (config->calc_pairwise < 0) { 
-                return MORANS_I_ERROR_PARAMETER; 
+            if (config->calc_pairwise < 0) {
+                return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         } else if (strcmp(argv[i], "-g") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for -g\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("-g");
             config->calc_all_vs_all = load_positive_value(argv[i], "-g", 0, 1);
-            if (config->calc_all_vs_all < 0) { 
-                return MORANS_I_ERROR_PARAMETER; 
+            if (config->calc_all_vs_all < 0) {
+                return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         } else if (strcmp(argv[i], "-s") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for -s\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("-s");
             config->include_same_spot = load_positive_value(argv[i], "-s", 0, 1);
-            if (config->include_same_spot < 0) { 
-                return MORANS_I_ERROR_PARAMETER; 
+            if (config->include_same_spot < 0) {
+                return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         } else if (strcmp(argv[i], "-t") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for -t\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("-t");
             config->n_threads = load_positive_value(argv[i], "-t", 1, 1024);
-            if (config->n_threads < 0) { 
-                return MORANS_I_ERROR_PARAMETER; 
+            if (config->n_threads < 0) {
+                return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         } else if (strcmp(argv[i], "-m") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for -m\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("-m");
             config->mkl_n_threads = load_positive_value(argv[i], "-m", 1, 1024);
-            if (config->mkl_n_threads < 0) { 
-                return MORANS_I_ERROR_PARAMETER; 
+            if (config->mkl_n_threads < 0) {
+                return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         /* Permutation test options */
-        } else if (strcmp(argv[i], "--run-perm") == 0) { 
+        } else if (strcmp(argv[i], "--run-perm") == 0) {
             config->run_permutations = 1;
-            
+
         } else if (strcmp(argv[i], "--num-perm") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --num-perm\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("--num-perm");
             config->num_permutations = load_positive_value(argv[i], "--num-perm", 1, 10000000);
-            if (config->num_permutations < 0) { 
-                return MORANS_I_ERROR_PARAMETER; 
+            if (config->num_permutations < 0) {
+                return MORANS_I_ERROR_PARAMETER;
             }
             config->run_permutations = 1;
-            
+
         } else if (strcmp(argv[i], "--perm-seed") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --perm-seed\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            long seed_val = strtol(argv[i], NULL, 10); 
-            if (errno == ERANGE || seed_val < 0 || (unsigned long)seed_val > UINT_MAX) { 
-                fprintf(stderr, "Error: Invalid seed value for --perm-seed '%s'.\n", argv[i]); 
+            REQUIRE_ARG("--perm-seed");
+            long seed_val = strtol(argv[i], NULL, 10);
+            if (errno == ERANGE || seed_val < 0 || (unsigned long)seed_val > UINT_MAX) {
+                fprintf(stderr, "Error: Invalid seed value for --perm-seed '%s'.\n", argv[i]);
                 return MORANS_I_ERROR_PARAMETER;
             }
             config->perm_seed = (unsigned int)seed_val;
             config->run_permutations = 1;
-            
+
         } else if (strcmp(argv[i], "--perm-out-z") == 0) {
             if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 || strcmp(argv[i + 1], "1") == 0)) {
                 i++;
@@ -439,7 +345,7 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
                 config->perm_output_zscores = 1;
             }
             config->run_permutations = 1;
-            
+
         } else if (strcmp(argv[i], "--perm-out-p") == 0) {
             if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 || strcmp(argv[i + 1], "1") == 0)) {
                 i++;
@@ -449,25 +355,17 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
                 config->perm_output_pvalues = 1;
             }
             config->run_permutations = 1;
-            
+
         /* Residual analysis options */
         } else if (strcmp(argv[i], "--analysis-mode") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --analysis-mode\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("--analysis-mode");
             config->residual_config.analysis_mode = parse_analysis_mode(argv[i]);
             if (config->residual_config.analysis_mode < 0) {
                 return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         } else if (strcmp(argv[i], "--celltype-file") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --celltype-file\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->celltype_file, argv[i], BUFFER_SIZE - 1);
-            args->celltype_file[BUFFER_SIZE - 1] = '\0';
+            REQUIRE_ARG("--celltype-file");
             if (config->residual_config.celltype_file) free(config->residual_config.celltype_file);
             config->residual_config.celltype_file = strdup(argv[i]);
             if (!config->residual_config.celltype_file) {
@@ -475,87 +373,59 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
                 return MORANS_I_ERROR_MEMORY;
             }
             config->residual_config.analysis_mode = ANALYSIS_MODE_RESIDUAL;
-            
+
         } else if (strcmp(argv[i], "--celltype-format") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --celltype-format\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("--celltype-format");
             config->residual_config.celltype_format = parse_celltype_format(argv[i]);
             if (config->residual_config.celltype_format < 0) {
                 return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         } else if (strcmp(argv[i], "--celltype-id-col") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --celltype-id-col\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->celltype_id_col, argv[i], BUFFER_SIZE - 1);
-            args->celltype_id_col[BUFFER_SIZE - 1] = '\0';
+            REQUIRE_ARG("--celltype-id-col");
             if (config->residual_config.celltype_id_col) free(config->residual_config.celltype_id_col);
             config->residual_config.celltype_id_col = strdup(argv[i]);
             if (!config->residual_config.celltype_id_col) {
                 perror("strdup celltype_id_col");
                 return MORANS_I_ERROR_MEMORY;
             }
-            
+
         } else if (strcmp(argv[i], "--celltype-type-col") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --celltype-type-col\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->celltype_type_col, argv[i], BUFFER_SIZE - 1);
-            args->celltype_type_col[BUFFER_SIZE - 1] = '\0';
+            REQUIRE_ARG("--celltype-type-col");
             if (config->residual_config.celltype_type_col) free(config->residual_config.celltype_type_col);
             config->residual_config.celltype_type_col = strdup(argv[i]);
             if (!config->residual_config.celltype_type_col) {
                 perror("strdup celltype_type_col");
                 return MORANS_I_ERROR_MEMORY;
             }
-            
+
         } else if (strcmp(argv[i], "--celltype-x-col") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --celltype-x-col\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->celltype_x_col, argv[i], BUFFER_SIZE - 1);
-            args->celltype_x_col[BUFFER_SIZE - 1] = '\0';
+            REQUIRE_ARG("--celltype-x-col");
             if (config->residual_config.celltype_x_col) free(config->residual_config.celltype_x_col);
             config->residual_config.celltype_x_col = strdup(argv[i]);
             if (!config->residual_config.celltype_x_col) {
                 perror("strdup celltype_x_col");
                 return MORANS_I_ERROR_MEMORY;
             }
-            
+
         } else if (strcmp(argv[i], "--celltype-y-col") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --celltype-y-col\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->celltype_y_col, argv[i], BUFFER_SIZE - 1);
-            args->celltype_y_col[BUFFER_SIZE - 1] = '\0';
+            REQUIRE_ARG("--celltype-y-col");
             if (config->residual_config.celltype_y_col) free(config->residual_config.celltype_y_col);
             config->residual_config.celltype_y_col = strdup(argv[i]);
             if (!config->residual_config.celltype_y_col) {
                 perror("strdup celltype_y_col");
                 return MORANS_I_ERROR_MEMORY;
             }
-            
+
         } else if (strcmp(argv[i], "--spot-id-col") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --spot-id-col\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
-            strncpy(args->spot_id_col, argv[i], BUFFER_SIZE - 1);
-            args->spot_id_col[BUFFER_SIZE - 1] = '\0';
+            REQUIRE_ARG("--spot-id-col");
             if (config->residual_config.spot_id_col) free(config->residual_config.spot_id_col);
             config->residual_config.spot_id_col = strdup(argv[i]);
             if (!config->residual_config.spot_id_col) {
                 perror("strdup spot_id_col");
                 return MORANS_I_ERROR_MEMORY;
             }
-            
+
         } else if (strcmp(argv[i], "--include-intercept") == 0) {
             if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 || strcmp(argv[i + 1], "1") == 0)) {
                 i++;
@@ -564,19 +434,16 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             } else {
                 config->residual_config.include_intercept = 1;
             }
-            
+
         } else if (strcmp(argv[i], "--regularization") == 0) {
-            if (++i >= argc) { 
-                fprintf(stderr, "Error: Missing value for --regularization\n"); 
-                return MORANS_I_ERROR_PARAMETER; 
-            }
+            REQUIRE_ARG("--regularization");
             config->residual_config.regularization_lambda = load_double_value(argv[i], "--regularization");
-            if (isnan(config->residual_config.regularization_lambda) || 
+            if (isnan(config->residual_config.regularization_lambda) ||
                 config->residual_config.regularization_lambda < 0) {
                 fprintf(stderr, "Error: --regularization must be a non-negative number\n");
                 return MORANS_I_ERROR_PARAMETER;
             }
-            
+
         } else if (strcmp(argv[i], "--normalize-residuals") == 0) {
             if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 || strcmp(argv[i + 1], "1") == 0)) {
                 i++;
@@ -585,7 +452,7 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             } else {
                 config->residual_config.normalize_residuals = 1;
             }
-            
+
         } else {
             fprintf(stderr, "Error: Unknown parameter '%s'. Use -h for help.\n", argv[i]);
             return MORANS_I_ERROR_PARAMETER;
@@ -677,7 +544,7 @@ static int validate_and_initialize_config(MoransIConfig* config, const CommandLi
 
         /* Validate cell type file for residual analysis */
         if (config->residual_config.analysis_mode == ANALYSIS_MODE_RESIDUAL) {
-            if (!config->residual_config.celltype_file || strlen(args->celltype_file) == 0) {
+            if (config->residual_config.celltype_file == NULL) {
                 fprintf(stderr, "Error: Residual analysis mode requires --celltype-file\n");
                 return MORANS_I_ERROR_PARAMETER;
             }
@@ -1010,52 +877,60 @@ static int prepare_valid_spot_arrays(AnalysisResources* resources) {
 }
 
 static int map_spots_to_expression(AnalysisResources* resources) {
+    /* Build hash table from expression matrix column names for O(1) lookups */
+    SpotNameHashTable* expr_ht = spot_name_ht_create((size_t)resources->znorm_matrix->ncols);
+    if (!expr_ht) {
+        fprintf(stderr, "Error: Failed to create hash table for expression column lookup\n");
+        return MORANS_I_ERROR_MEMORY;
+    }
+    for (MKL_INT j = 0; j < resources->znorm_matrix->ncols; j++) {
+        spot_name_ht_insert(expr_ht, resources->znorm_matrix->colnames[j], j);
+    }
+
     MKL_INT v_idx = 0;
-    
-    for (MKL_INT i = 0; i < resources->spot_coords->total_spots; i++) { 
+
+    for (MKL_INT i = 0; i < resources->spot_coords->total_spots; i++) {
         if (resources->spot_coords->valid_mask[i]) {
-            if (v_idx >= resources->num_valid_spots) { 
-                fprintf(stderr, "Error: Index v_idx out of bounds for helper arrays.\n"); 
+            if (v_idx >= resources->num_valid_spots) {
+                fprintf(stderr, "Error: Index v_idx out of bounds for helper arrays.\n");
+                spot_name_ht_free(expr_ht);
                 return MORANS_I_ERROR_COMPUTATION;
             }
-            
+
             resources->valid_spot_rows[v_idx] = resources->spot_coords->spot_row[i];
             resources->valid_spot_cols[v_idx] = resources->spot_coords->spot_col[i];
             resources->valid_spot_names[v_idx] = strdup(resources->spot_coords->spot_names[i]);
-            
-            if (!resources->valid_spot_names[v_idx]) { 
-                perror("strdup for valid_spot_names_list"); 
+
+            if (!resources->valid_spot_names[v_idx]) {
+                perror("strdup for valid_spot_names_list");
+                spot_name_ht_free(expr_ht);
                 return MORANS_I_ERROR_MEMORY;
             }
-            
-            /* Find corresponding expression column */
-            int expr_col_idx = -1; 
-            for (MKL_INT j = 0; j < resources->znorm_matrix->ncols; j++) {
-                if (strcmp(resources->spot_coords->spot_names[i], resources->znorm_matrix->colnames[j]) == 0) { 
-                    expr_col_idx = j; 
-                    break;
-                }
-            }
+
+            /* Find corresponding expression column via hash table */
+            MKL_INT expr_col_idx = spot_name_ht_find(expr_ht, resources->spot_coords->spot_names[i]);
             resources->valid_spot_indices[v_idx] = expr_col_idx;
-            
+
             if (expr_col_idx == -1) {
-                fprintf(stderr, "Warning: Valid coordinate spot '%s' not found in expression matrix colnames.\n", 
+                fprintf(stderr, "Warning: Valid coordinate spot '%s' not found in expression matrix colnames.\n",
                         resources->spot_coords->spot_names[i]);
             }
             v_idx++;
         }
     }
-    
+
+    spot_name_ht_free(expr_ht);
+
     if (v_idx != resources->num_valid_spots) {
-        fprintf(stderr, "Warning: Actual populated valid spots (%lld) differs from initial count (%lld). Adjusting.\n", 
+        fprintf(stderr, "Warning: Actual populated valid spots (%lld) differs from initial count (%lld). Adjusting.\n",
                 (long long)v_idx, (long long)resources->num_valid_spots);
-        resources->num_valid_spots = v_idx; 
-        if (resources->num_valid_spots == 0) { 
-            fprintf(stderr, "Error: No valid spots remain. Cannot proceed.\n"); 
-            return MORANS_I_ERROR_COMPUTATION; 
+        resources->num_valid_spots = v_idx;
+        if (resources->num_valid_spots == 0) {
+            fprintf(stderr, "Error: No valid spots remain. Cannot proceed.\n");
+            return MORANS_I_ERROR_COMPUTATION;
         }
     }
-    
+
     return MORANS_I_SUCCESS;
 }
 
@@ -1627,444 +1502,23 @@ char** extract_spot_names_from_expression(const DenseMatrix* expr_matrix, MKL_IN
     return spot_names;
 }
 
-/* ============================================================================
- * TOY EXAMPLE FUNCTIONS
- * ============================================================================ */
-
-/* Helper function for toy examples */
-static inline MKL_INT grid_to_1d_idx(MKL_INT r, MKL_INT c, MKL_INT num_grid_cols) {
-    return r * num_grid_cols + c;
-}
-
-DenseMatrix* create_theoretical_toy_moran_i_matrix_2d(MKL_INT n_genes, char** gene_names) {
-    if (n_genes != 5) {
-        fprintf(stderr, "Error (create_theoretical_toy_moran_i): This function is hardcoded for 5 genes.\n");
-        return NULL;
-    }
-
-    DenseMatrix* theoretical_I = (DenseMatrix*)calloc(1, sizeof(DenseMatrix));
-    if (!theoretical_I) { 
-        perror("calloc theoretical_I"); 
-        return NULL; 
-    }
-
-    theoretical_I->nrows = n_genes;
-    theoretical_I->ncols = n_genes;
-    theoretical_I->values = (double*)mkl_calloc((size_t)n_genes * n_genes, sizeof(double), 64);
-    theoretical_I->rownames = (char**)calloc(n_genes, sizeof(char*));
-    theoretical_I->colnames = (char**)calloc(n_genes, sizeof(char*));
-
-    if (!theoretical_I->values || !theoretical_I->rownames || !theoretical_I->colnames) {
-        perror("mkl_calloc theoretical_I components");
-        free_dense_matrix(theoretical_I); 
-        return NULL;
-    }
-
-    for (MKL_INT i = 0; i < n_genes; ++i) {
-        theoretical_I->rownames[i] = strdup(gene_names[i]); // Use names from X_calc
-        theoretical_I->colnames[i] = strdup(gene_names[i]);
-        if (!theoretical_I->rownames[i] || !theoretical_I->colnames[i]) {
-            perror("strdup theoretical_I gene names");
-            free_dense_matrix(theoretical_I); 
-            return NULL;
-        }
-    }
-
-    // Values based on our derivations/expectations:
-    // G0: Row gradient
-    // G1: Row gradient (identical to G0)
-    // G2: Column gradient
-    // G3: Checkerboard
-    // G4: Radial
-
-    // I(G0,G0)
-    theoretical_I->values[0 * n_genes + 0] = 0.75;
-    // I(G0,G1) - G0 and G1 are identical
-    theoretical_I->values[0 * n_genes + 1] = 0.75;
-    theoretical_I->values[1 * n_genes + 0] = 0.75;
-    // I(G0,G2) - Row vs Col gradient (orthogonal)
-    theoretical_I->values[0 * n_genes + 2] = 0.0;
-    theoretical_I->values[2 * n_genes + 0] = 0.0;
-    // I(G0,G3) - Row grad vs Checkerboard (expected near 0)
-    theoretical_I->values[0 * n_genes + 3] = 0.0; // Approx.
-    theoretical_I->values[3 * n_genes + 0] = 0.0; // Approx.
-    // I(G0,G4) - Row grad vs Radial (expected near 0)
-    theoretical_I->values[0 * n_genes + 4] = 0.0; // Approx.
-    theoretical_I->values[4 * n_genes + 0] = 0.0; // Approx.
-
-    // I(G1,G1)
-    theoretical_I->values[1 * n_genes + 1] = 0.75;
-    // I(G1,G2) - Row vs Col gradient (orthogonal)
-    theoretical_I->values[1 * n_genes + 2] = 0.0;
-    theoretical_I->values[2 * n_genes + 1] = 0.0;
-    // I(G1,G3) - Row grad vs Checkerboard
-    theoretical_I->values[1 * n_genes + 3] = 0.0; // Approx.
-    theoretical_I->values[3 * n_genes + 1] = 0.0; // Approx.
-    // I(G1,G4) - Row grad vs Radial
-    theoretical_I->values[1 * n_genes + 4] = 0.0; // Approx.
-    theoretical_I->values[4 * n_genes + 1] = 0.0; // Approx.
-
-    // I(G2,G2) - Col gradient
-    theoretical_I->values[2 * n_genes + 2] = 0.75;
-    // I(G2,G3) - Col grad vs Checkerboard
-    theoretical_I->values[2 * n_genes + 3] = 0.0; // Approx.
-    theoretical_I->values[3 * n_genes + 2] = 0.0; // Approx.
-    // I(G2,G4) - Col grad vs Radial
-    theoretical_I->values[2 * n_genes + 4] = 0.0; // Approx.
-    theoretical_I->values[4 * n_genes + 2] = 0.0; // Approx.
-
-    // I(G3,G3) - Checkerboard
-    theoretical_I->values[3 * n_genes + 3] = -1.0;
-    // I(G3,G4) - Checkerboard vs Radial
-    theoretical_I->values[3 * n_genes + 4] = 0.0; // Approx.
-    theoretical_I->values[4 * n_genes + 3] = 0.0; // Approx.
-
-    // I(G4,G4) - Radial Autocorrelation
-    theoretical_I->values[4 * n_genes + 4] = 0.4; // Placeholder: Expected positive
-
-    printf("Theoretical Moran's I expectation matrix created.\n");
-    return theoretical_I;
-}
-
-SparseMatrix* create_toy_W_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_cols) {
-    MKL_INT n_spots = num_grid_rows * num_grid_cols;
-    if (n_spots == 0) {
-        fprintf(stderr, "Error (create_toy_W_matrix_2d): Cannot create W for 0 spots.\n");
-        return NULL;
-    }
-
-    SparseMatrix* W = (SparseMatrix*)calloc(1, sizeof(SparseMatrix));
-    if (!W) { 
-        perror("calloc toy W 2D"); 
-        return NULL; 
-    }
-
-    W->nrows = n_spots;
-    W->ncols = n_spots;
-
-    MKL_INT max_possible_nnz = n_spots * 4; 
-    MKL_INT* temp_I = NULL;
-    MKL_INT* temp_J = NULL;
-    double* temp_V = NULL;
-    MKL_INT* current_pos = NULL; 
-
-    if (max_possible_nnz > 0) { 
-        temp_I = (MKL_INT*)malloc(max_possible_nnz * sizeof(MKL_INT));
-        temp_J = (MKL_INT*)malloc(max_possible_nnz * sizeof(MKL_INT));
-        temp_V = (double*)malloc(max_possible_nnz * sizeof(double));
-        if (!temp_I || !temp_J || !temp_V) {
-            perror("malloc temp COO for toy W 2D");
-            goto cleanup_toy_w_coo_2d;
-        }
-    }
-
-    MKL_INT current_nnz = 0;
-    int dr[] = {-1, 1, 0, 0}; 
-    int dc[] = {0, 0, -1, 1}; 
-
-    for (MKL_INT r = 0; r < num_grid_rows; ++r) {
-        for (MKL_INT c = 0; c < num_grid_cols; ++c) {
-            MKL_INT spot_idx_i = grid_to_1d_idx(r, c, num_grid_cols);
-            for (int move = 0; move < 4; ++move) {
-                MKL_INT nr = r + dr[move];
-                MKL_INT nc = c + dc[move];
-                if (nr >= 0 && nr < num_grid_rows && nc >= 0 && nc < num_grid_cols) {
-                    MKL_INT spot_idx_j = grid_to_1d_idx(nr, nc, num_grid_cols);
-                    if (temp_I && current_nnz < max_possible_nnz) { 
-                        temp_I[current_nnz] = spot_idx_i;
-                        temp_J[current_nnz] = spot_idx_j;
-                        temp_V[current_nnz] = 1.0;
-                        current_nnz++;
-                    } else if (temp_I) { 
-                        fprintf(stderr, "Error: Exceeded temp COO capacity for toy W 2D.\n");
-                        goto cleanup_toy_w_coo_2d;
-                    }
-                }
-            }
-        }
-    }
-    W->nnz = current_nnz;
-
-    W->row_ptr = (MKL_INT*)mkl_calloc(n_spots + 1, sizeof(MKL_INT), 64);
-    if (!W->row_ptr) { 
-        perror("mkl_calloc W->row_ptr for toy W 2D"); 
-        goto cleanup_toy_w_coo_2d;
-    }
-
-    if (W->nnz > 0) {
-        W->col_ind = (MKL_INT*)mkl_malloc(W->nnz * sizeof(MKL_INT), 64);
-        W->values  = (double*)mkl_malloc(W->nnz * sizeof(double), 64);
-        if (!W->col_ind || !W->values) {
-            perror("mkl_malloc W->col_ind/values for toy W 2D");
-            goto cleanup_toy_w_coo_2d;
-        }
-
-        for (MKL_INT k = 0; k < W->nnz; ++k) W->row_ptr[temp_I[k] + 1]++;
-        for (MKL_INT i = 0; i < n_spots; ++i) W->row_ptr[i + 1] += W->row_ptr[i];
-        
-        current_pos = (MKL_INT*)mkl_malloc((size_t)(n_spots + 1) * sizeof(MKL_INT), 64);
-        if (!current_pos) { 
-            perror("mkl_malloc current_pos for CSR conversion"); 
-            goto cleanup_toy_w_coo_2d;
-        }
-        memcpy(current_pos, W->row_ptr, (size_t)(n_spots + 1) * sizeof(MKL_INT));
-
-        for (MKL_INT k = 0; k < W->nnz; ++k) {
-            MKL_INT r_csr = temp_I[k]; 
-            MKL_INT insert_idx = current_pos[r_csr];
-            W->col_ind[insert_idx] = temp_J[k];
-            W->values[insert_idx] = temp_V[k];
-            current_pos[r_csr]++;
-        }
-    } else { 
-        W->col_ind = NULL;
-        W->values = NULL;
-    }
-
-cleanup_toy_w_coo_2d:
-    free(temp_I); 
-    free(temp_J); 
-    free(temp_V);
-    mkl_free(current_pos);
-    if ((W->row_ptr && W->nnz > 0 && (!W->col_ind || !W->values)) || (!W->row_ptr && n_spots > 0) ) { 
-        free_sparse_matrix(W);
-        return NULL;
-    }
-    if (W->nnz > 0 && (!W->col_ind || !W->values)) {
-         free_sparse_matrix(W);
-         return NULL;
-    }
-
-    printf("Toy W matrix (2D Grid, Rook, %lldx%lld spots) created with %lld NNZ.\n", 
-           (long long)num_grid_rows, (long long)num_grid_cols, (long long)W->nnz);
-    return W;
-}
-
-DenseMatrix* create_toy_X_calc_matrix_2d(MKL_INT num_grid_rows, MKL_INT num_grid_cols, MKL_INT n_genes) {
-    MKL_INT n_spots = num_grid_rows * num_grid_cols;
-    if (n_spots == 0 || n_genes == 0) {
-        fprintf(stderr, "Error (create_toy_X_calc_2d): n_spots or n_genes is zero.\n");
-        return NULL;
-    }
-    if (n_genes < 5 && n_genes > 0) {
-        fprintf(stderr, "Warning (create_toy_X_calc_2d): Requested %lld genes, but patterns defined for up to 5. Some patterns might be omitted.\n", 
-                (long long)n_genes);
-    }
-
-    DenseMatrix* X = (DenseMatrix*)calloc(1, sizeof(DenseMatrix));
-    if (!X) { 
-        perror("calloc toy X 2D"); 
-        return NULL; 
-    }
-
-    X->nrows = n_spots; 
-    X->ncols = n_genes;
-    X->values = (double*)mkl_calloc((size_t)n_spots * n_genes, sizeof(double), 64);
-    X->rownames = (char**)calloc(n_spots, sizeof(char*));
-    X->colnames = (char**)calloc(n_genes, sizeof(char*));
-
-    if (!X->values || !X->rownames || !X->colnames) {
-        perror("mkl_calloc toy X 2D components");
-        free_dense_matrix(X); 
-        return NULL;
-    }
-
-    for (MKL_INT r = 0; r < num_grid_rows; ++r) {
-        for (MKL_INT c = 0; c < num_grid_cols; ++c) {
-            MKL_INT spot_idx = grid_to_1d_idx(r, c, num_grid_cols);
-            char name_buf[32]; 
-            snprintf(name_buf, 32, "S_r%d_c%d", (int)r, (int)c);
-            X->rownames[spot_idx] = strdup(name_buf);
-            if (!X->rownames[spot_idx]) { 
-                perror("strdup toy spot name 2D"); 
-                free_dense_matrix(X); 
-                return NULL; 
-            }
-        }
-    }
-    for (MKL_INT j = 0; j < n_genes; ++j) {
-        char name_buf[32]; 
-        snprintf(name_buf, 32, "Gene%lld", (long long)j);
-        X->colnames[j] = strdup(name_buf);
-        if (!X->colnames[j]) { 
-            perror("strdup toy gene name 2D"); 
-            free_dense_matrix(X); 
-            return NULL; 
-        }
-    }
-
-    // Gene0: Gradient along rows (increases with row index r)
-    if (n_genes >= 1) {
-        for (MKL_INT r = 0; r < num_grid_rows; ++r) {
-            for (MKL_INT c = 0; c < num_grid_cols; ++c) {
-                X->values[grid_to_1d_idx(r,c,num_grid_cols)*n_genes + 0] = (double)r;
-            }
-        }
-    }
-    
-    // Gene1: Identical to Gene0 (also row gradient)
-    if (n_genes >= 2) {
-        for (MKL_INT r = 0; r < num_grid_rows; ++r) {
-            for (MKL_INT c = 0; c < num_grid_cols; ++c) {
-                X->values[grid_to_1d_idx(r,c,num_grid_cols)*n_genes + 1] = (double)r;
-            }
-        }
-    }
-    
-    // Gene2: Gradient along columns (increases with col index c)
-    if (n_genes >= 3) {
-        for (MKL_INT r = 0; r < num_grid_rows; ++r) {
-            for (MKL_INT c = 0; c < num_grid_cols; ++c) {
-                X->values[grid_to_1d_idx(r,c,num_grid_cols)*n_genes + 2] = (double)c;
-            }
-        }
-    }
-    
-    // Gene3: Checkerboard pattern ((r+c) % 2)
-    if (n_genes >= 4) {
-        for (MKL_INT r = 0; r < num_grid_rows; ++r) {
-            for (MKL_INT c = 0; c < num_grid_cols; ++c) {
-                X->values[grid_to_1d_idx(r,c,num_grid_cols)*n_genes + 3] = 
-                    ((r + c) % 2 == 0) ? 10.0 : 5.0;
-            }
-        }
-    }
-    
-    // Gene4: Radial pattern (distance from center, decreasing outwards)
-    if (n_genes >= 5) {
-        double center_r = (double)(num_grid_rows - 1) / 2.0;
-        double center_c = (double)(num_grid_cols - 1) / 2.0;
-        double max_dist_val = 0.0;
-        
-        for (MKL_INT r_corn = 0; r_corn < num_grid_rows; r_corn += (num_grid_rows-1 > 0 ? num_grid_rows-1 : 1)) {
-             for (MKL_INT c_corn = 0; c_corn < num_grid_cols; c_corn += (num_grid_cols-1 > 0 ? num_grid_cols-1 : 1)) {
-                double d = sqrt(pow(r_corn - center_r, 2) + pow(c_corn - center_c, 2));
-                if (d > max_dist_val) max_dist_val = d;
-             }
-        }
-        if (max_dist_val == 0 && (num_grid_rows > 1 || num_grid_cols > 1)) max_dist_val = 1.0;
-
-        for (MKL_INT r = 0; r < num_grid_rows; ++r) {
-            for (MKL_INT c = 0; c < num_grid_cols; ++c) {
-                double dist_from_center = sqrt(pow(r - center_r, 2) + pow(c - center_c, 2));
-                X->values[grid_to_1d_idx(r,c,num_grid_cols)*n_genes + 4] = 
-                    (max_dist_val > 0) ? (max_dist_val - dist_from_center) : 0.0;
-            }
-        }
-    }
-
-    // --- Z-Normalize each gene column ---
-    for (MKL_INT j = 0; j < n_genes; ++j) { 
-        double sum = 0.0;
-        for (MKL_INT i = 0; i < n_spots; ++i) sum += X->values[i*n_genes + j];
-        double mean = (n_spots > 0) ? sum / n_spots : 0.0;
-        
-        double sum_sq_diff = 0.0;
-        for (MKL_INT i = 0; i < n_spots; ++i) {
-            sum_sq_diff += pow(X->values[i*n_genes + j] - mean, 2);
-        }
-        double stddev = (n_spots > 0) ? sqrt(sum_sq_diff / n_spots) : 0.0;
-
-        if (stddev < ZERO_STD_THRESHOLD) { 
-            for (MKL_INT i = 0; i < n_spots; ++i) X->values[i*n_genes + j] = 0.0;
-        } else {
-            for (MKL_INT i = 0; i < n_spots; ++i) {
-                X->values[i*n_genes + j] = (X->values[i*n_genes + j] - mean) / stddev;
-            }
-        }
-    }
-    
-    printf("Toy X_calc matrix (2D Grid, %lld spots x %lld genes) created and Z-normalized.\n", 
-           (long long)X->nrows, (long long)X->ncols);
-    return X;
-}
-
-int run_toy_example_2d(const char* output_prefix_toy, MoransIConfig* config) {
-    printf("\n--- Running 2D Grid Toy Example (5x5 spots, 5 genes) ---\n");
-    MKL_INT grid_rows = 5; 
-    MKL_INT grid_cols = 5; 
-    MKL_INT toy_n_genes = 5; 
-    int status = MORANS_I_SUCCESS;
-
-    DenseMatrix* toy_X_calc = create_toy_X_calc_matrix_2d(grid_rows, grid_cols, toy_n_genes);
-    SparseMatrix* toy_W = create_toy_W_matrix_2d(grid_rows, grid_cols);
-
-    DenseMatrix* toy_observed_I = NULL;
-    DenseMatrix* toy_theoretical_I = NULL;
-    PermutationResults* toy_perm_results = NULL;
-
-    if (!toy_X_calc || !toy_W) {
-        fprintf(stderr, "Failed to create 2D toy matrices for example.\n");
-        status = MORANS_I_ERROR_COMPUTATION;
-        goto toy_cleanup;
-    }
-
-    char file_buffer[BUFFER_SIZE];
-
-    snprintf(file_buffer, BUFFER_SIZE, "%s_toy_2D_X_calc_Znorm.tsv", output_prefix_toy);
-    if (save_results(toy_X_calc, file_buffer) == MORANS_I_SUCCESS) {
-        printf("Saved Z-normalized 2D toy X_calc to %s for inspection.\n", file_buffer);
-    }
-
-    toy_theoretical_I = create_theoretical_toy_moran_i_matrix_2d(toy_n_genes, toy_X_calc->colnames);
-    if (toy_theoretical_I) {
-        snprintf(file_buffer, BUFFER_SIZE, "%s_toy_2D_theoretical_I_full.tsv", output_prefix_toy);
-        if(save_results(toy_theoretical_I, file_buffer) == MORANS_I_SUCCESS) {
-            printf("2D Toy 'hand-derived' theoretical Moran's I (full matrix) saved to %s\n", file_buffer);
-        } else {
-            fprintf(stderr, "Warning: Failed to save theoretical toy Moran's I matrix.\n");
-        }
-    } else {
-        fprintf(stderr, "Warning: Failed to create theoretical toy Moran's I matrix.\n");
-    }
-
-    printf("Calculating observed Moran's I for 2D toy example...\n");
-    toy_observed_I = calculate_morans_i(toy_X_calc, toy_W, config->row_normalize_weights);
-    if (!toy_observed_I) {
-        fprintf(stderr, "Failed to calculate observed Moran's I for 2D toy example.\n");
-        status = MORANS_I_ERROR_COMPUTATION;
-    } else {
-        snprintf(file_buffer, BUFFER_SIZE, "%s_toy_2D_observed_I_full.tsv", output_prefix_toy);
-        if (save_results(toy_observed_I, file_buffer) == MORANS_I_SUCCESS) {
-            printf("2D Toy observed Moran's I (full matrix) saved to %s\n", file_buffer);
-        } else {
-             fprintf(stderr, "Warning: Failed to save observed toy Moran's I matrix.\n");
-        }
-
-        if (config->run_permutations) {
-            PermutationParams toy_perm_params;
-            toy_perm_params.n_permutations = (config->num_permutations > 0 && config->num_permutations < 5000) ? 
-                                            config->num_permutations : 100;
-            toy_perm_params.seed = config->perm_seed; 
-            toy_perm_params.z_score_output = config->perm_output_zscores;
-            toy_perm_params.p_value_output = config->perm_output_pvalues;
-
-            printf("Running permutation test for 2D toy example (%d permutations)...\n", toy_perm_params.n_permutations);
-            toy_perm_results = run_permutation_test(toy_X_calc, toy_W, &toy_perm_params, config->row_normalize_weights);
-
-            if (toy_perm_results) {
-                if (save_permutation_results(toy_perm_results, output_prefix_toy) != MORANS_I_SUCCESS) {
-                     fprintf(stderr, "Warning: Failed to save some or all toy permutation results.\n");
-                } else {
-                    printf("2D Toy permutation results saved with prefix: %s\n", output_prefix_toy);
-                }
-            } else {
-                fprintf(stderr, "Permutation test failed for 2D toy example.\n");
-                if (status == MORANS_I_SUCCESS) status = MORANS_I_ERROR_COMPUTATION;
-            }
-        } else {
-            printf("Permutation testing not enabled by CLI flags (--run-perm), skipping for 2D toy example.\n");
-        }
-    }
-
-toy_cleanup:
-    free_dense_matrix(toy_X_calc);
-    free_sparse_matrix(toy_W);
-    free_dense_matrix(toy_observed_I);
-    free_dense_matrix(toy_theoretical_I);
-    free_permutation_results(toy_perm_results);
-    printf("--- 2D Grid Toy Example Finished ---\n\n");
-    return status;
+/* Free dynamically allocated config strings */
+static void free_config(MoransIConfig* config) {
+    if (!config) return;
+    free(config->custom_weights_file);
+    config->custom_weights_file = NULL;
+    free(config->residual_config.celltype_file);
+    config->residual_config.celltype_file = NULL;
+    free(config->residual_config.celltype_id_col);
+    config->residual_config.celltype_id_col = NULL;
+    free(config->residual_config.celltype_type_col);
+    config->residual_config.celltype_type_col = NULL;
+    free(config->residual_config.celltype_x_col);
+    config->residual_config.celltype_x_col = NULL;
+    free(config->residual_config.celltype_y_col);
+    config->residual_config.celltype_y_col = NULL;
+    free(config->residual_config.spot_id_col);
+    config->residual_config.spot_id_col = NULL;
 }
 
 /* ============================================================================
@@ -2145,38 +1599,8 @@ int main(int argc, char* argv[]) {
     final_status = run_permutation_analysis(&config, &resources, args.output_prefix);
     
 cleanup:
-    /* Clean up all resources */
     cleanup_resources(&resources);
-    
-    /* Free dynamically allocated config strings */
-    if (config.custom_weights_file) {
-        free(config.custom_weights_file);
-        config.custom_weights_file = NULL;
-    }
-    if (config.residual_config.celltype_file) {
-        free(config.residual_config.celltype_file);
-        config.residual_config.celltype_file = NULL;
-    }
-    if (config.residual_config.celltype_id_col) {
-        free(config.residual_config.celltype_id_col);
-        config.residual_config.celltype_id_col = NULL;
-    }
-    if (config.residual_config.celltype_type_col) {
-        free(config.residual_config.celltype_type_col);
-        config.residual_config.celltype_type_col = NULL;
-    }
-    if (config.residual_config.celltype_x_col) {
-        free(config.residual_config.celltype_x_col);
-        config.residual_config.celltype_x_col = NULL;
-    }
-    if (config.residual_config.celltype_y_col) {
-        free(config.residual_config.celltype_y_col);
-        config.residual_config.celltype_y_col = NULL;
-    }
-    if (config.residual_config.spot_id_col) {
-        free(config.residual_config.spot_id_col);
-        config.residual_config.spot_id_col = NULL;
-    }
+    free_config(&config);
 
     double total_end_time = get_time();
     print_elapsed_time(total_start_time, total_end_time, "TOTAL EXECUTION");

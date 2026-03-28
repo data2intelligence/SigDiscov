@@ -4,7 +4,8 @@
 
 | File | Lines | Responsibility |
 |------|-------|----------------|
-| `main.c` | 2185 | CLI parsing, orchestration, toy example |
+| `main.c` | ~1600 | CLI parsing, orchestration |
+| `toy_example.c` | ~450 | Built-in 5x5 grid toy example for testing |
 | `morans_i_utils.c` | ~540 | Hash table, config init, timing, input validation, permutation helpers |
 | `morans_i_io.c` | ~2960 | All file I/O: VST, weight matrix, cell type, coordinates, results |
 | `morans_i_core.c` | ~800 | Z-normalization, Moran's I calculation (all modes) |

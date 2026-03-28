@@ -21,6 +21,7 @@ TARGET = morans_i_mkl
 
 # Source files (modular structure)
 SOURCES = main.c \
+          toy_example.c \
           morans_i_utils.c \
           morans_i_io.c \
           morans_i_core.c \
