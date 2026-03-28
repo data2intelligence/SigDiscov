@@ -166,7 +166,7 @@ static int parallel_compute_coo(const MKL_INT* spot_row_valid, const MKL_INT* sp
 
 /*
  * merge_thread_coo() -- Merge thread-local COO triplets into the global arrays.
- * Must be called inside an OpenMP critical section.
+ * Contains its own OpenMP critical section for thread-safe merging.
  *
  * On error, sets *critical_error_flag to 1.
  */

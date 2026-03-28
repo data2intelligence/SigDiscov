@@ -144,6 +144,10 @@ void spot_name_ht_free(SpotNameHashTable* ht) {
 
 int copy_string_array(char** dest, const char** src, MKL_INT count) {
     for (MKL_INT i = 0; i < count; i++) {
+        if (!src[i]) {
+            dest[i] = NULL;
+            continue;
+        }
         dest[i] = strdup(src[i]);
         if (!dest[i]) {
             perror("copy_string_array: strdup failed");
