@@ -25,6 +25,9 @@
 *.jpg
 *.jpeg
 
+# macOS
+.DS_Store
+
 # Build artifacts
 *.o
 *.d
