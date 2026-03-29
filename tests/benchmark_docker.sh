@@ -7,12 +7,12 @@
 #SBATCH --mem=100G
 #SBATCH --gres=lscratch:50
 #SBATCH --time=02:00:00
-#SBATCH --output=tests/output/benchmark_%j.log
+#SBATCH --output=%x_%j.log
 
 set -euo pipefail
 
 # Configurable via environment variables
-PROJECT_DIR="${SIGDISCOV_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+PROJECT_DIR="${SIGDISCOV_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}}"
 cd "$PROJECT_DIR"
 
 INPUT="${SIGDISCOV_INPUT:-/data/parks34/projects/0sigdiscov/archive/moran_i/datasets/visium/vst/1_vst.tsv}"

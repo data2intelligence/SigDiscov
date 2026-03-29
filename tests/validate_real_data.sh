@@ -6,12 +6,14 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=100G
 #SBATCH --time=12:00:00
-#SBATCH --output=tests/output/validate_%j.log
+#SBATCH --output=%x_%j.log
 
 set -euo pipefail
 
 # Configurable via environment variables
-PROJECT_DIR="${SIGDISCOV_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# SLURM copies scripts to a temp dir, so BASH_SOURCE won't resolve to the repo.
+# Default to SLURM_SUBMIT_DIR (the directory where sbatch was invoked).
+PROJECT_DIR="${SIGDISCOV_DIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}}"
 cd "$PROJECT_DIR"
 
 INPUT="${SIGDISCOV_INPUT:-/data/parks34/projects/0sigdiscov/archive/moran_i/datasets/visium/vst/1_vst.tsv}"
