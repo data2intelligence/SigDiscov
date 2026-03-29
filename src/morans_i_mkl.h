@@ -12,7 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <sys/time.h> 
+#include <sys/time.h>
 #include <time.h>  /* For timing functions, time() */
 #include <string.h>  /* For string manipulation functions */
 #include <omp.h>     /* For OpenMP parallelization */
@@ -152,16 +152,16 @@ typedef struct {
     int analysis_mode;                    /* ANALYSIS_MODE_STANDARD or ANALYSIS_MODE_RESIDUAL */
     char* celltype_file;                 /* Path to cell type data file */
     int celltype_format;                 /* CELLTYPE_FORMAT_DECONVOLUTION or CELLTYPE_FORMAT_SINGLE_CELL */
-    
+
     /* Column names for single-cell format */
     char* celltype_id_col;               /* Cell ID column (default: "cell_ID") */
-    char* celltype_type_col;             /* Cell type column (default: "cellType") */ 
+    char* celltype_type_col;             /* Cell type column (default: "cellType") */
     char* celltype_x_col;                /* X coordinate column (default: "sdimx") */
     char* celltype_y_col;                /* Y coordinate column (default: "sdimy") */
-    
+
     /* Column name for deconvolution format */
     char* spot_id_col;                   /* Spot ID column for deconvolution format (default: "spot_id") */
-    
+
     /* Regression parameters */
     int include_intercept;               /* Include intercept in regression (default: 1) */
     double regularization_lambda;        /* Ridge regularization parameter (default: 0.0) */
@@ -217,13 +217,13 @@ typedef struct {
     double coord_scale;     /* Coordinate scaling factor for single-cell to integer grid */
     int n_threads;          /* Number of OpenMP threads to use */
     int mkl_n_threads;      /* Number of MKL threads (0: let MKL decide based on n_threads or its own default) */
-    
+
     // Custom weight matrix configuration
     char* custom_weights_file;    /* Path to custom weight matrix file */
     int weight_format;            /* Format of weight matrix file */
     int normalize_weights;        /* Boolean: normalize custom weights (divide by sum) */
     int row_normalize_weights;    /* Boolean: normalize each row to sum to 1 */
-    
+
     // Permutation-specific configuration
     int run_permutations;      /* Boolean: 1 to run permutation tests, 0 otherwise */
     int num_permutations;      /* Number of permutations if run_permutations is 1 */
@@ -231,7 +231,7 @@ typedef struct {
     int perm_output_zscores;   /* Boolean: 1 to output Z-scores from permutations */
     int perm_output_pvalues;   /* Boolean: 1 to output p-values from permutations */
     char* output_prefix;       /* Prefix for output files */
-    
+
     // Residual analysis configuration
     ResidualConfig residual_config;  /* Configuration for residual Moran's I analysis */
 } MoransIConfig;
@@ -260,7 +260,7 @@ int validate_weight_matrix(const SparseMatrix* W, char** spot_names, MKL_INT n_s
 
 /* Cell Type Data Processing */
 CellTypeMatrix* read_celltype_deconvolution_file(const char* filename, const char* spot_id_col);
-CellTypeMatrix* read_celltype_singlecell_file(const char* filename, 
+CellTypeMatrix* read_celltype_singlecell_file(const char* filename,
                                              const char* cell_id_col,
                                              const char* celltype_col,
                                              const char* x_col,
@@ -307,7 +307,7 @@ double* calculate_morans_i_batch(const double* X_data_spots_x_genes, long long n
                                  long long W_nnz, int paired_genes);
 
 /* Residual Moran's I Core Calculation */
-ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTypeMatrix* Z, 
+ResidualResults* calculate_residual_morans_i(const DenseMatrix* X, const CellTypeMatrix* Z,
                                            const SparseMatrix* W, const ResidualConfig* config,
                                            int verbose);
 DenseMatrix* calculate_residual_morans_i_matrix(const DenseMatrix* R_normalized, const SparseMatrix* W);
@@ -320,8 +320,8 @@ PermutationResults* run_residual_permutation_test(const DenseMatrix* X, const Ce
                                                  const ResidualConfig* config);
 
 /* Results Saving */
-int save_results(const DenseMatrix* result_matrix, const char* output_file); 
-int save_single_gene_results(const DenseMatrix* X_calc_spots_x_genes, const SparseMatrix* W_spots_x_spots, double S0_unused, const char* output_file, int row_normalized); 
+int save_results(const DenseMatrix* result_matrix, const char* output_file);
+int save_single_gene_results(const DenseMatrix* X_calc_spots_x_genes, const SparseMatrix* W_spots_x_spots, double S0_unused, const char* output_file, int row_normalized);
 int save_first_gene_vs_all_results(const double* morans_values_array, const char** gene_names_array, MKL_INT n_genes, const char* output_file);
 int save_lower_triangular_matrix_raw(const DenseMatrix* square_matrix, const char* output_file);
 int save_permutation_results(const PermutationResults* perm_test_results,
