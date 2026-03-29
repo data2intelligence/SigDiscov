@@ -30,7 +30,7 @@ make clean && make
 echo ""
 
 echo "=== Running Moran's I (Visium, -s 0 -r 3, all pairs) ==="
-time ./morans_i_mkl \
+time ./build/morans_i_mkl \
     -i "$INPUT" \
     -o "$OUTPUT_PREFIX" \
     -p 0 -r 3 -s 0 \

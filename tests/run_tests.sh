@@ -12,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BINARY="${1:-${PROJECT_DIR}/morans_i_mkl}"
+BINARY="${1:-${PROJECT_DIR}/build/morans_i_mkl}"
 OUTPUT_DIR="${SCRIPT_DIR}/output"
 EXPECTED_DIR="${SCRIPT_DIR}/expected"
 
@@ -64,7 +64,7 @@ compare_file() {
 
 # Generate expected files mode
 if [ "${1:-}" = "--generate-expected" ]; then
-    BINARY="${2:-${PROJECT_DIR}/morans_i_mkl}"
+    BINARY="${2:-${PROJECT_DIR}/build/morans_i_mkl}"
     echo "=== Generating expected test outputs ==="
     echo "Binary: $BINARY"
 

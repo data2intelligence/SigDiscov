@@ -43,7 +43,7 @@ make clean && make -j8
 echo ""
 
 echo "Running native MKL..."
-time ./morans_i_mkl \
+time ./build/morans_i_mkl \
     -i "$INPUT" \
     -o "${OUTPUT_DIR}/bench_native" \
     -p 0 -r 3 -s 0 -b 1 -g 1 -t 8

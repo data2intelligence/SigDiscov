@@ -6,7 +6,7 @@ WORKDIR /build
 COPY src/ src/
 COPY Makefile .
 
-RUN make -j$(nproc)
+RUN make BUILDDIR=. -j$(nproc)
 
 # Discover exact shared lib names the binary needs (for maintainability)
 RUN echo "=== Binary dependencies ===" && \

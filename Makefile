@@ -17,7 +17,9 @@ VERSION = 1.3.0
 VERSION_FLAG = -DMORANS_I_MKL_VERSION=\"$(VERSION)\"
 
 # Target executable name
-TARGET = morans_i_mkl
+BINARY = morans_i_mkl
+BUILDDIR ?= build
+TARGET = $(BUILDDIR)/$(BINARY)
 
 # Source layout
 SRCDIR = src
@@ -36,7 +38,7 @@ SOURCES = main.c \
 
 HEADERS = $(SRCDIR)/morans_i_mkl.h $(SRCDIR)/morans_i_internal.h $(SRCDIR)/openblas_compat.h
 
-OBJECTS = $(SOURCES:.c=.o)
+OBJECTS = $(addprefix $(BUILDDIR)/,$(SOURCES:.c=.o))
 
 # ============================================================
 # Compiler Configuration
@@ -89,17 +91,22 @@ endif
 all: $(TARGET)
 
 # Rule to build the target
-$(TARGET): $(OBJECTS)
+$(TARGET): $(OBJECTS) | $(BUILDDIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
 	@echo "Build complete: $(TARGET) v$(VERSION) ($(BUILD_INFO))"
 
 # Rule to compile object files (VPATH finds .c in src/)
-%.o: %.c $(HEADERS) Makefile
+$(BUILDDIR)/%.o: %.c $(HEADERS) Makefile | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(VERSION_FLAG) $(INCLUDES) -c $< -o $@
+
+# Create build directory
+$(BUILDDIR):
+	mkdir -p $(BUILDDIR)
 
 # Rule to clean build artifacts
 clean:
-	rm -f $(TARGET) $(OBJECTS) *.d
+	rm -f $(TARGET) $(OBJECTS)
+	@-rmdir $(BUILDDIR) 2>/dev/null || true
 	@echo "Cleaned build artifacts."
 
 # Install target
@@ -107,13 +114,13 @@ PREFIX ?= /usr/local
 DESTDIR ?=
 install: $(TARGET)
 	mkdir -p $(DESTDIR)$(PREFIX)/bin
-	cp $(TARGET) $(DESTDIR)$(PREFIX)/bin/
-	@echo "Installed $(TARGET) to $(DESTDIR)$(PREFIX)/bin/"
+	cp $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(BINARY)
+	@echo "Installed $(BINARY) to $(DESTDIR)$(PREFIX)/bin/"
 
 # Uninstall target
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/$(TARGET)
-	@echo "Uninstalled $(TARGET) from $(DESTDIR)$(PREFIX)/bin/"
+	rm -f $(DESTDIR)$(PREFIX)/bin/$(BINARY)
+	@echo "Uninstalled $(BINARY) from $(DESTDIR)$(PREFIX)/bin/"
 
 # Debug build with additional debug flags and no optimization
 debug: CFLAGS_ORIG := $(CFLAGS)
@@ -137,6 +144,8 @@ help:
 	@echo "Build configurations:"
 	@echo "  make                        - Build with Intel icx + MKL (default)"
 	@echo "  make CC=gcc USE_OPENBLAS=1  - Build with GCC + OpenBLAS"
+	@echo ""
+	@echo "Build output goes to $(BUILDDIR)/ (override with BUILDDIR=<dir>)"
 	@echo ""
 	@echo "Makefile targets:"
 	@echo "  all       - Build the program (default)"

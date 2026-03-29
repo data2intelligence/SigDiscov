@@ -70,4 +70,4 @@ jobs:
         run: make CC=gcc USE_OPENBLAS=1
 
       - name: Smoke test
-        run: ./morans_i_mkl --run-toy-example -o /tmp/ci_toy -t 1
+        run: ./build/morans_i_mkl --run-toy-example -o /tmp/ci_toy -t 1

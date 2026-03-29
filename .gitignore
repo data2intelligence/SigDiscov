@@ -29,6 +29,7 @@
 .DS_Store
 
 # Build artifacts
+build/
 *.o
 *.d
 morans_i_mkl

@@ -11,10 +11,10 @@ See [docs/weight-generator.md](docs/weight-generator.md) for full documentation.
 python3 tools/make_custom_w.py -i expression.tsv -o weights -r 3 -s 0 -p 0
 
 # Use with Moran's I
-./morans_i_mkl -i expression.tsv -o results -w weights_dense.tsv --weight-format dense -b 1 -g 1
+./build/morans_i_mkl -i expression.tsv -o results -w weights_dense.tsv --weight-format dense -b 1 -g 1
 
 # Validate against built-in calculation
-./morans_i_mkl -i expression.tsv -o builtin -r 3 -s 0 -p 0 -b 1 -g 1
+./build/morans_i_mkl -i expression.tsv -o builtin -r 3 -s 0 -p 0 -b 1 -g 1
 diff builtin_all_pairs_moran_i_raw.tsv results_all_pairs_moran_i_raw.tsv
 ```
 

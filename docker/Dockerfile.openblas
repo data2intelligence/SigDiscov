@@ -9,7 +9,7 @@ WORKDIR /build
 COPY src/ src/
 COPY Makefile .
 
-RUN make CC=gcc USE_OPENBLAS=1 -j$(nproc)
+RUN make CC=gcc USE_OPENBLAS=1 BUILDDIR=. -j$(nproc)
 
 # Runtime stage
 FROM ubuntu:22.04

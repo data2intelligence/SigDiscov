@@ -31,8 +31,8 @@ echo ""
 # Run tests
 if [ "${1:-}" = "--generate-expected" ]; then
     echo "=== Generating expected outputs ==="
-    bash tests/run_tests.sh --generate-expected ./morans_i_mkl
+    bash tests/run_tests.sh --generate-expected ./build/morans_i_mkl
 else
     echo "=== Running tests ==="
-    bash tests/run_tests.sh ./morans_i_mkl
+    bash tests/run_tests.sh ./build/morans_i_mkl
 fi

@@ -49,7 +49,7 @@ make test                   # Submit SLURM test job
 make clean                  # Remove artifacts
 ```
 
-The Makefile uses `VPATH = src` so source files live in `src/` while object files and the binary are built in the project root. `USE_OPENBLAS` switches compiler, headers, and link libraries.
+The Makefile uses `VPATH = src` so source files live in `src/` while object files and the binary are built in `build/` (override with `BUILDDIR=<dir>`). `USE_OPENBLAS` switches compiler, headers, and link libraries.
 
 ## Data Flow
 

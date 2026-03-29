@@ -69,8 +69,8 @@ make
 # GCC + OpenBLAS (portable)
 make CC=gcc USE_OPENBLAS=1
 
-# Run
-./morans_i_mkl -i expression.tsv -o results -r 3 -p 0 -b 1 -g 1
+# Run (binary is in build/)
+./build/morans_i_mkl -i expression.tsv -o results -r 3 -p 0 -b 1 -g 1
 ```
 
 ## Performance
@@ -132,7 +132,7 @@ docker run --rm psychemistz/sigdiscov --run-toy-example -o /tmp/test
 sbatch tests/run_tests_slurm.sh
 
 # Direct
-./tests/run_tests.sh ./morans_i_mkl
+./tests/run_tests.sh ./build/morans_i_mkl
 ```
 
 ## License

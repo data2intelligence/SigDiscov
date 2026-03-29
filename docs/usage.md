@@ -3,7 +3,7 @@
 ## Basic Usage
 
 ```bash
-./morans_i_mkl -i <input.tsv> -o <output_prefix> [OPTIONS]
+./build/morans_i_mkl -i <input.tsv> -o <output_prefix> [OPTIONS]
 ```
 
 ## Required Arguments
@@ -96,29 +96,29 @@
 
 ```bash
 # Single-gene Moran's I for Visium
-./morans_i_mkl -i visium.tsv -o out -b 0 -p 0 -r 4
+./build/morans_i_mkl -i visium.tsv -o out -b 0 -p 0 -r 4
 
 # Pairwise, first gene vs all
-./morans_i_mkl -i visium.tsv -o out -b 1 -g 0
+./build/morans_i_mkl -i visium.tsv -o out -b 1 -g 0
 
 # Single-cell with coordinates
-./morans_i_mkl -i sc_expr.tsv -o out -p 2 -c coords.tsv
+./build/morans_i_mkl -i sc_expr.tsv -o out -p 2 -c coords.tsv
 
 # Residual with deconvolution
-./morans_i_mkl -i expr.tsv -o out --analysis-mode residual \
+./build/morans_i_mkl -i expr.tsv -o out --analysis-mode residual \
   --celltype-file deconv.csv --celltype-format deconv
 
 # Residual with regularization and permutation
-./morans_i_mkl -i expr.tsv -o out --analysis-mode residual \
+./build/morans_i_mkl -i expr.tsv -o out --analysis-mode residual \
   --celltype-file props.tsv --regularization 0.1 \
   --run-perm --num-perm 1000
 
 # Custom weight matrix
 python3 tools/make_custom_w.py -i expr.tsv -o weights -r 5 -p 0
-./morans_i_mkl -i expr.tsv -o out -w weights_dense.tsv --weight-format dense
+./build/morans_i_mkl -i expr.tsv -o out -w weights_dense.tsv --weight-format dense
 
 # Toy example with permutations
-./morans_i_mkl --run-toy-example -o toy --num-perm 100 --perm-seed 42
+./build/morans_i_mkl --run-toy-example -o toy --num-perm 100 --perm-seed 42
 ```
 
 ## Error Codes

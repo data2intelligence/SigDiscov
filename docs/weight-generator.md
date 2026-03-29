@@ -32,10 +32,10 @@ Generates two files:
 python3 tools/make_custom_w.py -i data.tsv -o weights -r 3 -p 0
 
 # Run with custom weights
-./morans_i_mkl -i data.tsv -o test_custom -w weights_dense.tsv --weight-format dense -b 1 -g 1
+./build/morans_i_mkl -i data.tsv -o test_custom -w weights_dense.tsv --weight-format dense -b 1 -g 1
 
 # Run with built-in weights (same parameters)
-./morans_i_mkl -i data.tsv -o test_builtin -p 0 -r 3 -b 1 -g 1
+./build/morans_i_mkl -i data.tsv -o test_builtin -p 0 -r 3 -b 1 -g 1
 
 # Results should be identical
 diff test_custom_all_pairs_moran_i_raw.tsv test_builtin_all_pairs_moran_i_raw.tsv
