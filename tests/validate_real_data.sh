@@ -47,77 +47,7 @@ if [ ! -f "$ACTUAL" ]; then
 fi
 
 echo "=== Comparing output ==="
-echo "Expected: $EXPECTED ($(wc -l < "$EXPECTED") lines)"
-echo "Actual:   $ACTUAL ($(wc -l < "$ACTUAL") lines)"
-
-expected_lines=$(wc -l < "$EXPECTED")
-actual_lines=$(wc -l < "$ACTUAL")
-
-if [ "$expected_lines" != "$actual_lines" ]; then
-    echo "FAIL: Line count mismatch: expected=$expected_lines actual=$actual_lines"
-    exit 1
-fi
-
-echo "Line counts match: $actual_lines"
-
-python3 -c "
-import sys
-import numpy as np
-
-tolerance = 1e-6
-expected_file = '$EXPECTED'
-actual_file = '$ACTUAL'
-
-# Load as ragged text, parse each row as floats
-print('Loading expected output...')
-e_rows = []
-with open(expected_file) as f:
-    for line in f:
-        e_rows.append(np.array(line.strip().split('\t'), dtype=np.float64))
-
-print('Loading actual output...')
-a_rows = []
-with open(actual_file) as f:
-    for line in f:
-        a_rows.append(np.array(line.strip().split('\t'), dtype=np.float64))
-
-if len(e_rows) != len(a_rows):
-    print(f'FAIL: Row count mismatch: expected={len(e_rows)} actual={len(a_rows)}')
-    sys.exit(1)
-
-total_count = 0
-max_diff = 0.0
-diff_count = 0
-
-for line_num, (e_vals, a_vals) in enumerate(zip(e_rows, a_rows), 1):
-    if len(e_vals) != len(a_vals):
-        print(f'FAIL: Column count mismatch at line {line_num}: expected={len(e_vals)} actual={len(a_vals)}')
-        sys.exit(1)
-    diffs = np.abs(e_vals - a_vals)
-    row_max = diffs.max()
-    if row_max > max_diff:
-        max_diff = row_max
-    bad = diffs > tolerance
-    n_bad = bad.sum()
-    total_count += len(e_vals)
-    if n_bad > 0 and diff_count < 5:
-        idxs = np.where(bad)[0]
-        for idx in idxs[:5 - diff_count]:
-            print(f'  Diff at line {line_num}, col {idx+1}: expected={e_vals[idx]:.10f} actual={a_vals[idx]:.10f} diff={diffs[idx]:.2e}')
-    diff_count += n_bad
-
-print()
-print(f'Total values compared: {total_count}')
-print(f'Max absolute difference: {max_diff:.2e}')
-print(f'Values exceeding tolerance ({tolerance}): {diff_count}')
-
-if diff_count == 0:
-    print('PASS: Output matches expected within tolerance')
-    sys.exit(0)
-else:
-    print(f'FAIL: {diff_count} values differ beyond tolerance')
-    sys.exit(1)
-"
+python3 "${PROJECT_DIR}/tests/compare_tsv.py" "$EXPECTED" "$ACTUAL"
 
 echo ""
 echo "=== Validation complete ==="

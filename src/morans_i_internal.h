@@ -38,8 +38,52 @@
     #define DEBUG_MATRIX_INFO(mat, name)
 #endif
 
+/*
+ * ERROR HANDLING CONVENTION
+ *
+ * Data loaders (read_vst_file, read_celltype_*, read_*_weight_matrix,
+ *   extract_coordinates, read_coordinates_file)
+ *   → return NULL on error, print message to stderr.
+ *
+ * Computation functions (calculate_*, run_permutation_test, run_residual_*)
+ *   → return NULL on error.
+ *
+ * Save functions (save_results, save_*_results, save_lower_triangular_*)
+ *   → return MORANS_I_SUCCESS or MORANS_I_ERROR_* codes.
+ *
+ * Validation/mapping (validate_*, map_*_to_*)
+ *   → return MORANS_I_SUCCESS or MORANS_I_ERROR_* codes.
+ *
+ * Lightweight utilities (detect_file_delimiter)
+ *   → return sensible defaults on error (e.g., '\t'); callers will fail
+ *     at the real operation if the default was wrong.
+ */
+
 /* Maximum reasonable dimensions to prevent memory issues */
 #define MAX_REASONABLE_DIM 10000000  /* 10M spots/genes */
+
+/**
+ * MKL_ALLOC_OR_FAIL -- allocate via mkl_malloc and jump to a cleanup label on failure.
+ *
+ * Usage:
+ *   double* buf = NULL;
+ *   MKL_ALLOC_OR_FAIL(buf, n * sizeof(double), cleanup);
+ *   ...
+ * cleanup:
+ *   if (buf) mkl_free(buf);
+ *
+ * The macro intentionally uses `goto` because structured cleanup in C is
+ * safest with a single exit path, especially when multiple resources must
+ * be freed.
+ */
+#define MKL_ALLOC_OR_FAIL(ptr, size_bytes, cleanup_label) do { \
+    (ptr) = mkl_malloc((size_bytes), 64);                      \
+    if (!(ptr)) {                                              \
+        fprintf(stderr, "Error: mkl_malloc failed (%zu bytes) at %s:%d\n", \
+                (size_t)(size_bytes), __FILE__, __LINE__);     \
+        goto cleanup_label;                                    \
+    }                                                          \
+} while (0)
 
 /* --- Shared helper function declarations --- */
 

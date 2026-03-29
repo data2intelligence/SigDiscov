@@ -74,6 +74,9 @@ int run_toy_example_2d(const char* output_prefix_toy, MoransIConfig* config);
 static void initialize_resources(AnalysisResources* resources);
 static void cleanup_resources(AnalysisResources* resources);
 static void initialize_command_args(CommandLineArgs* args);
+static int parse_spatial_options(int* i, int argc, char* argv[], MoransIConfig* config, CommandLineArgs* args);
+static int parse_perm_options(int* i, int argc, char* argv[], MoransIConfig* config);
+static int parse_residual_options(int* i, int argc, char* argv[], MoransIConfig* config);
 static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* config, CommandLineArgs* args);
 static int validate_and_initialize_config(MoransIConfig* config, const CommandLineArgs* args);
 static int load_and_process_expression_data(const char* input_file, AnalysisResources* resources);
@@ -184,6 +187,268 @@ static void initialize_command_args(CommandLineArgs* args) {
     args->run_toy_example = 0;
 }
 
+/* Sentinel: option not handled by this helper -- caller should try next group */
+#define PARSE_NOT_HANDLED 1
+
+/* Parse spatial / weight / coordinate options.
+ * Returns MORANS_I_SUCCESS if handled, MORANS_I_ERROR_* on error,
+ * or PARSE_NOT_HANDLED if argv[*i] does not belong to this group. */
+static int parse_spatial_options(int* i, int argc, char* argv[],
+                                 MoransIConfig* config, CommandLineArgs* args) {
+    const char* arg = argv[*i];
+
+    if (strcmp(arg, "-r") == 0) {
+        REQUIRE_ARG(*i, argc, "-r");
+        config->max_radius = load_positive_value(argv[*i], "-r", 1, 1000);
+        if (config->max_radius < 0) {
+            return MORANS_I_ERROR_PARAMETER;
+        }
+
+    } else if (strcmp(arg, "-p") == 0) {
+        REQUIRE_ARG(*i, argc, "-p");
+        config->platform_mode = load_positive_value(argv[*i], "-p", 0, 3);
+        if (config->platform_mode < 0) {
+            return MORANS_I_ERROR_PARAMETER;
+        }
+
+    } else if (strcmp(arg, "-s") == 0) {
+        REQUIRE_ARG(*i, argc, "-s");
+        config->include_same_spot = load_positive_value(argv[*i], "-s", 0, 1);
+        if (config->include_same_spot < 0) {
+            return MORANS_I_ERROR_PARAMETER;
+        }
+
+    } else if (strcmp(arg, "-w") == 0) {
+        REQUIRE_ARG(*i, argc, "-w");
+        if (config->custom_weights_file) free(config->custom_weights_file);
+        config->custom_weights_file = strdup(argv[*i]);
+        if (!config->custom_weights_file) {
+            perror("strdup custom_weights_file");
+            return MORANS_I_ERROR_MEMORY;
+        }
+        config->platform_mode = CUSTOM_WEIGHTS;
+
+    } else if (strcmp(arg, "--weight-format") == 0) {
+        REQUIRE_ARG(*i, argc, "--weight-format");
+        config->weight_format = parse_weight_format(argv[*i]);
+
+    } else if (strcmp(arg, "--normalize-weights") == 0) {
+        config->normalize_weights = 1;
+
+    } else if (strcmp(arg, "--row-normalize") == 0) {
+        if (*i + 1 < argc && (strcmp(argv[*i + 1], "0") == 0 || strcmp(argv[*i + 1], "1") == 0)) {
+            (*i)++;
+            config->row_normalize_weights = load_positive_value(argv[*i], "--row-normalize", 0, 1);
+            if (config->row_normalize_weights < 0) {
+                return MORANS_I_ERROR_PARAMETER;
+            }
+        } else {
+            config->row_normalize_weights = 1;
+        }
+
+    } else if (strcmp(arg, "--sigma") == 0) {
+        REQUIRE_ARG(*i, argc, "--sigma");
+        args->custom_sigma = load_double_value(argv[*i], "--sigma");
+        if (isnan(args->custom_sigma)) {
+            return MORANS_I_ERROR_PARAMETER;
+        }
+
+    } else if (strcmp(arg, "--scale") == 0) {
+        REQUIRE_ARG(*i, argc, "--scale");
+        config->coord_scale = load_double_value(argv[*i], "--scale");
+        if (isnan(config->coord_scale) || config->coord_scale <= 0) {
+            fprintf(stderr, "Error: --scale must be a positive number.\n");
+            return MORANS_I_ERROR_PARAMETER;
+        }
+
+    } else if (strcmp(arg, "-c") == 0) {
+        PARSE_STRING_ARG(*i, argc, argv, "-c", args->meta_file);
+        args->use_metadata_file = 1;
+
+    } else if (strcmp(arg, "--id-col") == 0) {
+        PARSE_STRING_ARG(*i, argc, argv, "--id-col", args->id_column);
+
+    } else if (strcmp(arg, "--x-col") == 0) {
+        PARSE_STRING_ARG(*i, argc, argv, "--x-col", args->x_column);
+
+    } else if (strcmp(arg, "--y-col") == 0) {
+        PARSE_STRING_ARG(*i, argc, argv, "--y-col", args->y_column);
+
+    } else {
+        return PARSE_NOT_HANDLED;
+    }
+
+    return MORANS_I_SUCCESS;
+}
+
+/* Parse permutation test options.
+ * Returns MORANS_I_SUCCESS if handled, MORANS_I_ERROR_* on error,
+ * or PARSE_NOT_HANDLED if argv[*i] does not belong to this group. */
+static int parse_perm_options(int* i, int argc, char* argv[],
+                              MoransIConfig* config) {
+    const char* arg = argv[*i];
+
+    if (strcmp(arg, "--run-perm") == 0) {
+        config->run_permutations = 1;
+
+    } else if (strcmp(arg, "--num-perm") == 0) {
+        REQUIRE_ARG(*i, argc, "--num-perm");
+        config->num_permutations = load_positive_value(argv[*i], "--num-perm", 1, 10000000);
+        if (config->num_permutations < 0) {
+            return MORANS_I_ERROR_PARAMETER;
+        }
+        config->run_permutations = 1;
+
+    } else if (strcmp(arg, "--perm-seed") == 0) {
+        REQUIRE_ARG(*i, argc, "--perm-seed");
+        char* endptr = NULL;
+        errno = 0;
+        long seed_val = strtol(argv[*i], &endptr, 10);
+        if (errno == ERANGE || seed_val < 0 || (unsigned long)seed_val > UINT_MAX
+            || endptr == argv[*i] || *endptr != '\0') {
+            fprintf(stderr, "Error: Invalid seed value for --perm-seed '%s'.\n", argv[*i]);
+            return MORANS_I_ERROR_PARAMETER;
+        }
+        config->perm_seed = (unsigned int)seed_val;
+        config->run_permutations = 1;
+
+    } else if (strcmp(arg, "--perm-out-z") == 0) {
+        if (*i + 1 < argc && (strcmp(argv[*i + 1], "0") == 0 || strcmp(argv[*i + 1], "1") == 0)) {
+            (*i)++;
+            config->perm_output_zscores = load_positive_value(argv[*i], "--perm-out-z", 0, 1);
+            if (config->perm_output_zscores < 0) return MORANS_I_ERROR_PARAMETER;
+        } else {
+            config->perm_output_zscores = 1;
+        }
+        config->run_permutations = 1;
+
+    } else if (strcmp(arg, "--perm-out-p") == 0) {
+        if (*i + 1 < argc && (strcmp(argv[*i + 1], "0") == 0 || strcmp(argv[*i + 1], "1") == 0)) {
+            (*i)++;
+            config->perm_output_pvalues = load_positive_value(argv[*i], "--perm-out-p", 0, 1);
+            if (config->perm_output_pvalues < 0) return MORANS_I_ERROR_PARAMETER;
+        } else {
+            config->perm_output_pvalues = 1;
+        }
+        config->run_permutations = 1;
+
+    } else {
+        return PARSE_NOT_HANDLED;
+    }
+
+    return MORANS_I_SUCCESS;
+}
+
+/* Parse residual analysis options.
+ * Returns MORANS_I_SUCCESS if handled, MORANS_I_ERROR_* on error,
+ * or PARSE_NOT_HANDLED if argv[*i] does not belong to this group. */
+static int parse_residual_options(int* i, int argc, char* argv[],
+                                  MoransIConfig* config) {
+    const char* arg = argv[*i];
+
+    if (strcmp(arg, "--analysis-mode") == 0) {
+        REQUIRE_ARG(*i, argc, "--analysis-mode");
+        config->residual_config.analysis_mode = parse_analysis_mode(argv[*i]);
+        if (config->residual_config.analysis_mode < 0) {
+            return MORANS_I_ERROR_PARAMETER;
+        }
+
+    } else if (strcmp(arg, "--celltype-file") == 0) {
+        REQUIRE_ARG(*i, argc, "--celltype-file");
+        if (config->residual_config.celltype_file) free(config->residual_config.celltype_file);
+        config->residual_config.celltype_file = strdup(argv[*i]);
+        if (!config->residual_config.celltype_file) {
+            perror("strdup celltype_file");
+            return MORANS_I_ERROR_MEMORY;
+        }
+        config->residual_config.analysis_mode = ANALYSIS_MODE_RESIDUAL;
+
+    } else if (strcmp(arg, "--celltype-format") == 0) {
+        REQUIRE_ARG(*i, argc, "--celltype-format");
+        config->residual_config.celltype_format = parse_celltype_format(argv[*i]);
+        if (config->residual_config.celltype_format < 0) {
+            return MORANS_I_ERROR_PARAMETER;
+        }
+
+    } else if (strcmp(arg, "--celltype-id-col") == 0) {
+        REQUIRE_ARG(*i, argc, "--celltype-id-col");
+        if (config->residual_config.celltype_id_col) free(config->residual_config.celltype_id_col);
+        config->residual_config.celltype_id_col = strdup(argv[*i]);
+        if (!config->residual_config.celltype_id_col) {
+            perror("strdup celltype_id_col");
+            return MORANS_I_ERROR_MEMORY;
+        }
+
+    } else if (strcmp(arg, "--celltype-type-col") == 0) {
+        REQUIRE_ARG(*i, argc, "--celltype-type-col");
+        if (config->residual_config.celltype_type_col) free(config->residual_config.celltype_type_col);
+        config->residual_config.celltype_type_col = strdup(argv[*i]);
+        if (!config->residual_config.celltype_type_col) {
+            perror("strdup celltype_type_col");
+            return MORANS_I_ERROR_MEMORY;
+        }
+
+    } else if (strcmp(arg, "--celltype-x-col") == 0) {
+        REQUIRE_ARG(*i, argc, "--celltype-x-col");
+        if (config->residual_config.celltype_x_col) free(config->residual_config.celltype_x_col);
+        config->residual_config.celltype_x_col = strdup(argv[*i]);
+        if (!config->residual_config.celltype_x_col) {
+            perror("strdup celltype_x_col");
+            return MORANS_I_ERROR_MEMORY;
+        }
+
+    } else if (strcmp(arg, "--celltype-y-col") == 0) {
+        REQUIRE_ARG(*i, argc, "--celltype-y-col");
+        if (config->residual_config.celltype_y_col) free(config->residual_config.celltype_y_col);
+        config->residual_config.celltype_y_col = strdup(argv[*i]);
+        if (!config->residual_config.celltype_y_col) {
+            perror("strdup celltype_y_col");
+            return MORANS_I_ERROR_MEMORY;
+        }
+
+    } else if (strcmp(arg, "--spot-id-col") == 0) {
+        REQUIRE_ARG(*i, argc, "--spot-id-col");
+        if (config->residual_config.spot_id_col) free(config->residual_config.spot_id_col);
+        config->residual_config.spot_id_col = strdup(argv[*i]);
+        if (!config->residual_config.spot_id_col) {
+            perror("strdup spot_id_col");
+            return MORANS_I_ERROR_MEMORY;
+        }
+
+    } else if (strcmp(arg, "--include-intercept") == 0) {
+        if (*i + 1 < argc && (strcmp(argv[*i + 1], "0") == 0 || strcmp(argv[*i + 1], "1") == 0)) {
+            (*i)++;
+            config->residual_config.include_intercept = load_positive_value(argv[*i], "--include-intercept", 0, 1);
+            if (config->residual_config.include_intercept < 0) return MORANS_I_ERROR_PARAMETER;
+        } else {
+            config->residual_config.include_intercept = 1;
+        }
+
+    } else if (strcmp(arg, "--regularization") == 0) {
+        REQUIRE_ARG(*i, argc, "--regularization");
+        config->residual_config.regularization_lambda = load_double_value(argv[*i], "--regularization");
+        if (isnan(config->residual_config.regularization_lambda) ||
+            config->residual_config.regularization_lambda < 0) {
+            fprintf(stderr, "Error: --regularization must be a non-negative number\n");
+            return MORANS_I_ERROR_PARAMETER;
+        }
+
+    } else if (strcmp(arg, "--normalize-residuals") == 0) {
+        if (*i + 1 < argc && (strcmp(argv[*i + 1], "0") == 0 || strcmp(argv[*i + 1], "1") == 0)) {
+            (*i)++;
+            config->residual_config.normalize_residuals = load_positive_value(argv[*i], "--normalize-residuals", 0, 1);
+            if (config->residual_config.normalize_residuals < 0) return MORANS_I_ERROR_PARAMETER;
+        } else {
+            config->residual_config.normalize_residuals = 1;
+        }
+
+    } else {
+        return PARSE_NOT_HANDLED;
+    }
+
+    return MORANS_I_SUCCESS;
+}
+
 /* Parse command line arguments */
 static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* config,
                                        CommandLineArgs* args) {
@@ -198,6 +463,7 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
     }
 
     for (int i = 1; i < argc; i++) {
+        /* Global options handled directly */
         if (strcmp(argv[i], "-i") == 0) {
             PARSE_STRING_ARG(i, argc, argv, "-i", args->input_file);
 
@@ -206,76 +472,6 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
 
         } else if (strcmp(argv[i], "--run-toy-example") == 0) {
             args->run_toy_example = 2;
-
-        } else if (strcmp(argv[i], "-c") == 0) {
-            PARSE_STRING_ARG(i, argc, argv, "-c", args->meta_file);
-            args->use_metadata_file = 1;
-
-        } else if (strcmp(argv[i], "--id-col") == 0) {
-            PARSE_STRING_ARG(i, argc, argv, "--id-col", args->id_column);
-
-        } else if (strcmp(argv[i], "--x-col") == 0) {
-            PARSE_STRING_ARG(i, argc, argv, "--x-col", args->x_column);
-
-        } else if (strcmp(argv[i], "--y-col") == 0) {
-            PARSE_STRING_ARG(i, argc, argv, "--y-col", args->y_column);
-
-        } else if (strcmp(argv[i], "--scale") == 0) {
-            REQUIRE_ARG(i, argc, "--scale");
-            config->coord_scale = load_double_value(argv[i], "--scale");
-            if (isnan(config->coord_scale) || config->coord_scale <= 0) {
-                fprintf(stderr, "Error: --scale must be a positive number.\n");
-                return MORANS_I_ERROR_PARAMETER;
-            }
-
-        } else if (strcmp(argv[i], "--sigma") == 0) {
-            REQUIRE_ARG(i, argc, "--sigma");
-            args->custom_sigma = load_double_value(argv[i], "--sigma");
-            if (isnan(args->custom_sigma)) {
-                return MORANS_I_ERROR_PARAMETER;
-            }
-
-        } else if (strcmp(argv[i], "-r") == 0) {
-            REQUIRE_ARG(i, argc, "-r");
-            config->max_radius = load_positive_value(argv[i], "-r", 1, 1000);
-            if (config->max_radius < 0) {
-                return MORANS_I_ERROR_PARAMETER;
-            }
-
-        } else if (strcmp(argv[i], "-w") == 0) {
-            REQUIRE_ARG(i, argc, "-w");
-            if (config->custom_weights_file) free(config->custom_weights_file);
-            config->custom_weights_file = strdup(argv[i]);
-            if (!config->custom_weights_file) {
-                perror("strdup custom_weights_file");
-                return MORANS_I_ERROR_MEMORY;
-            }
-            config->platform_mode = CUSTOM_WEIGHTS;
-
-        } else if (strcmp(argv[i], "--weight-format") == 0) {
-            REQUIRE_ARG(i, argc, "--weight-format");
-            config->weight_format = parse_weight_format(argv[i]);
-
-        } else if (strcmp(argv[i], "--normalize-weights") == 0) {
-            config->normalize_weights = 1;
-
-        } else if (strcmp(argv[i], "--row-normalize") == 0) {
-            if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 || strcmp(argv[i + 1], "1") == 0)) {
-                i++;
-                config->row_normalize_weights = load_positive_value(argv[i], "--row-normalize", 0, 1);
-                if (config->row_normalize_weights < 0) {
-                    return MORANS_I_ERROR_PARAMETER;
-                }
-            } else {
-                config->row_normalize_weights = 1;
-            }
-
-        } else if (strcmp(argv[i], "-p") == 0) {
-            REQUIRE_ARG(i, argc, "-p");
-            config->platform_mode = load_positive_value(argv[i], "-p", 0, 3);
-            if (config->platform_mode < 0) {
-                return MORANS_I_ERROR_PARAMETER;
-            }
 
         } else if (strcmp(argv[i], "-b") == 0) {
             REQUIRE_ARG(i, argc, "-b");
@@ -288,13 +484,6 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
             REQUIRE_ARG(i, argc, "-g");
             config->calc_all_vs_all = load_positive_value(argv[i], "-g", 0, 1);
             if (config->calc_all_vs_all < 0) {
-                return MORANS_I_ERROR_PARAMETER;
-            }
-
-        } else if (strcmp(argv[i], "-s") == 0) {
-            REQUIRE_ARG(i, argc, "-s");
-            config->include_same_spot = load_positive_value(argv[i], "-s", 0, 1);
-            if (config->include_same_spot < 0) {
                 return MORANS_I_ERROR_PARAMETER;
             }
 
@@ -312,151 +501,22 @@ static int parse_command_line_arguments(int argc, char* argv[], MoransIConfig* c
                 return MORANS_I_ERROR_PARAMETER;
             }
 
-        /* Permutation test options */
-        } else if (strcmp(argv[i], "--run-perm") == 0) {
-            config->run_permutations = 1;
-
-        } else if (strcmp(argv[i], "--num-perm") == 0) {
-            REQUIRE_ARG(i, argc, "--num-perm");
-            config->num_permutations = load_positive_value(argv[i], "--num-perm", 1, 10000000);
-            if (config->num_permutations < 0) {
-                return MORANS_I_ERROR_PARAMETER;
-            }
-            config->run_permutations = 1;
-
-        } else if (strcmp(argv[i], "--perm-seed") == 0) {
-            REQUIRE_ARG(i, argc, "--perm-seed");
-            char* endptr = NULL;
-            errno = 0;
-            long seed_val = strtol(argv[i], &endptr, 10);
-            if (errno == ERANGE || seed_val < 0 || (unsigned long)seed_val > UINT_MAX
-                || endptr == argv[i] || *endptr != '\0') {
-                fprintf(stderr, "Error: Invalid seed value for --perm-seed '%s'.\n", argv[i]);
-                return MORANS_I_ERROR_PARAMETER;
-            }
-            config->perm_seed = (unsigned int)seed_val;
-            config->run_permutations = 1;
-
-        } else if (strcmp(argv[i], "--perm-out-z") == 0) {
-            if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 || strcmp(argv[i + 1], "1") == 0)) {
-                i++;
-                config->perm_output_zscores = load_positive_value(argv[i], "--perm-out-z", 0, 1);
-                if (config->perm_output_zscores < 0) return MORANS_I_ERROR_PARAMETER;
-            } else {
-                config->perm_output_zscores = 1;
-            }
-            config->run_permutations = 1;
-
-        } else if (strcmp(argv[i], "--perm-out-p") == 0) {
-            if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 || strcmp(argv[i + 1], "1") == 0)) {
-                i++;
-                config->perm_output_pvalues = load_positive_value(argv[i], "--perm-out-p", 0, 1);
-                if (config->perm_output_pvalues < 0) return MORANS_I_ERROR_PARAMETER;
-            } else {
-                config->perm_output_pvalues = 1;
-            }
-            config->run_permutations = 1;
-
-        /* Residual analysis options */
-        } else if (strcmp(argv[i], "--analysis-mode") == 0) {
-            REQUIRE_ARG(i, argc, "--analysis-mode");
-            config->residual_config.analysis_mode = parse_analysis_mode(argv[i]);
-            if (config->residual_config.analysis_mode < 0) {
-                return MORANS_I_ERROR_PARAMETER;
-            }
-
-        } else if (strcmp(argv[i], "--celltype-file") == 0) {
-            REQUIRE_ARG(i, argc, "--celltype-file");
-            if (config->residual_config.celltype_file) free(config->residual_config.celltype_file);
-            config->residual_config.celltype_file = strdup(argv[i]);
-            if (!config->residual_config.celltype_file) {
-                perror("strdup celltype_file");
-                return MORANS_I_ERROR_MEMORY;
-            }
-            config->residual_config.analysis_mode = ANALYSIS_MODE_RESIDUAL;
-
-        } else if (strcmp(argv[i], "--celltype-format") == 0) {
-            REQUIRE_ARG(i, argc, "--celltype-format");
-            config->residual_config.celltype_format = parse_celltype_format(argv[i]);
-            if (config->residual_config.celltype_format < 0) {
-                return MORANS_I_ERROR_PARAMETER;
-            }
-
-        } else if (strcmp(argv[i], "--celltype-id-col") == 0) {
-            REQUIRE_ARG(i, argc, "--celltype-id-col");
-            if (config->residual_config.celltype_id_col) free(config->residual_config.celltype_id_col);
-            config->residual_config.celltype_id_col = strdup(argv[i]);
-            if (!config->residual_config.celltype_id_col) {
-                perror("strdup celltype_id_col");
-                return MORANS_I_ERROR_MEMORY;
-            }
-
-        } else if (strcmp(argv[i], "--celltype-type-col") == 0) {
-            REQUIRE_ARG(i, argc, "--celltype-type-col");
-            if (config->residual_config.celltype_type_col) free(config->residual_config.celltype_type_col);
-            config->residual_config.celltype_type_col = strdup(argv[i]);
-            if (!config->residual_config.celltype_type_col) {
-                perror("strdup celltype_type_col");
-                return MORANS_I_ERROR_MEMORY;
-            }
-
-        } else if (strcmp(argv[i], "--celltype-x-col") == 0) {
-            REQUIRE_ARG(i, argc, "--celltype-x-col");
-            if (config->residual_config.celltype_x_col) free(config->residual_config.celltype_x_col);
-            config->residual_config.celltype_x_col = strdup(argv[i]);
-            if (!config->residual_config.celltype_x_col) {
-                perror("strdup celltype_x_col");
-                return MORANS_I_ERROR_MEMORY;
-            }
-
-        } else if (strcmp(argv[i], "--celltype-y-col") == 0) {
-            REQUIRE_ARG(i, argc, "--celltype-y-col");
-            if (config->residual_config.celltype_y_col) free(config->residual_config.celltype_y_col);
-            config->residual_config.celltype_y_col = strdup(argv[i]);
-            if (!config->residual_config.celltype_y_col) {
-                perror("strdup celltype_y_col");
-                return MORANS_I_ERROR_MEMORY;
-            }
-
-        } else if (strcmp(argv[i], "--spot-id-col") == 0) {
-            REQUIRE_ARG(i, argc, "--spot-id-col");
-            if (config->residual_config.spot_id_col) free(config->residual_config.spot_id_col);
-            config->residual_config.spot_id_col = strdup(argv[i]);
-            if (!config->residual_config.spot_id_col) {
-                perror("strdup spot_id_col");
-                return MORANS_I_ERROR_MEMORY;
-            }
-
-        } else if (strcmp(argv[i], "--include-intercept") == 0) {
-            if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 || strcmp(argv[i + 1], "1") == 0)) {
-                i++;
-                config->residual_config.include_intercept = load_positive_value(argv[i], "--include-intercept", 0, 1);
-                if (config->residual_config.include_intercept < 0) return MORANS_I_ERROR_PARAMETER;
-            } else {
-                config->residual_config.include_intercept = 1;
-            }
-
-        } else if (strcmp(argv[i], "--regularization") == 0) {
-            REQUIRE_ARG(i, argc, "--regularization");
-            config->residual_config.regularization_lambda = load_double_value(argv[i], "--regularization");
-            if (isnan(config->residual_config.regularization_lambda) ||
-                config->residual_config.regularization_lambda < 0) {
-                fprintf(stderr, "Error: --regularization must be a non-negative number\n");
-                return MORANS_I_ERROR_PARAMETER;
-            }
-
-        } else if (strcmp(argv[i], "--normalize-residuals") == 0) {
-            if (i + 1 < argc && (strcmp(argv[i + 1], "0") == 0 || strcmp(argv[i + 1], "1") == 0)) {
-                i++;
-                config->residual_config.normalize_residuals = load_positive_value(argv[i], "--normalize-residuals", 0, 1);
-                if (config->residual_config.normalize_residuals < 0) return MORANS_I_ERROR_PARAMETER;
-            } else {
-                config->residual_config.normalize_residuals = 1;
-            }
-
         } else {
-            fprintf(stderr, "Error: Unknown parameter '%s'. Use -h for help.\n", argv[i]);
-            return MORANS_I_ERROR_PARAMETER;
+            /* Try category-specific helpers in order */
+            int rc = parse_spatial_options(&i, argc, argv, config, args);
+            if (rc == PARSE_NOT_HANDLED) {
+                rc = parse_perm_options(&i, argc, argv, config);
+            }
+            if (rc == PARSE_NOT_HANDLED) {
+                rc = parse_residual_options(&i, argc, argv, config);
+            }
+            if (rc == PARSE_NOT_HANDLED) {
+                fprintf(stderr, "Error: Unknown parameter '%s'. Use -h for help.\n", argv[i]);
+                return MORANS_I_ERROR_PARAMETER;
+            }
+            if (rc != MORANS_I_SUCCESS) {
+                return rc;
+            }
         }
     }
 

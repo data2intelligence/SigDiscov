@@ -508,6 +508,137 @@ double* calculate_first_gene_vs_all(const DenseMatrix* X, const SparseMatrix* W,
 }
 
 /* ===============================
+ * BATCH CALCULATION HELPERS
+ * =============================== */
+
+/* Pairwise branch: compute n_genes x n_genes Moran's I matrix via
+ * mkl_sparse_d_mm + cblas_dgemm.  Returns mkl_malloc'd result or NULL. */
+static double* batch_pairwise_morans_i(sparse_matrix_t W_mkl, const double* X_data,
+                                       MKL_INT n_genes, MKL_INT n_spots, double inv_S0) {
+    // Allocate result matrix (n_genes x n_genes)
+    size_t result_size_elements;
+    size_t result_size_bytes;
+
+    if (safe_multiply_size_t(n_genes, n_genes, &result_size_elements) != 0 ||
+        safe_multiply_size_t(result_size_elements, sizeof(double), &result_size_bytes) != 0) {
+        fprintf(stderr, "Error: Result matrix dimensions too large for batch pairwise calc.\n");
+        return NULL;
+    }
+    double* results = (double*)mkl_malloc(result_size_bytes, 64);
+
+    if (!results) {
+        perror("Failed to allocate results for batch pairwise calculation");
+        return NULL;
+    }
+
+    // Allocate temp_WX (n_spots x n_genes)
+    size_t temp_wx_elements;
+    size_t temp_wx_bytes;
+    if (safe_multiply_size_t(n_spots, n_genes, &temp_wx_elements) != 0 ||
+        safe_multiply_size_t(temp_wx_elements, sizeof(double), &temp_wx_bytes) != 0) {
+        fprintf(stderr, "Error: Temp_WX matrix dimensions too large for batch pairwise calc.\n");
+        mkl_free(results);
+        return NULL;
+    }
+    double* temp_WX = (double*)mkl_malloc(temp_wx_bytes, 64);
+
+    if (!temp_WX) {
+        perror("Failed to allocate temp_WX for batch calculation");
+        mkl_free(results);
+        return NULL;
+    }
+
+    // Sparse-dense multiply: temp_WX = W * X
+    struct matrix_descr descr;
+    descr.type = SPARSE_MATRIX_TYPE_GENERAL;
+
+    sparse_status_t status = mkl_sparse_d_mm(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, W_mkl, descr,
+                            SPARSE_LAYOUT_ROW_MAJOR, (double*)X_data, n_genes, n_genes, // X_data is const, MKL takes non-const. This is typical.
+                            0.0, temp_WX, n_genes);
+
+    if (status != SPARSE_STATUS_SUCCESS) {
+        print_mkl_status(status, "mkl_sparse_d_mm (batch W * X)");
+        mkl_free(temp_WX);
+        mkl_free(results);
+        return NULL;
+    }
+
+    // results = X^T * temp_WX * inv_S0
+    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                n_genes, n_genes, n_spots, inv_S0,
+                X_data, n_genes, temp_WX, n_genes,
+                0.0, results, n_genes);
+
+    mkl_free(temp_WX);
+    return results;
+}
+
+/* Single-gene branch: compute per-gene Moran's I via mkl_sparse_d_mv loop.
+ * Returns mkl_malloc'd result vector (length n_genes) or NULL.
+ * S0 is needed for the explicit near-zero check inside the loop. */
+static double* batch_single_gene_morans_i(sparse_matrix_t W_mkl, const double* X_data,
+                                          MKL_INT n_genes, MKL_INT n_spots,
+                                          double inv_S0, double S0) {
+    size_t result_size_bytes;
+    if (safe_multiply_size_t(n_genes, sizeof(double), &result_size_bytes) != 0) {
+         fprintf(stderr, "Error: Result vector too large for batch single-gene calc.\n");
+         return NULL;
+    }
+    double* results = (double*)mkl_malloc(result_size_bytes, 64);
+    if (!results) {
+        fprintf(stderr, "Error: Failed to allocate result vector for batch single-gene calc.\n");
+        return NULL;
+    }
+
+    size_t buffer_bytes;
+    if (safe_multiply_size_t(n_spots, sizeof(double), &buffer_bytes) != 0) {
+        fprintf(stderr, "Error: Buffer size overflow for batch single-gene calc.\n");
+        mkl_free(results);
+        return NULL;
+    }
+
+    double* gene_buffer = (double*)mkl_malloc(buffer_bytes, 64);
+    double* Wz_buffer = (double*)mkl_malloc(buffer_bytes, 64);
+    if (!gene_buffer || !Wz_buffer) {
+        fprintf(stderr, "Error: Failed to allocate work buffers for batch single-gene calc.\n");
+        if (gene_buffer) mkl_free(gene_buffer);
+        if (Wz_buffer) mkl_free(Wz_buffer);
+        mkl_free(results);
+        return NULL;
+    }
+
+    struct matrix_descr descr;
+    descr.type = SPARSE_MATRIX_TYPE_GENERAL;
+
+    for (MKL_INT g = 0; g < n_genes; g++) {
+        for (MKL_INT s = 0; s < n_spots; s++) {
+            gene_buffer[s] = X_data[s * n_genes + g];
+        }
+
+        sparse_status_t status = mkl_sparse_d_mv(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, W_mkl, descr,
+                                gene_buffer, 0.0, Wz_buffer);
+
+        if (status != SPARSE_STATUS_SUCCESS) {
+            print_mkl_status(status, "mkl_sparse_d_mv (batch single-gene)");
+            results[g] = NAN;
+            continue;
+        }
+
+        double dot_product = cblas_ddot(n_spots, gene_buffer, 1, Wz_buffer, 1);
+        if (fabs(S0) < DBL_EPSILON) { // Explicit check for S0 for single gene case if inv_S0 might be 0.0
+             results[g] = (dot_product == 0.0) ? 0.0 : (dot_product > 0 ? INFINITY : -INFINITY) ; // Or NAN
+             if(dot_product == 0.0 && S0 == 0.0) results[g] = NAN; // 0/0 is NaN
+        } else {
+             results[g] = dot_product * inv_S0;
+        }
+    }
+
+    mkl_free(gene_buffer);
+    mkl_free(Wz_buffer);
+    return results;
+}
+
+/* ===============================
  * BATCH CALCULATION FUNCTION
  * =============================== */
 
@@ -608,126 +739,18 @@ double* calculate_morans_i_batch(const double* X_data, long long n_genes_ll, lon
         }
     }
 
-    double* results = NULL;
+    // Dispatch to the appropriate helper
+    double* results = paired_genes
+        ? batch_pairwise_morans_i(W_mkl, X_data, n_genes, n_spots, inv_S0)
+        : batch_single_gene_morans_i(W_mkl, X_data, n_genes, n_spots, inv_S0, S0);
 
-    if (paired_genes) {
-        // Pairwise calculation: result is n_genes x n_genes matrix
-        size_t result_size_elements;
-        size_t result_size_bytes;
-
-        if (safe_multiply_size_t(n_genes, n_genes, &result_size_elements) != 0 ||
-            safe_multiply_size_t(result_size_elements, sizeof(double), &result_size_bytes) != 0) {
-            fprintf(stderr, "Error: Result matrix dimensions too large for batch pairwise calc.\n");
-            mkl_sparse_destroy(W_mkl);
-            mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
-            return NULL;
-        }
-        results = (double*)mkl_malloc(result_size_bytes, 64);
-
-        if (!results) {
-            perror("Failed to allocate results for batch pairwise calculation");
-            mkl_sparse_destroy(W_mkl);
-            mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
-            return NULL;
-        }
-
-        size_t temp_wx_elements;
-        size_t temp_wx_bytes;
-        if (safe_multiply_size_t(n_spots, n_genes, &temp_wx_elements) != 0 ||
-            safe_multiply_size_t(temp_wx_elements, sizeof(double), &temp_wx_bytes) != 0) {
-            fprintf(stderr, "Error: Temp_WX matrix dimensions too large for batch pairwise calc.\n");
-            mkl_free(results);
-            mkl_sparse_destroy(W_mkl);
-            mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
-            return NULL;
-        }
-        double* temp_WX = (double*)mkl_malloc(temp_wx_bytes, 64);
-
-        if (!temp_WX) {
-            perror("Failed to allocate temp_WX for batch calculation");
-            mkl_free(results);
-            mkl_sparse_destroy(W_mkl);
-            mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
-            return NULL;
-        }
-
-        struct matrix_descr descr;
-        descr.type = SPARSE_MATRIX_TYPE_GENERAL;
-
-        status = mkl_sparse_d_mm(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, W_mkl, descr,
-                                SPARSE_LAYOUT_ROW_MAJOR, (double*)X_data, n_genes, n_genes, // X_data is const, MKL takes non-const. This is typical.
-                                0.0, temp_WX, n_genes);
-
-        if (status != SPARSE_STATUS_SUCCESS) {
-            print_mkl_status(status, "mkl_sparse_d_mm (batch W * X)");
-            mkl_free(temp_WX);
-            mkl_free(results);
-            mkl_sparse_destroy(W_mkl);
-            mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
-            return NULL;
-        }
-
-        cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-                    n_genes, n_genes, n_spots, inv_S0,
-                    X_data, n_genes, temp_WX, n_genes,
-                    0.0, results, n_genes);
-
-        mkl_free(temp_WX);
-
-    } else { // Single-gene calculation
-        size_t result_size_bytes;
-        if (safe_multiply_size_t(n_genes, sizeof(double), &result_size_bytes) != 0) {
-             fprintf(stderr, "Error: Result vector too large for batch single-gene calc.\n");
-             mkl_sparse_destroy(W_mkl);
-             mkl_free(W_row_ptr_mkl); if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
-             return NULL;
-        }
-        results = (double*)mkl_malloc(result_size_bytes, 64);
-        if (!results) { /* ... */ }
-
-        size_t buffer_bytes;
-        if (safe_multiply_size_t(n_spots, sizeof(double), &buffer_bytes) != 0) {
-            /* ... */
-        }
-
-        double* gene_buffer = (double*)mkl_malloc(buffer_bytes, 64);
-        double* Wz_buffer = (double*)mkl_malloc(buffer_bytes, 64);
-        if (!gene_buffer || !Wz_buffer) { /* ... */ }
-
-        struct matrix_descr descr;
-        descr.type = SPARSE_MATRIX_TYPE_GENERAL;
-
-        for (MKL_INT g = 0; g < n_genes; g++) {
-            for (MKL_INT s = 0; s < n_spots; s++) {
-                gene_buffer[s] = X_data[s * n_genes + g];
-            }
-
-            status = mkl_sparse_d_mv(SPARSE_OPERATION_NON_TRANSPOSE, 1.0, W_mkl, descr,
-                                    gene_buffer, 0.0, Wz_buffer);
-
-            if (status != SPARSE_STATUS_SUCCESS) {
-                print_mkl_status(status, "mkl_sparse_d_mv (batch single-gene)");
-                results[g] = NAN;
-                continue;
-            }
-
-            double dot_product = cblas_ddot(n_spots, gene_buffer, 1, Wz_buffer, 1);
-            if (fabs(S0) < DBL_EPSILON) { // Explicit check for S0 for single gene case if inv_S0 might be 0.0
-                 results[g] = (dot_product == 0.0) ? 0.0 : (dot_product > 0 ? INFINITY : -INFINITY) ; // Or NAN
-                 if(dot_product == 0.0 && S0 == 0.0) results[g] = NAN; // 0/0 is NaN
-            } else {
-                 results[g] = dot_product * inv_S0;
-            }
-        }
-
-        mkl_free(gene_buffer);
-        mkl_free(Wz_buffer);
-    }
-
+    // Cleanup shared resources (MKL handle + converted arrays)
     mkl_sparse_destroy(W_mkl);
     mkl_free(W_row_ptr_mkl);
     if (W_col_ind_mkl) mkl_free(W_col_ind_mkl);
 
-    printf("Batch Moran's I calculation complete.\n");
+    if (results) {
+        printf("Batch Moran's I calculation complete.\n");
+    }
     return results;
 }

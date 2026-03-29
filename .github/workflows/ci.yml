@@ -33,6 +33,7 @@ jobs:
             --inline-suppr \
             -I src \
             src/main.c src/toy_example.c src/morans_i_utils.c src/morans_i_io.c \
+            src/morans_i_io_celltype.c src/morans_i_io_weights.c src/morans_i_io_results.c \
             src/morans_i_core.c src/morans_i_spatial.c src/morans_i_residual.c \
             src/morans_i_perm.c src/morans_i_memory.c
 

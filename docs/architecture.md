@@ -4,19 +4,22 @@
 
 ```
 .
-├── src/                    # C source and headers
-│   ├── main.c              # CLI parsing, orchestration
-│   ├── toy_example.c       # Built-in 5x5 grid toy example
-│   ├── morans_i_utils.c    # Hash table, config, timing, validation
-│   ├── morans_i_io.c       # All file I/O
-│   ├── morans_i_core.c     # Z-normalization, Moran's I calculation
-│   ├── morans_i_spatial.c  # RBF decay, distance, weight matrix
-│   ├── morans_i_residual.c # Regression, residual Moran's I
-│   ├── morans_i_perm.c     # Standard permutation testing
-│   ├── morans_i_memory.c   # All free_* functions
-│   ├── morans_i_mkl.h      # Public API header
-│   ├── morans_i_internal.h # Internal shared helpers
-│   └── openblas_compat.h   # MKL-to-OpenBLAS compatibility
+├── src/                        # C source and headers
+│   ├── main.c                  # CLI parsing, orchestration
+│   ├── toy_example.c           # Built-in 5x5 grid toy example
+│   ├── morans_i_utils.c        # Hash table, config, timing, validation
+│   ├── morans_i_io.c           # Expression and coordinate I/O
+│   ├── morans_i_io_celltype.c  # Cell type data reading and mapping
+│   ├── morans_i_io_weights.c   # Weight matrix reading and validation
+│   ├── morans_i_io_results.c   # All save_* output functions
+│   ├── morans_i_core.c         # Z-normalization, Moran's I calculation
+│   ├── morans_i_spatial.c      # RBF decay, distance, weight matrix
+│   ├── morans_i_residual.c     # Regression, residual Moran's I
+│   ├── morans_i_perm.c         # Standard permutation testing
+│   ├── morans_i_memory.c       # All free_* functions
+│   ├── morans_i_mkl.h          # Public API header
+│   ├── morans_i_internal.h     # Internal shared helpers
+│   └── openblas_compat.h       # MKL-to-OpenBLAS compatibility
 ├── tools/
 │   └── make_custom_w.py    # Weight matrix generator
 ├── docker/

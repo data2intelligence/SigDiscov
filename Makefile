@@ -30,6 +30,9 @@ SOURCES = main.c \
           toy_example.c \
           morans_i_utils.c \
           morans_i_io.c \
+          morans_i_io_celltype.c \
+          morans_i_io_weights.c \
+          morans_i_io_results.c \
           morans_i_core.c \
           morans_i_spatial.c \
           morans_i_residual.c \

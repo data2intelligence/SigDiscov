@@ -104,22 +104,8 @@ for label_file in "native:${NATIVE_OUTPUT}" "openblas:${OPENBLAS_OUTPUT}" "mkl_d
         continue
     fi
 
-    python3 -c "
-import numpy as np, sys
-tol = 1e-6
-mx = 0.0; total = 0; bad = 0
-with open('$EXPECTED') as ef, open('$file') as af:
-    for el, al in zip(ef, af):
-        e = np.array(el.strip().split('\t'), dtype=np.float64)
-        a = np.array(al.strip().split('\t'), dtype=np.float64)
-        d = np.abs(e - a)
-        md = float(d.max())
-        if md > mx: mx = md
-        total += len(e)
-        bad += int((d > tol).sum())
-s = 'PASS' if bad == 0 else 'FAIL'
-print(f'  $label: {s} ({total} values, max_diff={mx:.2e})')
-"
+    echo "  --- $label ---"
+    python3 "${PROJECT_DIR}/tests/compare_tsv.py" "$EXPECTED" "$file" || true
 done
 
 echo ""

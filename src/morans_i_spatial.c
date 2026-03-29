@@ -10,6 +10,10 @@
 
 #include "morans_i_internal.h"
 
+/* COO buffer growth factor (1.5x) and fallback neighbor count */
+#define NEIGHBOR_DENSITY_FUDGE  1.5
+#define FALLBACK_NEIGHBORS      27
+
 /* ===============================
  * SPATIAL WEIGHT MATRIX FUNCTIONS
  * =============================== */
@@ -20,6 +24,46 @@ static void merge_thread_coo(const MKL_INT* local_I, const MKL_INT* local_J, con
                              MKL_INT** global_I, MKL_INT** global_J, double** global_V,
                              MKL_INT* global_nnz, MKL_INT* current_capacity,
                              MKL_INT n_spots_valid, volatile int* critical_error_flag);
+
+/*
+ * coo_append_weight() -- Append a single (i,j,weight) triplet to thread-local
+ * COO buffers, resizing them if necessary.
+ *
+ * Operates on thread-local buffers only; no OMP pragmas needed.
+ * Returns 0 on success, -1 on allocation failure.
+ */
+static int coo_append_weight(double weight,
+                             MKL_INT i, MKL_INT j,
+                             MKL_INT** local_I, MKL_INT** local_J, double** local_V,
+                             MKL_INT* local_nnz, MKL_INT* local_capacity) {
+    if (fabs(weight) <= WEIGHT_THRESHOLD)
+        return 0; /* weight below threshold -- nothing to do */
+
+    if (*local_nnz >= *local_capacity) { /* resize */
+        MKL_INT new_capacity = (MKL_INT)(*local_capacity * NEIGHBOR_DENSITY_FUDGE) + 1;
+        MKL_INT* new_I = (MKL_INT*)realloc(*local_I, (size_t)new_capacity * sizeof(MKL_INT));
+        MKL_INT* new_J = (MKL_INT*)realloc(*local_J, (size_t)new_capacity * sizeof(MKL_INT));
+        double*  new_V = (double*) realloc(*local_V, (size_t)new_capacity * sizeof(double));
+
+        if (!new_I || !new_J || !new_V) {
+            /* Keep whichever pointers succeeded so the caller can still free them */
+            if (new_I) *local_I = new_I;
+            if (new_J) *local_J = new_J;
+            if (new_V) *local_V = new_V;
+            return -1;
+        }
+        *local_I = new_I;
+        *local_J = new_J;
+        *local_V = new_V;
+        *local_capacity = new_capacity;
+    }
+
+    (*local_I)[*local_nnz] = i;
+    (*local_J)[*local_nnz] = j;
+    (*local_V)[*local_nnz] = weight;
+    (*local_nnz)++;
+    return 0;
+}
 
 /*
  * parallel_compute_coo() -- OpenMP parallel section that computes COO triplets
@@ -96,44 +140,22 @@ static int parallel_compute_coo(const MKL_INT* spot_row_valid, const MKL_INT* sp
                     MKL_INT row_shift_abs = llabs(spot_row_valid[i] - spot_row_valid[j]);
                     MKL_INT col_shift_abs = llabs(spot_col_valid[i] - spot_col_valid[j]);
 
-                    // Check bounds for distance_matrix access
-                    if (row_shift_abs < distance_matrix->nrows && col_shift_abs < distance_matrix->ncols) {
-                        double weight = distance_matrix->values[row_shift_abs * distance_matrix->ncols + col_shift_abs];
+                    if (row_shift_abs >= distance_matrix->nrows || col_shift_abs >= distance_matrix->ncols)
+                        continue;
 
-                        if (fabs(weight) > WEIGHT_THRESHOLD) { // Weight is significant
-                            if (local_nnz_tl >= local_capacity) { // Resize local buffer if needed
-                                MKL_INT new_capacity = (MKL_INT)(local_capacity * 1.5) + 1; // Growth factor
-                                MKL_INT* temp_li_new = (MKL_INT*)realloc(local_I_tl, (size_t)new_capacity * sizeof(MKL_INT));
-                                MKL_INT* temp_lj_new = (MKL_INT*)realloc(local_J_tl, (size_t)new_capacity * sizeof(MKL_INT));
-                                double* temp_lv_new = (double*)realloc(local_V_tl, (size_t)new_capacity * sizeof(double));
+                    double weight = distance_matrix->values[row_shift_abs * distance_matrix->ncols + col_shift_abs];
 
-                                if (!temp_li_new || !temp_lj_new || !temp_lv_new) {
-                                    #pragma omp critical
-                                    {
-                                        fprintf(stderr, "Error: Thread %d failed to realloc thread-local COO buffers.\n", omp_get_thread_num());
-                                        critical_error_flag = 1;
-                                    }
-                                    // Keep old pointers if realloc failed for some but not all
-                                    local_I_tl = temp_li_new ? temp_li_new : local_I_tl;
-                                    local_J_tl = temp_lj_new ? temp_lj_new : local_J_tl;
-                                    local_V_tl = temp_lv_new ? temp_lv_new : local_V_tl;
-                                    thread_alloc_error = 1; // Mark error for this thread
-                                    continue; // Skip to next i due to realloc failure
-                                }
-                                local_I_tl = temp_li_new;
-                                local_J_tl = temp_lj_new;
-                                local_V_tl = temp_lv_new;
-                                local_capacity = new_capacity;
-                            }
-                            local_I_tl[local_nnz_tl] = i;
-                            local_J_tl[local_nnz_tl] = j;
-                            local_V_tl[local_nnz_tl] = weight;
-                            local_nnz_tl++;
+                    if (coo_append_weight(weight, i, j,
+                                          &local_I_tl, &local_J_tl, &local_V_tl,
+                                          &local_nnz_tl, &local_capacity) != 0) {
+                        #pragma omp critical
+                        {
+                            fprintf(stderr, "Error: Thread %d failed to realloc thread-local COO buffers.\n", omp_get_thread_num());
+                            critical_error_flag = 1;
                         }
+                        thread_alloc_error = 1;
+                        break; /* exit inner j-loop on alloc failure */
                     }
-                }
-                if (thread_alloc_error) { // If error occurred within inner loop (e.g. realloc)
-                     continue; // Skip to next i
                 }
             } // End of omp for loop
         } // End of if (!thread_alloc_error && !critical_error_flag)
@@ -182,7 +204,7 @@ static void merge_thread_coo(const MKL_INT* local_I, const MKL_INT* local_J, con
                 MKL_INT needed_capacity = *global_nnz + local_nnz;
                 MKL_INT new_global_capacity = *current_capacity;
                 while(new_global_capacity < needed_capacity && new_global_capacity > 0) { // Prevent overflow with new_global_capacity > 0
-                    new_global_capacity = (MKL_INT)(new_global_capacity * 1.5) + 1;
+                    new_global_capacity = (MKL_INT)(new_global_capacity * NEIGHBOR_DENSITY_FUDGE) + 1;
                     if (new_global_capacity <= *current_capacity) { // Overflow or no increase
                         new_global_capacity = needed_capacity > *current_capacity ? needed_capacity : *current_capacity + 1; // Try to reach at least needed
                         if (new_global_capacity <= *current_capacity) { // Still stuck, indicates potential overflow
@@ -392,8 +414,11 @@ SparseMatrix* build_spatial_weight_matrix(const MKL_INT* spot_row_valid, const M
            (long long)n_spots_valid, (long long)n_spots_valid,
            row_normalize ? " with row normalization" : "");
 
-    MKL_INT estimated_neighbors_per_spot = (MKL_INT)(M_PI * max_radius * max_radius * 1.5);
-    if (estimated_neighbors_per_spot <= 0) estimated_neighbors_per_spot = 27; // Default from STUtility (max_radius=5 -> ~117, this is lower)
+    /* Heuristic: pi*r^2 gives the area of a circle in grid units; multiply by
+       NEIGHBOR_DENSITY_FUDGE (1.5) to over-estimate for hexagonal/irregular grids
+       so the initial COO buffer rarely needs resizing. */
+    MKL_INT estimated_neighbors_per_spot = (MKL_INT)(M_PI * max_radius * max_radius * NEIGHBOR_DENSITY_FUDGE);
+    if (estimated_neighbors_per_spot <= 0) estimated_neighbors_per_spot = FALLBACK_NEIGHBORS;
 
     /* Step 1: Parallel COO computation */
     MKL_INT* temp_I = NULL;

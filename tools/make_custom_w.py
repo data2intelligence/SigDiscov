@@ -202,11 +202,11 @@ def main():
         )
 
         print("\n=== Usage ===")
-        print(f"Dense:   ./morans_i_mkl -i {args.input} -o out "
+        print(f"Dense:   ./build/morans_i_mkl -i {args.input} -o out "
               f"-w {dense_file} --weight-format dense -b 1 -g 1")
-        print(f"Sparse:  ./morans_i_mkl -i {args.input} -o out "
+        print(f"Sparse:  ./build/morans_i_mkl -i {args.input} -o out "
               f"-w {sparse_file} --weight-format sparse_tsv -b 1 -g 1")
-        print(f"Builtin: ./morans_i_mkl -i {args.input} -o out "
+        print(f"Builtin: ./build/morans_i_mkl -i {args.input} -o out "
               f"-p {args.platform} -r {args.max_radius} "
               f"-s {args.include_same_spot} -b 1 -g 1")
 
