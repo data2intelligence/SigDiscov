@@ -186,38 +186,18 @@ DenseMatrix* compute_regression_coefficients(const CellTypeMatrix* Z, const Dens
     }
 
     // Copy names
-    for (MKL_INT i = 0; i < n_celltypes; i++) {
-        if (Z->colnames && Z->colnames[i]) {
-            B->rownames[i] = strdup(Z->colnames[i]);
-        } else {
-            char temp[32];
-            snprintf(temp, sizeof(temp), "CellType_%lld", (long long)i);
-            B->rownames[i] = strdup(temp);
-        }
-        if (!B->rownames[i]) {
-            perror("strdup cell type name for coefficients");
-            mkl_free(ZtZ);
-            mkl_free(ZtX);
-            free_dense_matrix(B);
-            return NULL;
-        }
+    if (copy_string_array_with_fallback(B->rownames, (const char**)Z->colnames, n_celltypes, "CellType_%lld") != MORANS_I_SUCCESS) {
+        mkl_free(ZtZ);
+        mkl_free(ZtX);
+        free_dense_matrix(B);
+        return NULL;
     }
 
-    for (MKL_INT j = 0; j < n_genes; j++) {
-        if (X->colnames && X->colnames[j]) {
-            B->colnames[j] = strdup(X->colnames[j]);
-        } else {
-            char temp[32];
-            snprintf(temp, sizeof(temp), "Gene_%lld", (long long)j);
-            B->colnames[j] = strdup(temp);
-        }
-        if (!B->colnames[j]) {
-            perror("strdup gene name for coefficients");
-            mkl_free(ZtZ);
-            mkl_free(ZtX);
-            free_dense_matrix(B);
-            return NULL;
-        }
+    if (copy_string_array_with_fallback(B->colnames, (const char**)X->colnames, n_genes, "Gene_%lld") != MORANS_I_SUCCESS) {
+        mkl_free(ZtZ);
+        mkl_free(ZtX);
+        free_dense_matrix(B);
+        return NULL;
     }
 
     // Compute final result: B̂ = (Z^T Z + λI)^(-1) Z^T X
@@ -398,62 +378,8 @@ DenseMatrix* apply_residual_projection(const DenseMatrix* X, const DenseMatrix* 
     printf("Applying residual projection: %lld spots x %lld genes\n",
            (long long)n_spots, (long long)n_genes);
 
-    DenseMatrix* R = (DenseMatrix*)malloc(sizeof(DenseMatrix));
-    if (!R) {
-        perror("malloc residual matrix");
-        return NULL;
-    }
-
-    R->nrows = n_spots;
-    R->ncols = n_genes;
-    R->rownames = (char**)calloc(n_spots, sizeof(char*));
-    R->colnames = (char**)calloc(n_genes, sizeof(char*));
-
-    size_t residual_size;
-    if (safe_multiply_size_t(n_spots, n_genes, &residual_size) != 0 ||
-        safe_multiply_size_t(residual_size, sizeof(double), &residual_size) != 0) {
-        fprintf(stderr, "Error: Residual matrix too large\n");
-        free(R);
-        return NULL;
-    }
-
-    R->values = (double*)mkl_malloc(residual_size, 64);
-    if (!R->values || !R->rownames || !R->colnames) {
-        perror("Failed to allocate residual matrix components");
-        free_dense_matrix(R);
-        return NULL;
-    }
-
-    // Copy names from X
-    for (MKL_INT i = 0; i < n_spots; i++) {
-        if (X->rownames && X->rownames[i]) {
-            R->rownames[i] = strdup(X->rownames[i]);
-        } else {
-            char temp[32];
-            snprintf(temp, sizeof(temp), "Spot_%lld", (long long)i);
-            R->rownames[i] = strdup(temp);
-        }
-        if (!R->rownames[i]) {
-            perror("strdup spot name for residuals");
-            free_dense_matrix(R);
-            return NULL;
-        }
-    }
-
-    for (MKL_INT j = 0; j < n_genes; j++) {
-        if (X->colnames && X->colnames[j]) {
-            R->colnames[j] = strdup(X->colnames[j]);
-        } else {
-            char temp[32];
-            snprintf(temp, sizeof(temp), "Gene_%lld", (long long)j);
-            R->colnames[j] = strdup(temp);
-        }
-        if (!R->colnames[j]) {
-            perror("strdup gene name for residuals");
-            free_dense_matrix(R);
-            return NULL;
-        }
-    }
+    DenseMatrix* R = alloc_dense_matrix_like(X, "Spot_%lld", "Gene_%lld");
+    if (!R) return NULL;
 
     // Compute R = M_res * X
     cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
@@ -479,62 +405,8 @@ DenseMatrix* center_matrix_columns(const DenseMatrix* matrix) {
     printf("Centering matrix columns: %lld spots x %lld genes\n",
            (long long)n_spots, (long long)n_genes);
 
-    DenseMatrix* centered = (DenseMatrix*)malloc(sizeof(DenseMatrix));
-    if (!centered) {
-        perror("malloc centered matrix");
-        return NULL;
-    }
-
-    centered->nrows = n_spots;
-    centered->ncols = n_genes;
-    centered->rownames = (char**)calloc(n_spots, sizeof(char*));
-    centered->colnames = (char**)calloc(n_genes, sizeof(char*));
-
-    size_t matrix_size;
-    if (safe_multiply_size_t(n_spots, n_genes, &matrix_size) != 0 ||
-        safe_multiply_size_t(matrix_size, sizeof(double), &matrix_size) != 0) {
-        fprintf(stderr, "Error: Centered matrix too large\n");
-        free(centered);
-        return NULL;
-    }
-
-    centered->values = (double*)mkl_malloc(matrix_size, 64);
-    if (!centered->values || !centered->rownames || !centered->colnames) {
-        perror("Failed to allocate centered matrix components");
-        free_dense_matrix(centered);
-        return NULL;
-    }
-
-    // Copy names
-    for (MKL_INT i = 0; i < n_spots; i++) {
-        if (matrix->rownames && matrix->rownames[i]) {
-            centered->rownames[i] = strdup(matrix->rownames[i]);
-        } else {
-            char temp[32];
-            snprintf(temp, sizeof(temp), "Spot_%lld", (long long)i);
-            centered->rownames[i] = strdup(temp);
-        }
-        if (!centered->rownames[i]) {
-            perror("strdup spot name for centered matrix");
-            free_dense_matrix(centered);
-            return NULL;
-        }
-    }
-
-    for (MKL_INT j = 0; j < n_genes; j++) {
-        if (matrix->colnames && matrix->colnames[j]) {
-            centered->colnames[j] = strdup(matrix->colnames[j]);
-        } else {
-            char temp[32];
-            snprintf(temp, sizeof(temp), "Gene_%lld", (long long)j);
-            centered->colnames[j] = strdup(temp);
-        }
-        if (!centered->colnames[j]) {
-            perror("strdup gene name for centered matrix");
-            free_dense_matrix(centered);
-            return NULL;
-        }
-    }
+    DenseMatrix* centered = alloc_dense_matrix_like(matrix, "Spot_%lld", "Gene_%lld");
+    if (!centered) return NULL;
 
     // Center each column (gene) by subtracting mean
     #pragma omp parallel for
@@ -567,62 +439,8 @@ DenseMatrix* normalize_matrix_rows(const DenseMatrix* matrix) {
     printf("Normalizing matrix rows: %lld spots x %lld genes\n",
            (long long)n_spots, (long long)n_genes);
 
-    DenseMatrix* normalized = (DenseMatrix*)malloc(sizeof(DenseMatrix));
-    if (!normalized) {
-        perror("malloc normalized matrix");
-        return NULL;
-    }
-
-    normalized->nrows = n_spots;
-    normalized->ncols = n_genes;
-    normalized->rownames = (char**)calloc(n_spots, sizeof(char*));
-    normalized->colnames = (char**)calloc(n_genes, sizeof(char*));
-
-    size_t matrix_size;
-    if (safe_multiply_size_t(n_spots, n_genes, &matrix_size) != 0 ||
-        safe_multiply_size_t(matrix_size, sizeof(double), &matrix_size) != 0) {
-        fprintf(stderr, "Error: Normalized matrix too large\n");
-        free(normalized);
-        return NULL;
-    }
-
-    normalized->values = (double*)mkl_malloc(matrix_size, 64);
-    if (!normalized->values || !normalized->rownames || !normalized->colnames) {
-        perror("Failed to allocate normalized matrix components");
-        free_dense_matrix(normalized);
-        return NULL;
-    }
-
-    // Copy names
-    for (MKL_INT i = 0; i < n_spots; i++) {
-        if (matrix->rownames && matrix->rownames[i]) {
-            normalized->rownames[i] = strdup(matrix->rownames[i]);
-        } else {
-            char temp[32];
-            snprintf(temp, sizeof(temp), "Spot_%lld", (long long)i);
-            normalized->rownames[i] = strdup(temp);
-        }
-        if (!normalized->rownames[i]) {
-            perror("strdup spot name for normalized matrix");
-            free_dense_matrix(normalized);
-            return NULL;
-        }
-    }
-
-    for (MKL_INT j = 0; j < n_genes; j++) {
-        if (matrix->colnames && matrix->colnames[j]) {
-            normalized->colnames[j] = strdup(matrix->colnames[j]);
-        } else {
-            char temp[32];
-            snprintf(temp, sizeof(temp), "Gene_%lld", (long long)j);
-            normalized->colnames[j] = strdup(temp);
-        }
-        if (!normalized->colnames[j]) {
-            perror("strdup gene name for normalized matrix");
-            free_dense_matrix(normalized);
-            return NULL;
-        }
-    }
+    DenseMatrix* normalized = alloc_dense_matrix_like(matrix, "Spot_%lld", "Gene_%lld");
+    if (!normalized) return NULL;
 
     // Normalize each row by its L2 norm
     #pragma omp parallel for

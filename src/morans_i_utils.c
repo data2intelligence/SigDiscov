@@ -158,6 +158,84 @@ int copy_string_array(char** dest, const char** src, MKL_INT count) {
 }
 
 /* ===============================
+ * STRING ARRAY COPY WITH FALLBACK
+ * =============================== */
+
+int copy_string_array_with_fallback(char** dest, const char** src, MKL_INT count, const char* fallback_fmt) {
+    int fmt_has_percent = (strchr(fallback_fmt, '%') != NULL);
+    for (MKL_INT i = 0; i < count; i++) {
+        if (src && src[i]) {
+            dest[i] = strdup(src[i]);
+        } else if (fmt_has_percent) {
+            char temp[64];
+            snprintf(temp, sizeof(temp), fallback_fmt, (long long)i);
+            dest[i] = strdup(temp);
+        } else {
+            dest[i] = strdup(fallback_fmt);
+        }
+        if (!dest[i]) {
+            perror("copy_string_array_with_fallback: strdup failed");
+            return MORANS_I_ERROR_MEMORY;
+        }
+    }
+    return MORANS_I_SUCCESS;
+}
+
+/* ===============================
+ * DENSE MATRIX ALLOCATION HELPER
+ * =============================== */
+
+DenseMatrix* alloc_dense_matrix_like(const DenseMatrix* source,
+                                     const char* row_fallback_fmt,
+                                     const char* col_fallback_fmt) {
+    if (!source) return NULL;
+
+    MKL_INT nrows = source->nrows;
+    MKL_INT ncols = source->ncols;
+
+    DenseMatrix* result = (DenseMatrix*)calloc(1, sizeof(DenseMatrix));
+    if (!result) {
+        perror("alloc_dense_matrix_like: calloc DenseMatrix");
+        return NULL;
+    }
+
+    result->nrows = nrows;
+    result->ncols = ncols;
+
+    size_t matrix_size;
+    if (safe_multiply_size_t(nrows, ncols, &matrix_size) != 0 ||
+        safe_multiply_size_t(matrix_size, sizeof(double), &matrix_size) != 0) {
+        fprintf(stderr, "Error: Matrix dimensions too large in alloc_dense_matrix_like\n");
+        free(result);
+        return NULL;
+    }
+
+    result->values = (double*)mkl_malloc(matrix_size, 64);
+    result->rownames = (char**)calloc(nrows, sizeof(char*));
+    result->colnames = (char**)calloc(ncols, sizeof(char*));
+
+    if (!result->values || !result->rownames || !result->colnames) {
+        perror("alloc_dense_matrix_like: failed to allocate components");
+        free_dense_matrix(result);
+        return NULL;
+    }
+
+    if (copy_string_array_with_fallback(result->rownames,
+            (const char**)source->rownames, nrows, row_fallback_fmt) != MORANS_I_SUCCESS) {
+        free_dense_matrix(result);
+        return NULL;
+    }
+
+    if (copy_string_array_with_fallback(result->colnames,
+            (const char**)source->colnames, ncols, col_fallback_fmt) != MORANS_I_SUCCESS) {
+        free_dense_matrix(result);
+        return NULL;
+    }
+
+    return result;
+}
+
+/* ===============================
  * UTILITY AND HELPER FUNCTIONS
  * =============================== */
 
@@ -415,42 +493,8 @@ PermutationResults* alloc_permutation_results(MKL_INT n_genes, const char** gene
     }
 
     DenseMatrix* matrices[] = {results->mean_perm, results->var_perm, results->z_scores, results->p_values};
-    int num_matrices = 2 + (params->z_score_output ? 1 : 0) + (params->p_value_output ? 1 : 0);
 
-    /* Build a source name array suitable for copy_string_array.
-     * If gene_names is NULL or contains NULL entries, use "UNKNOWN_GENE" fallback. */
-    char** fallback_names = NULL;
-    const char** names_src = gene_names;
-    int need_fallback = 0;
-    if (!gene_names) {
-        need_fallback = 1;
-    } else {
-        for (MKL_INT i = 0; i < n_genes; i++) {
-            if (!gene_names[i]) { need_fallback = 1; break; }
-        }
-    }
-    if (need_fallback) {
-        fallback_names = (char**)malloc((size_t)n_genes * sizeof(char*));
-        if (!fallback_names) {
-            perror("Failed to allocate fallback gene name array");
-            free_permutation_results(results);
-            return NULL;
-        }
-        for (MKL_INT i = 0; i < n_genes; i++) {
-            const char* src = (gene_names && gene_names[i]) ? gene_names[i] : "UNKNOWN_GENE";
-            fallback_names[i] = strdup(src);
-            if (!fallback_names[i]) {
-                perror("Failed to strdup gene name for fallback");
-                for (MKL_INT k = 0; k < i; k++) free(fallback_names[k]);
-                free(fallback_names);
-                free_permutation_results(results);
-                return NULL;
-            }
-        }
-        names_src = (const char**)fallback_names;
-    }
-
-    for (int m = 0; m < num_matrices; m++) {
+    for (int m = 0; m < 4; m++) {
         if (!matrices[m]) continue;
 
         matrices[m]->nrows = n_genes;
@@ -461,29 +505,16 @@ PermutationResults* alloc_permutation_results(MKL_INT n_genes, const char** gene
 
         if (!matrices[m]->values || !matrices[m]->rownames || !matrices[m]->colnames) {
             perror("Failed to allocate result matrix components");
-            if (fallback_names) {
-                for (MKL_INT k = 0; k < n_genes; k++) free(fallback_names[k]);
-                free(fallback_names);
-            }
             free_permutation_results(results);
             return NULL;
         }
 
-        if (copy_string_array(matrices[m]->rownames, names_src, n_genes) != MORANS_I_SUCCESS ||
-            copy_string_array(matrices[m]->colnames, names_src, n_genes) != MORANS_I_SUCCESS) {
+        if (copy_string_array_with_fallback(matrices[m]->rownames, gene_names, n_genes, "UNKNOWN_GENE") != MORANS_I_SUCCESS ||
+            copy_string_array_with_fallback(matrices[m]->colnames, gene_names, n_genes, "UNKNOWN_GENE") != MORANS_I_SUCCESS) {
             perror("Failed to duplicate gene names for permutation results");
-            if (fallback_names) {
-                for (MKL_INT k = 0; k < n_genes; k++) free(fallback_names[k]);
-                free(fallback_names);
-            }
             free_permutation_results(results);
             return NULL;
         }
-    }
-
-    if (fallback_names) {
-        for (MKL_INT k = 0; k < n_genes; k++) free(fallback_names[k]);
-        free(fallback_names);
     }
 
     return results;

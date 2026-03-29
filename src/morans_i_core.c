@@ -213,8 +213,8 @@ DenseMatrix* compute_pairwise_morans_i_scaled(const DenseMatrix* X, const Sparse
             return NULL;
         }
         if (X->colnames) {
-            res_empty->rownames = calloc(0, sizeof(char*));
-            res_empty->colnames = calloc(0, sizeof(char*));
+            res_empty->rownames = NULL;
+            res_empty->colnames = NULL;
         }
         return res_empty;
     }
@@ -253,25 +253,11 @@ DenseMatrix* compute_pairwise_morans_i_scaled(const DenseMatrix* X, const Sparse
         return NULL;
     }
 
-    // Copy gene names
-    if (X->colnames) {
-        if (copy_string_array(result->rownames, (const char**)X->colnames, n_genes) != MORANS_I_SUCCESS ||
-            copy_string_array(result->colnames, (const char**)X->colnames, n_genes) != MORANS_I_SUCCESS) {
-            free_dense_matrix(result);
-            return NULL;
-        }
-    } else {
-        for (MKL_INT i = 0; i < n_genes; i++) {
-            char default_name_buf[32];
-            snprintf(default_name_buf, sizeof(default_name_buf), "Gene%lld", (long long)i);
-            result->rownames[i] = strdup(default_name_buf);
-            result->colnames[i] = strdup(default_name_buf);
-            if (!result->rownames[i] || !result->colnames[i]) {
-                perror("Failed to duplicate default gene names");
-                free_dense_matrix(result);
-                return NULL;
-            }
-        }
+    // Copy gene names (with fallback for NULL entries)
+    if (copy_string_array_with_fallback(result->rownames, (const char**)X->colnames, n_genes, "Gene%lld") != MORANS_I_SUCCESS ||
+        copy_string_array_with_fallback(result->colnames, (const char**)X->colnames, n_genes, "Gene%lld") != MORANS_I_SUCCESS) {
+        free_dense_matrix(result);
+        return NULL;
     }
 
     sparse_matrix_t W_mkl;

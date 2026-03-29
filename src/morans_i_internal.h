@@ -111,6 +111,28 @@ void spot_name_ht_free(SpotNameHashTable* ht);
  */
 int copy_string_array(char** dest, const char** src, MKL_INT count);
 
+/**
+ * Copy an array of strings with fallback names for NULL entries.
+ * For each index i: if src && src[i], strdup it; else generate a name from
+ * fallback_fmt.  If fallback_fmt contains '%', snprintf(fmt, i) is used;
+ * otherwise the format string itself is strdup'd verbatim.
+ * Returns MORANS_I_SUCCESS on success, MORANS_I_ERROR_MEMORY on failure.
+ */
+int copy_string_array_with_fallback(char** dest, const char** src, MKL_INT count,
+                                    const char* fallback_fmt);
+
+/* --- Dense matrix allocation helper --- */
+
+/**
+ * Allocate a DenseMatrix with the same dimensions as source,
+ * copying row/col names (with fallback format strings for NULL entries).
+ * Values are allocated via mkl_malloc but NOT initialized.
+ * Returns NULL on failure (all partial allocations freed).
+ */
+DenseMatrix* alloc_dense_matrix_like(const DenseMatrix* source,
+                                     const char* row_fallback_fmt,
+                                     const char* col_fallback_fmt);
+
 /* --- Permutation parameter helpers --- */
 
 /**
