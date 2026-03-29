@@ -8,7 +8,7 @@
 │   ├── main.c                  # CLI parsing, orchestration
 │   ├── toy_example.c           # Built-in 5x5 grid toy example
 │   ├── morans_i_utils.c        # Hash table, config, timing, validation
-│   ├── morans_i_io.c           # Expression and coordinate I/O
+│   ├── morans_i_io_expression.c # Expression and coordinate I/O
 │   ├── morans_i_io_celltype.c  # Cell type data reading and mapping
 │   ├── morans_i_io_weights.c   # Weight matrix reading and validation
 │   ├── morans_i_io_results.c   # All save_* output functions

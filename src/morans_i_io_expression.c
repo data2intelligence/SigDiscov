@@ -1,13 +1,7 @@
-/* morans_i_io.c - Expression and coordinate I/O module for Moran's I implementation
+/* morans_i_io_expression.c - Expression and coordinate I/O
  *
- * Contains file format detection, VST expression file parsing, and coordinate
- * file reading/mapping functions.  Cell type I/O, weight matrix I/O, and
- * results saving have been split into separate modules:
- *   morans_i_io_celltype.c  - cell type reading and mapping
- *   morans_i_io_weights.c   - weight matrix reading and validation
- *   morans_i_io_results.c   - all save_* functions
- *
- * Split from the original monolithic morans_i_io.c
+ * File format detection, VST expression file parsing, and coordinate
+ * file reading/mapping.
  */
 
 #include "morans_i_internal.h"
