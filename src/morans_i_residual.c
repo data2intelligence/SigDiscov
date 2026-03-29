@@ -476,6 +476,11 @@ DenseMatrix* normalize_matrix_rows(const DenseMatrix* matrix) {
 
 /* Calculate residual Moran's I matrix: I_R = (1/S0) R_normalized W R_normalized^T */
 DenseMatrix* calculate_residual_morans_i_matrix(const DenseMatrix* R_normalized, const SparseMatrix* W) {
+    if (!R_normalized || !W) {
+        fprintf(stderr, "Error: NULL parameters in calculate_residual_morans_i_matrix\n");
+        return NULL;
+    }
+
     MKL_INT n_genes = R_normalized->ncols;
 
     /* Calculate scaling factor: always 1/S0 for residual */
@@ -623,7 +628,6 @@ static int residual_permutation_worker(const ResidualPermWorkerContext* ctx,
                                       double* local_p_counts) {
 
     const DenseMatrix* X_original = ctx->X_original;
-    const CellTypeMatrix* Z = ctx->Z;
     const SparseMatrix* W = ctx->W;
     const ResidualConfig* config = ctx->config;
     const PermutationParams* params = ctx->params;
@@ -633,24 +637,43 @@ static int residual_permutation_worker(const ResidualPermWorkerContext* ctx,
     MKL_INT n_genes = X_original->ncols;
     size_t matrix_elements = (size_t)n_genes * n_genes;
 
-    // Thread-local allocations
-    DenseMatrix X_perm;
-    X_perm.nrows = n_spots;
-    X_perm.ncols = n_genes;
-    X_perm.rownames = NULL;
-    X_perm.colnames = NULL;
-    X_perm.values = (double*)mkl_malloc((size_t)n_spots * n_genes * sizeof(double), 64);
+    // Thread-local allocations with overflow protection
+    size_t xperm_size;
+    if (safe_multiply_size_t((size_t)n_spots, (size_t)n_genes, &xperm_size) != 0 ||
+        safe_multiply_size_t(xperm_size, sizeof(double), &xperm_size) != 0) {
+        DEBUG_PRINT("Thread %d: Overflow computing X_perm allocation size", thread_id);
+        return -1;
+    }
 
+    double* xperm_values = (double*)mkl_malloc(xperm_size, 64);
     double* gene_buffer = (double*)mkl_malloc((size_t)n_spots * sizeof(double), 64);
     MKL_INT* indices_buffer = (MKL_INT*)mkl_malloc((size_t)n_spots * sizeof(MKL_INT), 64);
 
-    if (!X_perm.values || !gene_buffer || !indices_buffer) {
+    /* Pre-allocate reusable intermediates with values only (no name copying).
+     * R_buf:      n_spots x n_genes  -- residual projection result
+     * R_norm_buf: n_spots x n_genes  -- centered (and optionally row-normalized) result */
+    DenseMatrix* R_buf = alloc_dense_matrix_values_only(n_spots, n_genes);
+    DenseMatrix* R_norm_buf = alloc_dense_matrix_values_only(n_spots, n_genes);
+
+    if (!xperm_values || !gene_buffer || !indices_buffer || !R_buf || !R_norm_buf) {
         DEBUG_PRINT("Thread %d: Memory allocation failed for residual permutation", thread_id);
-        // Cleanup
-        if (X_perm.values) mkl_free(X_perm.values);
+        if (xperm_values) mkl_free(xperm_values);
         if (gene_buffer) mkl_free(gene_buffer);
         if (indices_buffer) mkl_free(indices_buffer);
+        if (R_buf) free_dense_matrix(R_buf);
+        if (R_norm_buf) free_dense_matrix(R_norm_buf);
         return -1;
+    }
+
+    /* Precompute weight sum and scaling factor once for all permutations */
+    double S0 = calculate_weight_sum(W);
+    double scaling_factor;
+    int s0_is_zero = 0;
+    if (fabs(S0) < DBL_EPSILON) {
+        scaling_factor = 1.0;  /* will produce NaN results, same as non-perm path */
+        s0_is_zero = (S0 == 0.0);
+    } else {
+        scaling_factor = 1.0 / S0;
     }
 
     unsigned int local_seed = params->seed + thread_id + 1;
@@ -677,50 +700,138 @@ static int residual_permutation_worker(const ResidualPermWorkerContext* ctx,
 
             // Apply permutation
             for (MKL_INT i = 0; i < n_spots; i++) {
-                X_perm.values[i * n_genes + j] = gene_buffer[indices_buffer[i]];
+                xperm_values[i * n_genes + j] = gene_buffer[indices_buffer[i]];
             }
         }
 
-        // Calculate residual Moran's I for permuted data using precomputed M_res
-        // Apply residual projection: R = M_res * X_perm
-        DenseMatrix* R = apply_residual_projection(&X_perm, ctx->M_res);
-        if (!R) {
-            DEBUG_PRINT("Thread %d: Permutation %d projection failed", thread_id, perm);
-            continue; // Skip this permutation
+        /* --- Inline residual pipeline (avoids name allocation) --- */
+
+        /* Step 1: R = M_res * X_perm  (same as apply_residual_projection) */
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    n_spots, n_genes, n_spots,
+                    1.0, ctx->M_res->values, n_spots,
+                    xperm_values, n_genes,
+                    0.0, R_buf->values, n_genes);
+
+        /* Step 2: Center columns in-place into R_norm_buf (same as center_matrix_columns) */
+        for (MKL_INT j = 0; j < n_genes; j++) {
+            double column_sum = 0.0;
+            for (MKL_INT i = 0; i < n_spots; i++) {
+                column_sum += R_buf->values[i * n_genes + j];
+            }
+            double column_mean = column_sum / (double)n_spots;
+            for (MKL_INT i = 0; i < n_spots; i++) {
+                R_norm_buf->values[i * n_genes + j] = R_buf->values[i * n_genes + j] - column_mean;
+            }
         }
 
-        // Center residual columns
-        DenseMatrix* R_centered = center_matrix_columns(R);
-        free_dense_matrix(R);
-        if (!R_centered) {
-            DEBUG_PRINT("Thread %d: Permutation %d centering failed", thread_id, perm);
+        /* Step 3: Normalize rows if requested (same as normalize_matrix_rows).
+         * Operates on R_norm_buf in-place when normalizing, reading from
+         * an intermediate copy in R_buf. */
+        if (config->normalize_residuals) {
+            /* Copy centered values to R_buf so we can read from it while writing R_norm_buf */
+            memcpy(R_buf->values, R_norm_buf->values, (size_t)n_spots * n_genes * sizeof(double));
+            for (MKL_INT i = 0; i < n_spots; i++) {
+                double row_sum_sq = 0.0;
+                for (MKL_INT j = 0; j < n_genes; j++) {
+                    double val = R_buf->values[i * n_genes + j];
+                    row_sum_sq += val * val;
+                }
+                double row_norm = sqrt(row_sum_sq / (double)n_genes);
+                if (row_norm < ZERO_STD_THRESHOLD) {
+                    for (MKL_INT j = 0; j < n_genes; j++) {
+                        R_norm_buf->values[i * n_genes + j] = 0.0;
+                    }
+                } else {
+                    for (MKL_INT j = 0; j < n_genes; j++) {
+                        R_norm_buf->values[i * n_genes + j] = R_buf->values[i * n_genes + j] / row_norm;
+                    }
+                }
+            }
+        }
+
+        /* Step 4: Compute Moran's I = scaling_factor * R_norm^T * W * R_norm
+         * (same as compute_pairwise_morans_i_scaled + calculate_residual_morans_i_matrix)
+         * Re-use R_buf->values as scratch for W * R_norm. */
+        if (s0_is_zero) {
+            /* All results would be NaN, which the isfinite guard maps to 0.
+             * Skip the expensive sparse-dense multiply entirely. */
             continue;
         }
 
-        // Normalize residual rows if requested
-        DenseMatrix* R_norm;
-        if (config->normalize_residuals) {
-            R_norm = normalize_matrix_rows(R_centered);
-            free_dense_matrix(R_centered);
-            if (!R_norm) {
-                DEBUG_PRINT("Thread %d: Permutation %d normalization failed", thread_id, perm);
+        /* Create MKL sparse handle for W */
+        sparse_matrix_t W_mkl;
+        sparse_status_t sp_status = mkl_sparse_d_create_csr(
+            &W_mkl, SPARSE_INDEX_BASE_ZERO, W->nrows, W->ncols,
+            W->row_ptr, W->row_ptr + 1, W->col_ind, W->values);
+        if (sp_status != SPARSE_STATUS_SUCCESS) {
+            DEBUG_PRINT("Thread %d: Permutation %d MKL sparse handle creation failed", thread_id, perm);
+            continue;
+        }
+
+        struct matrix_descr descrW;
+        descrW.type = SPARSE_MATRIX_TYPE_GENERAL;
+
+        /* Temp_WR = W * R_norm  (n_spots x n_genes, stored in R_buf->values) */
+        sp_status = mkl_sparse_d_mm(
+            SPARSE_OPERATION_NON_TRANSPOSE,
+            1.0,
+            W_mkl,
+            descrW,
+            SPARSE_LAYOUT_ROW_MAJOR,
+            R_norm_buf->values,
+            n_genes,
+            n_genes,
+            0.0,
+            R_buf->values,
+            n_genes
+        );
+
+        mkl_sparse_destroy(W_mkl);
+
+        if (sp_status != SPARSE_STATUS_SUCCESS) {
+            DEBUG_PRINT("Thread %d: Permutation %d sparse mm failed", thread_id, perm);
+            continue;
+        }
+
+        /* perm_morans_values = scaling_factor * R_norm^T * Temp_WR  (n_genes x n_genes)
+         * We need a separate buffer for the result since it's n_genes x n_genes,
+         * not n_spots x n_genes. Reuse xperm_values if n_genes*n_genes <= n_spots*n_genes,
+         * which is true when n_genes <= n_spots (always the case in practice).
+         * Otherwise fall back to a temporary allocation. */
+        double* perm_result_values;
+        int perm_result_allocated = 0;
+        if ((size_t)n_genes * n_genes <= (size_t)n_spots * n_genes) {
+            perm_result_values = xperm_values;  /* safe to reuse: X_perm not needed until next iteration */
+        } else {
+            perm_result_values = (double*)mkl_malloc(matrix_elements * sizeof(double), 64);
+            if (!perm_result_values) {
+                DEBUG_PRINT("Thread %d: Permutation %d result alloc failed", thread_id, perm);
                 continue;
             }
-        } else {
-            R_norm = R_centered;
+            perm_result_allocated = 1;
         }
 
-        // Compute residual Moran's I matrix from the processed residuals
-        DenseMatrix* perm_morans = calculate_residual_morans_i_matrix(R_norm, W);
-        free_dense_matrix(R_norm);
-        if (!perm_morans) {
-            DEBUG_PRINT("Thread %d: Permutation %d Moran's I calculation failed", thread_id, perm);
-            continue;
-        }
+        cblas_dgemm(
+            CblasRowMajor,
+            CblasTrans,
+            CblasNoTrans,
+            n_genes,
+            n_genes,
+            n_spots,
+            scaling_factor,
+            R_norm_buf->values,
+            n_genes,
+            R_buf->values,
+            n_genes,
+            0.0,
+            perm_result_values,
+            n_genes
+        );
 
         // Accumulate statistics
         for (size_t idx = 0; idx < matrix_elements; idx++) {
-            double perm_val = perm_morans->values[idx];
+            double perm_val = perm_result_values[idx];
             if (!isfinite(perm_val)) perm_val = 0.0;
 
             local_mean_sum[idx] += perm_val;
@@ -733,13 +844,15 @@ static int residual_permutation_worker(const ResidualPermWorkerContext* ctx,
             }
         }
 
-        free_dense_matrix(perm_morans);
+        if (perm_result_allocated) mkl_free(perm_result_values);
     }
 
     // Cleanup
-    mkl_free(X_perm.values);
+    mkl_free(xperm_values);
     mkl_free(gene_buffer);
     mkl_free(indices_buffer);
+    free_dense_matrix(R_buf);
+    free_dense_matrix(R_norm_buf);
 
     return 0;
 }

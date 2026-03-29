@@ -161,6 +161,8 @@ int copy_string_array(char** dest, const char** src, MKL_INT count) {
  * STRING ARRAY COPY WITH FALLBACK
  * =============================== */
 
+/* fallback_fmt: if it contains '%', used as snprintf format with (long long)index.
+ * Otherwise used verbatim as a fixed fallback string. */
 int copy_string_array_with_fallback(char** dest, const char** src, MKL_INT count, const char* fallback_fmt) {
     int fmt_has_percent = (strchr(fallback_fmt, '%') != NULL);
     for (MKL_INT i = 0; i < count; i++) {
@@ -229,6 +231,39 @@ DenseMatrix* alloc_dense_matrix_like(const DenseMatrix* source,
     if (copy_string_array_with_fallback(result->colnames,
             (const char**)source->colnames, ncols, col_fallback_fmt) != MORANS_I_SUCCESS) {
         free_dense_matrix(result);
+        return NULL;
+    }
+
+    return result;
+}
+
+/* Lightweight matrix allocation: values buffer only, no names.
+ * Suitable for temporary intermediates in hot paths (e.g., permutation workers)
+ * where name copying is wasted work. */
+DenseMatrix* alloc_dense_matrix_values_only(MKL_INT nrows, MKL_INT ncols) {
+    DenseMatrix* result = (DenseMatrix*)calloc(1, sizeof(DenseMatrix));
+    if (!result) {
+        perror("alloc_dense_matrix_values_only: calloc DenseMatrix");
+        return NULL;
+    }
+
+    result->nrows = nrows;
+    result->ncols = ncols;
+    result->rownames = NULL;
+    result->colnames = NULL;
+
+    size_t matrix_size;
+    if (safe_multiply_size_t((size_t)nrows, (size_t)ncols, &matrix_size) != 0 ||
+        safe_multiply_size_t(matrix_size, sizeof(double), &matrix_size) != 0) {
+        fprintf(stderr, "Error: Matrix dimensions too large in alloc_dense_matrix_values_only\n");
+        free(result);
+        return NULL;
+    }
+
+    result->values = (double*)mkl_malloc(matrix_size, 64);
+    if (!result->values) {
+        perror("alloc_dense_matrix_values_only: mkl_malloc values");
+        free(result);
         return NULL;
     }
 

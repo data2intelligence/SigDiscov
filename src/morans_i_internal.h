@@ -114,8 +114,11 @@ int copy_string_array(char** dest, const char** src, MKL_INT count);
 /**
  * Copy an array of strings with fallback names for NULL entries.
  * For each index i: if src && src[i], strdup it; else generate a name from
- * fallback_fmt.  If fallback_fmt contains '%', snprintf(fmt, i) is used;
- * otherwise the format string itself is strdup'd verbatim.
+ * fallback_fmt.
+ *
+ * fallback_fmt: if it contains '%', used as snprintf format with (long long)index.
+ * Otherwise used verbatim as a fixed fallback string.
+ *
  * Returns MORANS_I_SUCCESS on success, MORANS_I_ERROR_MEMORY on failure.
  */
 int copy_string_array_with_fallback(char** dest, const char** src, MKL_INT count,
@@ -132,6 +135,15 @@ int copy_string_array_with_fallback(char** dest, const char** src, MKL_INT count
 DenseMatrix* alloc_dense_matrix_like(const DenseMatrix* source,
                                      const char* row_fallback_fmt,
                                      const char* col_fallback_fmt);
+
+/**
+ * Allocate a DenseMatrix with only the values buffer (no row/col names).
+ * Intended for temporary intermediates in hot paths (e.g., permutation workers)
+ * where name allocation is wasted work.  rownames and colnames are set to NULL.
+ * Values are allocated via mkl_malloc but NOT initialized.
+ * Returns NULL on failure.
+ */
+DenseMatrix* alloc_dense_matrix_values_only(MKL_INT nrows, MKL_INT ncols);
 
 /* --- Permutation parameter helpers --- */
 
