@@ -172,6 +172,7 @@ typedef struct {
     const ResidualConfig* config;
     const PermutationParams* params;
     const DenseMatrix* observed_results;
+    const DenseMatrix* M_res;
 } ResidualPermWorkerContext;
 
 /* --- Permutation result helpers --- */

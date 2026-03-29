@@ -83,86 +83,59 @@ DenseMatrix* z_normalize(const DenseMatrix* data_matrix) {
         }
     }
 
-    // Perform normalization with better error handling
-    int global_alloc_error = 0;
-
+    // Perform normalization
     #pragma omp parallel
     {
-        double* centered_values_tl = (double*)mkl_malloc((size_t)n_spots * sizeof(double), 64);
-        double* std_dev_vector_tl = (double*)mkl_malloc((size_t)n_spots * sizeof(double), 64);
+        #pragma omp for schedule(dynamic)
+        for (MKL_INT i = 0; i < n_genes; i++) {
+            const double* current_gene_row_input = &(data_matrix->values[i * n_spots]);
+            double* current_gene_row_output = &(normalized->values[i * n_spots]);
 
-        if (!centered_values_tl || !std_dev_vector_tl) {
-            #pragma omp critical
-            {
-                fprintf(stderr, "Error: Thread %d failed to allocate memory for normalization buffers.\n", omp_get_thread_num());
-                global_alloc_error = 1;
+            double sum = 0.0;
+            MKL_INT n_finite = 0;
+            for (MKL_INT j = 0; j < n_spots; j++) {
+                if (isfinite(current_gene_row_input[j])) {
+                    sum += current_gene_row_input[j];
+                    n_finite++;
+                }
             }
-        }
 
-        if (!global_alloc_error) {
-            #pragma omp for schedule(dynamic)
-            for (MKL_INT i = 0; i < n_genes; i++) {
-                if (global_alloc_error) continue;
+            double mean = 0.0;
+            double std_dev = 0.0;
 
-                const double* current_gene_row_input = &(data_matrix->values[i * n_spots]);
-                double* current_gene_row_output = &(normalized->values[i * n_spots]);
-
-                double sum = 0.0;
-                MKL_INT n_finite = 0;
+            if (n_finite > 1) {
+                mean = sum / n_finite;
+                double sum_sq_diff = 0.0;
                 for (MKL_INT j = 0; j < n_spots; j++) {
                     if (isfinite(current_gene_row_input[j])) {
-                        sum += current_gene_row_input[j];
-                        n_finite++;
+                        double diff = current_gene_row_input[j] - mean;
+                        sum_sq_diff += diff * diff;
                     }
                 }
+                double variance = (n_finite > 0) ? sum_sq_diff / n_finite : 0.0; // Use n_finite, not n_spots for variance with NaNs
+                if (variance < 0.0) variance = 0.0; // Should not happen with sum of squares
+                std_dev = sqrt(variance);
+            } else if (n_finite == 1) { // Single finite value, mean is the value, std_dev is 0
+                mean = sum; // sum is just the single value
+                std_dev = 0.0;
+            }
+            // if n_finite == 0, mean and std_dev remain 0.0
 
-                double mean = 0.0;
-                double std_dev = 0.0;
-
-                if (n_finite > 1) {
-                    mean = sum / n_finite;
-                    double sum_sq_diff = 0.0;
-                    for (MKL_INT j = 0; j < n_spots; j++) {
-                        if (isfinite(current_gene_row_input[j])) {
-                            double diff = current_gene_row_input[j] - mean;
-                            sum_sq_diff += diff * diff;
-                        }
-                    }
-                    double variance = (n_finite > 0) ? sum_sq_diff / n_finite : 0.0; // Use n_finite, not n_spots for variance with NaNs
-                    if (variance < 0.0) variance = 0.0; // Should not happen with sum of squares
-                    std_dev = sqrt(variance);
-                } else if (n_finite == 1) { // Single finite value, mean is the value, std_dev is 0
-                    mean = sum; // sum is just the single value
-                    std_dev = 0.0;
+            if (n_finite <= 1 || std_dev < ZERO_STD_THRESHOLD) {
+                for (MKL_INT j = 0; j < n_spots; j++) {
+                    current_gene_row_output[j] = 0.0;
                 }
-                // if n_finite == 0, mean and std_dev remain 0.0
-
-                if (n_finite <= 1 || std_dev < ZERO_STD_THRESHOLD) {
-                    for (MKL_INT j = 0; j < n_spots; j++) {
+            } else {
+                double inv_std = 1.0 / std_dev;
+                for (MKL_INT j = 0; j < n_spots; j++) {
+                    if (isfinite(current_gene_row_input[j])) {
+                        current_gene_row_output[j] = (current_gene_row_input[j] - mean) * inv_std;
+                    } else {
                         current_gene_row_output[j] = 0.0;
                     }
-                } else {
-                    for (MKL_INT j = 0; j < n_spots; j++) {
-                        if (isfinite(current_gene_row_input[j])) {
-                            centered_values_tl[j] = current_gene_row_input[j] - mean;
-                        } else {
-                            centered_values_tl[j] = 0.0; // Non-finite values become 0 after normalization
-                        }
-                        std_dev_vector_tl[j] = std_dev; // Broadcast std_dev
-                    }
-                    vdDiv(n_spots, centered_values_tl, std_dev_vector_tl, current_gene_row_output);
                 }
             }
         }
-
-        if(centered_values_tl) mkl_free(centered_values_tl);
-        if(std_dev_vector_tl) mkl_free(std_dev_vector_tl);
-    }
-
-    if (global_alloc_error) {
-        fprintf(stderr, "Critical error during Z-normalization due to memory allocation failure in threads.\n");
-        free_dense_matrix(normalized);
-        return NULL;
     }
 
     printf("Z-normalization complete.\n");
@@ -340,15 +313,6 @@ DenseMatrix* compute_pairwise_morans_i_scaled(const DenseMatrix* X, const Sparse
 
 /* Calculate pairwise Moran's I matrix: Result = (X_transpose * W * X) / S0 with row normalization support */
 DenseMatrix* calculate_morans_i(const DenseMatrix* X, const SparseMatrix* W, int row_normalized) {
-    if (!X || !W || !X->values) {
-        fprintf(stderr, "Error: Invalid parameters provided to calculate_morans_i\n");
-        return NULL;
-    }
-    if (W->nnz > 0 && !W->values) {
-        fprintf(stderr, "Error: W->nnz > 0 but W->values is NULL in calculate_morans_i\n");
-        return NULL;
-    }
-
     MKL_INT n_spots = X->nrows;
     MKL_INT n_genes = X->ncols;
 

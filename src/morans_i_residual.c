@@ -476,15 +476,6 @@ DenseMatrix* normalize_matrix_rows(const DenseMatrix* matrix) {
 
 /* Calculate residual Moran's I matrix: I_R = (1/S0) R_normalized W R_normalized^T */
 DenseMatrix* calculate_residual_morans_i_matrix(const DenseMatrix* R_normalized, const SparseMatrix* W) {
-    if (!R_normalized || !W || !R_normalized->values) {
-        fprintf(stderr, "Error: Invalid parameters provided to calculate_residual_morans_i_matrix\n");
-        return NULL;
-    }
-    if (W->nnz > 0 && !W->values) {
-        fprintf(stderr, "Error: W->nnz > 0 but W->values is NULL in calculate_residual_morans_i_matrix\n");
-        return NULL;
-    }
-
     MKL_INT n_genes = R_normalized->ncols;
 
     /* Calculate scaling factor: always 1/S0 for residual */
@@ -690,18 +681,46 @@ static int residual_permutation_worker(const ResidualPermWorkerContext* ctx,
             }
         }
 
-        // Calculate residual Moran's I for permuted data
-        // This involves the full residual analysis pipeline
-        ResidualResults* perm_results = calculate_residual_morans_i(&X_perm, Z, W, config, 0); // Pass 0 for verbose
-        if (!perm_results || !perm_results->residual_morans_i) {
-            DEBUG_PRINT("Thread %d: Permutation %d failed", thread_id, perm);
-            if (perm_results) free_residual_results(perm_results);
+        // Calculate residual Moran's I for permuted data using precomputed M_res
+        // Apply residual projection: R = M_res * X_perm
+        DenseMatrix* R = apply_residual_projection(&X_perm, ctx->M_res);
+        if (!R) {
+            DEBUG_PRINT("Thread %d: Permutation %d projection failed", thread_id, perm);
             continue; // Skip this permutation
+        }
+
+        // Center residual columns
+        DenseMatrix* R_centered = center_matrix_columns(R);
+        free_dense_matrix(R);
+        if (!R_centered) {
+            DEBUG_PRINT("Thread %d: Permutation %d centering failed", thread_id, perm);
+            continue;
+        }
+
+        // Normalize residual rows if requested
+        DenseMatrix* R_norm;
+        if (config->normalize_residuals) {
+            R_norm = normalize_matrix_rows(R_centered);
+            free_dense_matrix(R_centered);
+            if (!R_norm) {
+                DEBUG_PRINT("Thread %d: Permutation %d normalization failed", thread_id, perm);
+                continue;
+            }
+        } else {
+            R_norm = R_centered;
+        }
+
+        // Compute residual Moran's I matrix from the processed residuals
+        DenseMatrix* perm_morans = calculate_residual_morans_i_matrix(R_norm, W);
+        free_dense_matrix(R_norm);
+        if (!perm_morans) {
+            DEBUG_PRINT("Thread %d: Permutation %d Moran's I calculation failed", thread_id, perm);
+            continue;
         }
 
         // Accumulate statistics
         for (size_t idx = 0; idx < matrix_elements; idx++) {
-            double perm_val = perm_results->residual_morans_i->values[idx];
+            double perm_val = perm_morans->values[idx];
             if (!isfinite(perm_val)) perm_val = 0.0;
 
             local_mean_sum[idx] += perm_val;
@@ -714,7 +733,7 @@ static int residual_permutation_worker(const ResidualPermWorkerContext* ctx,
             }
         }
 
-        free_residual_results(perm_results);
+        free_dense_matrix(perm_morans);
     }
 
     // Cleanup
@@ -787,6 +806,15 @@ PermutationResults* run_residual_permutation_test(const DenseMatrix* X, const Ce
     printf("Starting residual permutation loop (%d permutations) using %d OpenMP threads...\n",
            n_perm, num_threads);
 
+    // Precompute M_res ONCE before the parallel loop to avoid O(k^3) inversion per permutation
+    DenseMatrix* M_res = compute_residual_projection_matrix(Z, config->regularization_lambda);
+    if (!M_res) {
+        fprintf(stderr, "Error: Failed to precompute residual projection matrix for permutation test\n");
+        free_permutation_results(results);
+        free_residual_results(observed_residual_results);
+        return NULL;
+    }
+
     ResidualPermWorkerContext ctx;
     ctx.X_original = X;
     ctx.Z = Z;
@@ -794,6 +822,7 @@ PermutationResults* run_residual_permutation_test(const DenseMatrix* X, const Ce
     ctx.config = config;
     ctx.params = params;
     ctx.observed_results = observed_results;
+    ctx.M_res = M_res;
 
     volatile int error_occurred = 0;
     double loop_start_time = get_time();
@@ -861,6 +890,9 @@ PermutationResults* run_residual_permutation_test(const DenseMatrix* X, const Ce
 
     double loop_end_time = get_time();
     printf("Residual permutation loop completed in %.2f seconds\n", loop_end_time - loop_start_time);
+
+    // Free precomputed projection matrix
+    free_dense_matrix(M_res);
 
     if (error_occurred) {
         fprintf(stderr, "Error occurred during residual permutation execution\n");
