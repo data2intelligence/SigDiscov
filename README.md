@@ -94,37 +94,6 @@ Or use the verification script (also checks numerical tolerance for cross-platfo
 bash examples/run_example.sh docker
 ```
 
-> **macOS summary**: Install Docker Desktop, open Terminal, then copy-paste the four commands above (clone, cd, docker run, diff). No compiler, Homebrew, or MKL needed. Works on both Intel and Apple Silicon Macs.
-
-### Step 4: Run on your own data
-
-The `-v` flag mounts a directory from your computer into the Docker container. Here is how it works:
-
-```bash
-docker run --rm -v /path/on/your/computer:/data psychemistz/sigdiscov \
-  -i /data/your_expression_file.tsv -o /data/results
-```
-
-**What `-v /path/on/your/computer:/data` means:**
-- **Left side** (`/path/on/your/computer`): a directory on your laptop/server that contains your input files
-- **Right side** (`/data`): where that directory appears *inside* the Docker container
-- So if your file is at `/Users/jane/project/expr.tsv`, the command becomes:
-  ```bash
-  docker run --rm -v /Users/jane/project:/data psychemistz/sigdiscov \
-    -i /data/expr.tsv -o /data/results
-  ```
-- Output files will be written back to `/Users/jane/project/` (prefixed with `results`)
-
-**Using `$(pwd)` shortcut** (mounts the current directory):
-
-```bash
-cd /Users/jane/project        # directory containing your expression file
-docker run --rm -v $(pwd):/data psychemistz/sigdiscov \
-  -i /data/expr.tsv -o /data/results -r 3 -p 0
-```
-
-See [Running on Your Own Data](#running-on-your-own-data) for full examples.
-
 ---
 
 ## Getting Started (Build from Source)
