@@ -32,11 +32,11 @@ If you don't have Docker installed:
 
 | Platform | Install |
 |----------|---------|
-| **macOS** | [Docker Desktop for Mac](https://docs.docker.com/desktop/install/mac-install/) |
+| **macOS** | [Docker Desktop for Mac](https://docs.docker.com/desktop/install/mac-install/) -- download the `.dmg`, drag to Applications, and launch Docker Desktop. No Homebrew or Xcode required. |
 | **Windows** | [Docker Desktop for Windows](https://docs.docker.com/desktop/install/windows-install/) (requires WSL2) |
 | **Linux** | [Docker Engine](https://docs.docker.com/engine/install/) (e.g., `sudo apt-get install docker.io` on Ubuntu) |
 
-After installation, verify Docker is running:
+After installation, open a terminal (on macOS: Terminal.app or iTerm2) and verify Docker is running:
 
 ```bash
 docker --version
@@ -92,6 +92,8 @@ Or use the verification script (also checks numerical tolerance for cross-platfo
 ```bash
 bash examples/run_example.sh docker
 ```
+
+> **macOS summary**: Install Docker Desktop, open Terminal, then copy-paste the four commands above (clone, cd, docker run, diff). No compiler, Homebrew, or MKL needed. Works on both Intel and Apple Silicon Macs.
 
 ### Step 5: Run on your own data
 
