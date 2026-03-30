@@ -320,11 +320,11 @@ char* trim_whitespace_inplace(char* str) {
     return str;
 }
 
-/* Get current time in seconds with microsecond precision */
+/* Get current time in seconds with nanosecond precision */
 double get_time() {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec + (double)tv.tv_usec * 1e-6;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
 /* Initialize default configuration */

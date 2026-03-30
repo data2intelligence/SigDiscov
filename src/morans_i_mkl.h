@@ -12,8 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <sys/time.h>
-#include <time.h>  /* For timing functions, time() */
+#include <time.h>  /* For clock_gettime, time() */
 #include <string.h>  /* For string manipulation functions */
 #include <omp.h>     /* For OpenMP parallelization */
 
