@@ -331,7 +331,7 @@ The `examples/` directory contains real Visium spatial transcriptomics data for 
 | `expected_output.tsv` | Pairwise Moran's I for those 50 genes (lower triangle) | 14 KB |
 | `run_example.sh` | Verification script (Docker, Singularity, or native) | 1 KB |
 
-The expected output was extracted from a full computation on 19,729 genes. The full dataset (481 MB) is available from the [GitHub Releases](https://github.com/data2intelligence/SigDiscov/releases) page.
+The expected output is the pairwise Moran's I result for these 50 genes (lower triangle matrix).
 
 ---
 
