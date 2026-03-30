@@ -54,8 +54,14 @@ ifdef USE_OPENBLAS
     CFLAGS = -O3 -fopenmp -Wall -Wextra -std=c99 -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -g
     CFLAGS += -DUSE_OPENBLAS
 
-    # OpenBLAS includes and libs
-    OPENBLAS_ROOT ?= /usr
+    # OpenBLAS root: user override > pkg-config > module C_INCLUDE_PATH > /usr
+    OPENBLAS_ROOT ?= $(shell pkg-config --variable=prefix openblas 2>/dev/null)
+    ifeq ($(OPENBLAS_ROOT),)
+        OPENBLAS_ROOT := $(shell echo "$$C_INCLUDE_PATH" | tr ':' '\n' | grep -i -m1 '[Oo]pen[Bb][Ll][Aa][Ss]' | sed 's|/include$$||')
+    endif
+    ifeq ($(OPENBLAS_ROOT),)
+        OPENBLAS_ROOT := /usr
+    endif
     INCLUDES = -I$(SRCDIR) -I$(OPENBLAS_ROOT)/include
     LDFLAGS = -fopenmp
 
@@ -74,15 +80,13 @@ else
     CC = icx
     CFLAGS = -O3 -qopenmp -Wall -Wextra -std=c99 -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -g
 
-    # Find MKL
+    # Find MKL (errors are deferred so 'make clean/help' always work)
     MKLROOT ?= $(shell dirname $$(dirname $$(which icx 2>/dev/null)) 2>/dev/null)/mkl/latest
+    MKL_OK := yes
     ifeq ($(MKLROOT),)
-        $(warning MKLROOT is not set or icx not found in PATH. Please source the Intel oneAPI setvars.sh script.)
-        $(error MKLROOT not found. Halting. Try: make CC=gcc USE_OPENBLAS=1)
-    endif
-    ifeq ($(wildcard $(MKLROOT)/include/mkl.h),)
-        $(warning MKLROOT ($(MKLROOT)) does not seem to contain MKL headers (mkl.h not found).)
-        $(error MKL headers not found. Halting. Try: make CC=gcc USE_OPENBLAS=1)
+        MKL_OK := no
+    else ifeq ($(wildcard $(MKLROOT)/include/mkl.h),)
+        MKL_OK := no
     endif
 
     INCLUDES = -I$(SRCDIR) -I$(MKLROOT)/include
@@ -97,6 +101,13 @@ endif
 # Build Rules
 # ============================================================
 
+# Defer MKL error to build targets only (so 'make clean/help' always work)
+ifndef USE_OPENBLAS
+ifneq ($(MKL_OK),yes)
+NEED_MKL_ERROR := 1
+endif
+endif
+
 # Default target
 all: $(TARGET)
 
@@ -107,6 +118,9 @@ $(TARGET): $(OBJECTS) | $(BUILDDIR)
 
 # Rule to compile object files (VPATH finds .c in src/)
 $(BUILDDIR)/%.o: %.c $(HEADERS) Makefile | $(BUILDDIR)
+ifdef NEED_MKL_ERROR
+	$(error MKL not found (MKLROOT=$(MKLROOT)). Try: make CC=gcc USE_OPENBLAS=1)
+endif
 	$(CC) $(CFLAGS) $(VERSION_FLAG) $(INCLUDES) -c $< -o $@
 
 # Create build directory
@@ -139,8 +153,23 @@ debug: clean all
 	@echo "Debug build complete with CFLAGS: $(CFLAGS)"
 debug: CFLAGS := $(CFLAGS_ORIG)
 
+# Build a local OpenBLAS (no sudo required) then compile SigDiscov against it
+LOCAL_OPENBLAS_DIR = $(CURDIR)/deps/openblas
+deps-openblas:
+	@echo "=== Building OpenBLAS locally (no sudo needed) ==="
+	mkdir -p deps/_build
+	cd deps/_build && \
+	  if [ ! -d OpenBLAS ]; then \
+	    git clone --depth 1 https://github.com/OpenMathLib/OpenBLAS.git; \
+	  fi && \
+	  cd OpenBLAS && \
+	  make -j$$(nproc) NO_LAPACK=0 USE_OPENMP=1 PREFIX=$(LOCAL_OPENBLAS_DIR) && \
+	  make PREFIX=$(LOCAL_OPENBLAS_DIR) install
+	@echo "=== OpenBLAS installed to $(LOCAL_OPENBLAS_DIR) ==="
+	@echo "Now run:  make CC=gcc USE_OPENBLAS=1 OPENBLAS_ROOT=$(LOCAL_OPENBLAS_DIR)"
+
 # Phony targets
-.PHONY: all clean install uninstall debug help test
+.PHONY: all clean install uninstall debug help test deps-openblas
 
 # Test target (submits via SLURM)
 test:
@@ -163,8 +192,9 @@ help:
 	@echo "  install   - Install to $$(PREFIX)/bin (use 'make install PREFIX=/path')"
 	@echo "  uninstall - Remove from $$(PREFIX)/bin"
 	@echo "  debug     - Build with debug flags (-O0 -g3)"
-	@echo "  test      - Submit regression tests to SLURM"
-	@echo "  help      - Show this help message"
+	@echo "  test          - Submit regression tests to SLURM"
+	@echo "  deps-openblas - Download and build OpenBLAS locally (no sudo)"
+	@echo "  help          - Show this help message"
 ifdef USE_OPENBLAS
 	@echo ""
 	@echo "Using GCC + OpenBLAS (OPENBLAS_ROOT=$(OPENBLAS_ROOT))"

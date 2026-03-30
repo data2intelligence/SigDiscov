@@ -1116,18 +1116,18 @@ static int run_moran_analysis(const MoransIConfig* config, AnalysisResources* re
            config->row_normalize_weights ? " (with row-normalized weights)" : "");
     start_time = get_time();
 
-    char result_filename[BUFFER_SIZE];
+    char result_filename[BUFFER_SIZE + 64];
     int status = MORANS_I_SUCCESS;
 
     if (!config->calc_pairwise) {
         /* Single-gene mode */
-        snprintf(result_filename, BUFFER_SIZE, "%s_single_gene_moran_i.tsv", output_prefix);
+        snprintf(result_filename, sizeof(result_filename), "%s_single_gene_moran_i.tsv", output_prefix);
         printf("Mode: Single-Gene Moran's I. Output: %s\n", result_filename);
         status = save_single_gene_results(resources->X_calc, resources->W_matrix, S0_val, result_filename, config->row_normalize_weights);
 
     } else if (!config->calc_all_vs_all) {
         /* First gene vs all mode */
-        snprintf(result_filename, BUFFER_SIZE, "%s_first_vs_all_moran_i.tsv", output_prefix);
+        snprintf(result_filename, sizeof(result_filename), "%s_first_vs_all_moran_i.tsv", output_prefix);
         printf("Mode: Pairwise Moran's I (First Gene vs All Others). Output: %s\n", result_filename);
 
         if (resources->X_calc->ncols == 0) {
@@ -1148,7 +1148,7 @@ static int run_moran_analysis(const MoransIConfig* config, AnalysisResources* re
 
     } else {
         /* All pairs mode */
-        snprintf(result_filename, BUFFER_SIZE, "%s_all_pairs_moran_i_raw.tsv", output_prefix);
+        snprintf(result_filename, sizeof(result_filename), "%s_all_pairs_moran_i_raw.tsv", output_prefix);
         printf("Mode: Pairwise Moran's I (All Gene Pairs - Raw Lower Triangular). Output: %s\n", result_filename);
 
         resources->observed_results = calculate_morans_i(resources->X_calc, resources->W_matrix, config->row_normalize_weights);
