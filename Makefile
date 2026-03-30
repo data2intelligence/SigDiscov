@@ -58,7 +58,14 @@ ifdef USE_OPENBLAS
     OPENBLAS_ROOT ?= /usr
     INCLUDES = -I$(SRCDIR) -I$(OPENBLAS_ROOT)/include
     LDFLAGS = -fopenmp
-    LIBS_LINK = -lopenblas -llapacke -lpthread -lm -ldl
+
+    # OpenBLAS usually bundles LAPACKE; add -llapacke only if it doesn't
+    HAS_LAPACKE_IN_OPENBLAS := $(shell nm -D $(OPENBLAS_ROOT)/lib/libopenblas.so 2>/dev/null | grep -q LAPACKE_dgetrf && echo yes)
+    ifeq ($(HAS_LAPACKE_IN_OPENBLAS),yes)
+        LIBS_LINK = -lopenblas -lpthread -lm -ldl
+    else
+        LIBS_LINK = -lopenblas -llapacke -lpthread -lm -ldl
+    endif
     LIBS = $(LDFLAGS) -L$(OPENBLAS_ROOT)/lib $(LIBS_LINK)
 
     BUILD_INFO = GCC + OpenBLAS
