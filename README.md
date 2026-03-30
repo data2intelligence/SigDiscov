@@ -109,7 +109,7 @@ Building from source gives you a native binary without Docker overhead. There ar
 sudo apt-get install gcc make libopenblas-dev liblapacke-dev
 
 # macOS (with Homebrew)
-brew install gcc openblas lapack
+brew install gcc openblas
 
 # HPC (e.g. Biowulf) — load modules instead of apt/brew
 module load openblas    # includes LAPACKE; no separate lapacke needed
