@@ -110,6 +110,9 @@ sudo apt-get install gcc make libopenblas-dev liblapacke-dev
 
 # macOS (with Homebrew)
 brew install gcc openblas lapack
+
+# HPC (e.g. Biowulf) — load modules instead of apt/brew
+module load openblas    # includes LAPACKE; no separate lapacke needed
 ```
 
 **Build:**
