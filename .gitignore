@@ -8,6 +8,9 @@
 # Ignore common data file types
 *.csv
 *.tsv
+
+# Allow example data
+!examples/*.tsv
 *.h5ad
 *.h5
 *.rds
