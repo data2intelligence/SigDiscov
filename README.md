@@ -125,6 +125,19 @@ make CC=gcc USE_OPENBLAS=1
 
 The binary will be at `./build/morans_i_mkl`.
 
+**No OpenBLAS module or sudo?** Build OpenBLAS locally (no root access needed):
+
+```bash
+git clone https://github.com/data2intelligence/SigDiscov.git
+cd SigDiscov
+
+# Build OpenBLAS from source into deps/openblas/
+make deps-openblas
+
+# Build SigDiscov against the local OpenBLAS
+make CC=gcc USE_OPENBLAS=1 OPENBLAS_ROOT=$(pwd)/deps/openblas
+```
+
 **Verify:**
 
 ```bash
