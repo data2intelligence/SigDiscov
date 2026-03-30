@@ -10,6 +10,7 @@ Optimized Moran's I spatial autocorrelation for spatial transcriptomics data. Us
 
 ## Table of Contents
 
+- [Prerequisites: Install Docker](#prerequisites-install-docker)
 - [Getting Started (Docker -- Recommended)](#getting-started-docker----recommended)
 - [Getting Started (Build from Source)](#getting-started-build-from-source)
 - [Running on Your Own Data](#running-on-your-own-data)
@@ -22,17 +23,13 @@ Optimized Moran's I spatial autocorrelation for spatial transcriptomics data. Us
 
 ---
 
-## Getting Started (Docker -- Recommended)
+## Prerequisites: Install Docker
 
-Docker is the easiest way to run SigDiscov. No compiler, no MKL install, no dependency management. Works on Linux, macOS (Intel + Apple Silicon), and Windows.
-
-### Step 1: Install Docker
-
-If you don't have Docker installed:
+Docker is required for the recommended workflow. No compiler, MKL, or Homebrew needed.
 
 | Platform | Install |
 |----------|---------|
-| **macOS** | [Docker Desktop for Mac](https://docs.docker.com/desktop/install/mac-install/) -- download the `.dmg`, drag to Applications, and launch Docker Desktop. No Homebrew or Xcode required. |
+| **macOS** | [Docker Desktop for Mac](https://docs.docker.com/desktop/install/mac-install/) -- download the `.dmg`, drag to Applications, and launch Docker Desktop. No Homebrew or Xcode required. Works on both Intel and Apple Silicon. |
 | **Windows** | [Docker Desktop for Windows](https://docs.docker.com/desktop/install/windows-install/) (requires WSL2) |
 | **Linux** | [Docker Engine](https://docs.docker.com/engine/install/) (e.g., `sudo apt-get install docker.io` on Ubuntu) |
 
@@ -43,7 +40,11 @@ docker --version
 # Docker version 24.x or later
 ```
 
-### Step 2: Pull the SigDiscov image
+---
+
+## Getting Started (Docker -- Recommended)
+
+### Step 1: Pull the SigDiscov image
 
 ```bash
 # OpenBLAS version (works on all platforms including Apple Silicon)
@@ -58,7 +59,7 @@ docker pull psychemistz/sigdiscov:latest-mkl
 | `psychemistz/sigdiscov:latest` | amd64, arm64 | All platforms (macOS Apple Silicon, Linux, Windows) |
 | `psychemistz/sigdiscov:latest-mkl` | amd64 only | HPC / Intel/AMD systems (best performance) |
 
-### Step 3: Quick smoke test (built-in toy example)
+### Step 2: Quick smoke test (built-in toy example)
 
 SigDiscov includes a built-in test dataset (5x5 grid, 5 synthetic genes) that requires no input files:
 
@@ -68,7 +69,7 @@ docker run --rm psychemistz/sigdiscov --run-toy-example -o /tmp/test
 
 If this runs without errors, Docker and SigDiscov are working.
 
-### Step 4: Verify on real Visium data
+### Step 3: Verify on real Visium data
 
 The repository includes a real Visium dataset subset (50 genes x 3,813 spots) in `examples/` along with the expected output extracted from a full computation. Run SigDiscov on it and verify the result matches:
 
@@ -95,7 +96,7 @@ bash examples/run_example.sh docker
 
 > **macOS summary**: Install Docker Desktop, open Terminal, then copy-paste the four commands above (clone, cd, docker run, diff). No compiler, Homebrew, or MKL needed. Works on both Intel and Apple Silicon Macs.
 
-### Step 5: Run on your own data
+### Step 4: Run on your own data
 
 The `-v` flag mounts a directory from your computer into the Docker container. Here is how it works:
 
